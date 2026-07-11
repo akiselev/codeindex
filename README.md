@@ -119,6 +119,10 @@ which is the intended shape for unsaved editor buffers over filesystem or Git
 content. Database, object-store, Git-tree, archive, and notebook integrations can
 implement the dependency-light `codeindex-source` traits directly.
 
+Providers expose stable document identities, logical paths, opaque revisions,
+and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
+and editor-overlay providers can reuse the same indexing pipeline.
+
 ## Representations
 
 Each entity can carry multiple independently versioned representation channels:
