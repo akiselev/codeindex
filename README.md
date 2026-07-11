@@ -119,14 +119,13 @@ which is the intended shape for unsaved editor buffers over filesystem or Git
 content. Database, object-store, Git-tree, archive, and notebook integrations can
 implement the dependency-light `codeindex-source` traits directly.
 
-Workspaces expose stable document identities, logical paths, revisions, coherent
-snapshots, and optional bounded change feeds. The indexer persists provider
-checkpoints and consumes complete deltas when available, falling back to a full
-reconciliation when a checkpoint expires. Indexed source is retained in a
-deduplicated content-addressed cache so minimal/report representations can be
-reconstructed after the original snapshot disappears. Cache entries are retained
-while their indexed file version remains present and are pruned when no indexed
-file references that source hash.
+Workspaces may expose bounded change feeds. The indexer persists successful
+snapshot checkpoints, consumes complete deltas when available, and falls back to
+a full reconciliation when a checkpoint is unsupported or expired. Indexed
+source is retained in a deduplicated content-addressed cache so minimal/report
+representations can be reconstructed after the original snapshot disappears.
+Cache entries remain while an indexed file references the source hash and are
+pruned when that version leaves the index.
 
 ## Representations
 
