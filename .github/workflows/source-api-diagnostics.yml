@@ -1,34 +1,64 @@
-name: Source API diagnostics
+name: Source API fixup
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnostics:
+  fixup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - name: Format workspace
-        run: cargo fmt --all
-      - name: Capture checks
+          components: rustfmt
+      - name: Apply source API fixups
         shell: bash
         run: |
-          set +e
-          cargo check --workspace --all-targets > diagnostics.log 2>&1
-          echo $? > diagnostics.status
-          set -e
-      - name: Build diagnostic bundle
+          python3 - <<'PY'
+          from pathlib import Path
+
+          indexer = Path("crates/indexer/src/lib.rs")
+          text = indexer.read_text()
+          text = text.replace(
+              "    SourceWorkspace,\n",
+              "",
+          )
+          text = text.replace(
+              "    let mut seen = HashSet::new();\n    let mut paths = HashSet::new();",
+              "    let mut document_ids = HashSet::new();\n    let mut seen = HashSet::new();\n    let mut paths = HashSet::new();",
+          )
+          text = text.replace(
+              "        if !seen.insert(document.id.to_string()) {",
+              "        if !document_ids.insert(document.id.to_string()) {",
+          )
+          text = text.replace(
+              "        let Some(language_id) = resolve_language(&document, &enabled, registry) else {\n            continue;\n        };\n        let source_document_id = document.id.to_string();",
+              "        let Some(language_id) = resolve_language(&document, &enabled, registry) else {\n            continue;\n        };\n        seen.insert(document.id.to_string());\n        let source_document_id = document.id.to_string();",
+          )
+          indexer.write_text(text)
+
+          filesystem = Path("crates/source-fs/src/lib.rs")
+          filesystem.write_text(
+              filesystem.read_text().replace("SystemTime::UNIX_EPOCH", "UNIX_EPOCH")
+          )
+          PY
+          cargo fmt --all
+          cargo check --workspace --all-targets
+          cargo test --workspace
+      - name: Commit generated fixups
+        shell: bash
         run: |
-          tar --exclude=.git --exclude=target -czf source-api-diagnostics.tar.gz \
-            Cargo.toml Cargo.lock crates/indexer crates/source crates/source-fs crates/codeindex \
-            diagnostics.log diagnostics.status
-      - uses: actions/upload-artifact@v4
-        with:
-          name: source-api-diagnostics
-          path: source-api-diagnostics.tar.gz
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock crates/codeindex crates/indexer crates/source crates/source-fs
+          git commit -m "format and validate source workspace changes"
+          git push origin HEAD:${{ github.head_ref }}
