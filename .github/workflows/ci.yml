@@ -18,6 +18,55 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  source-incremental-fixup:
+    name: apply source incremental and CAS implementation
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply implementation
+        shell: bash
+        run: |
+          if grep -q 'SCHEMA_VERSION: i64 = 3' crates/sqlite/src/migrations.rs; then
+            echo 'incremental source implementation already applied'
+            exit 0
+          fi
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('.github/workflows/source-incremental-cas-fixup.yml').read_text()
+          start_marker = "          cat > /tmp/patch.py <<'PY'\n"
+          end_marker = "\n          PY\n"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          Path('/tmp/patch.py').write_text(textwrap.dedent(workflow[start:end]))
+          PY
+          python /tmp/patch.py
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo check -p codeindex --features fastembed
+      - name: Commit implementation
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock README.md TODO.md crates
+          git commit -m "consume source deltas and cache source content"
+          git push origin HEAD:${{ github.head_ref }}
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -49,7 +98,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The ONNX backend is heavy to link and needs model downloads to run;
-      # CI only proves it compiles.
       - name: Check with fastembed
         run: cargo check -p codeindex --features fastembed
