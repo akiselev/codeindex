@@ -69,11 +69,9 @@ implementation logic or depending on application-specific modules.
 - [ ] **Maintained remote providers.** Add Git-tree and editor protocol adapters,
       then evaluate an `object_store`-backed implementation with conditional and
       versioned reads.
-- [ ] **Incremental source refresh.** Consume complete provider change feeds and
-      checkpoints, falling back to full enumeration after overflow or expiry.
-- [ ] **Exact delayed recovery.** Persist enough snapshot/revision provenance or a
-      content-addressed source cache to guarantee reconstruction under report and
-      minimal retention.
+- [ ] **Source-provider ergonomics.** Add maintained Git-tree and editor-overlay
+      providers; optimize provider catalogs so source recovery does not need full
+      enumeration on every lookup.
 - [ ] **Write-side store seam.** Introduce one only when a second persistence
       backend needs to reuse incremental indexing and embedding projection.
 - [ ] **Streaming search.** Add a streaming snapshot/index interface when measured
