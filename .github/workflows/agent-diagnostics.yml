@@ -1,0 +1,53 @@
+name: Agent diagnostics
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Capture diagnostics
+        shell: bash
+        run: |
+          set +e
+          cargo fmt --all
+          git diff --binary > fmt.patch
+          cargo check --workspace --all-targets > check.log 2>&1
+          echo $? > check.status
+          cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1
+          echo $? > clippy.status
+          cargo test --workspace --no-run > test-build.log 2>&1
+          echo $? > test-build.status
+          cargo check -p codeindex --features fastembed > fastembed.log 2>&1
+          echo $? > fastembed.status
+          git status --short > status.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-diagnostics
+          path: |
+            fmt.patch
+            check.log
+            check.status
+            clippy.log
+            clippy.status
+            test-build.log
+            test-build.status
+            fastembed.log
+            fastembed.status
+            status.log
+          if-no-files-found: error
