@@ -1,0 +1,9 @@
+id = "typescript"
+name = "TypeScript"
+extensions = ["ts", "tsx", "mts", "cts"]
+comment_nodes = ["comment"]
+adapter = "js-like"
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"

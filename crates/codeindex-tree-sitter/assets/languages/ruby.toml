@@ -1,0 +1,12 @@
+id = "ruby"
+name = "Ruby"
+extensions = ["rb"]
+comment_nodes = ["comment"]
+
+[[scopes]]
+kind = "class"
+field = "name"
+
+[[scopes]]
+kind = "module"
+field = "name"

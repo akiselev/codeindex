@@ -1,0 +1,16 @@
+id = "php"
+name = "PHP"
+extensions = ["php", "phtml"]
+comment_nodes = ["comment"]
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"
+
+[[scopes]]
+kind = "interface_declaration"
+field = "name"
+
+[[scopes]]
+kind = "trait_declaration"
+field = "name"

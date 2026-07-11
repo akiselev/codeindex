@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/codeindex",
+    "crates/codeindex-core",
+    "crates/codeindex-embedding",
+    "crates/codeindex-indexer",
+    "crates/codeindex-query",
+    "crates/codeindex-sqlite",
+    "crates/codeindex-tree-sitter",
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

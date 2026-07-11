@@ -1,0 +1,16 @@
+id = "java"
+name = "Java"
+extensions = ["java"]
+comment_nodes = ["line_comment", "block_comment"]
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"
+
+[[scopes]]
+kind = "interface_declaration"
+field = "name"
+
+[[scopes]]
+kind = "enum_declaration"
+field = "name"

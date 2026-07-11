@@ -1,0 +1,9 @@
+[package]
+name = "codeindex-core"
+version = "0.1.0"
+edition = "2024"
+description = "Application-neutral domain model for source-code indexing"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }

@@ -1,0 +1,12 @@
+id = "kotlin"
+name = "Kotlin"
+extensions = ["kt", "kts"]
+comment_nodes = ["line_comment", "block_comment"]
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"
+
+[[scopes]]
+kind = "object_declaration"
+field = "name"

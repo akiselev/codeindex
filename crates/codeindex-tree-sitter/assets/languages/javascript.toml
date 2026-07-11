@@ -1,0 +1,9 @@
+id = "javascript"
+name = "JavaScript"
+extensions = ["js", "jsx", "mjs", "cjs"]
+comment_nodes = ["comment"]
+adapter = "js-like"
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"

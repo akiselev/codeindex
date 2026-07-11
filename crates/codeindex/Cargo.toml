@@ -1,0 +1,24 @@
+[package]
+name = "codeindex"
+version = "0.1.0"
+edition = "2024"
+description = "Facade over the reusable codeindex crates"
+publish = false
+
+[dependencies]
+codeindex-core = { path = "../codeindex-core" }
+codeindex-embedding = { path = "../codeindex-embedding", default-features = false }
+codeindex-indexer = { path = "../codeindex-indexer" }
+codeindex-query = { path = "../codeindex-query" }
+codeindex-sqlite = { path = "../codeindex-sqlite" }
+codeindex-tree-sitter = { path = "../codeindex-tree-sitter" }
+
+[features]
+default = []
+fastembed = ["codeindex-embedding/fastembed"]
+accel = ["fastembed", "codeindex-embedding/accel"]
+cuda = ["accel", "codeindex-embedding/cuda"]
+directml = ["accel", "codeindex-embedding/directml"]
+coreml = ["accel", "codeindex-embedding/coreml"]
+openvino = ["accel", "codeindex-embedding/openvino"]
+load-dynamic = ["accel", "codeindex-embedding/load-dynamic"]

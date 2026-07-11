@@ -1,0 +1,20 @@
+id = "csharp"
+name = "C#"
+extensions = ["cs"]
+comment_nodes = ["comment"]
+
+[[scopes]]
+kind = "class_declaration"
+field = "name"
+
+[[scopes]]
+kind = "struct_declaration"
+field = "name"
+
+[[scopes]]
+kind = "interface_declaration"
+field = "name"
+
+[[scopes]]
+kind = "record_declaration"
+field = "name"
