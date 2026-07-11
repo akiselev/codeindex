@@ -1,0 +1,628 @@
+name: Source incremental and CAS fixup
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Implement checkpoint feeds and source CAS
+        shell: bash
+        run: |
+          cat > /tmp/patch.py <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f"pattern not found in {path}: {old[:120]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # Schema: durable provider checkpoints and content-addressed source blobs.
+          replace_once(
+              "crates/sqlite/src/migrations.rs",
+              "/// Schema epoch. Version 1 was the pre-space M4 prototype; it is intentionally\n/// rejected rather than migrated because the project remains pre-release.\npub const SCHEMA_VERSION: i64 = 2;",
+              "/// Schema epoch. Earlier pre-release layouts are intentionally rejected rather\n/// than migrated. Version 3 adds provider checkpoints and durable source blobs.\npub const SCHEMA_VERSION: i64 = 3;",
+          )
+          replace_once(
+              "crates/sqlite/src/migrations.rs",
+              "CREATE TABLE files(\n",
+              "CREATE TABLE project_source_checkpoints(\n  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,\n  workspace_id TEXT NOT NULL,\n  checkpoint BLOB NOT NULL,\n  updated_at TEXT NOT NULL\n);\n\nCREATE TABLE files(\n",
+          )
+          replace_once(
+              "crates/sqlite/src/migrations.rs",
+              "CREATE INDEX idx_files_source_hash ON files(source_hash);\n",
+              "CREATE INDEX idx_files_source_hash ON files(source_hash);\n\nCREATE TABLE source_blobs(\n  source_hash TEXT PRIMARY KEY,\n  content BLOB NOT NULL,\n  encoding_hint TEXT,\n  size INTEGER NOT NULL,\n  created_at TEXT NOT NULL\n);\n",
+          )
+
+          # SQLite API.
+          replace_once(
+              "crates/sqlite/src/lib.rs",
+              "pub struct HashLocation {\n    pub project_label: String,\n    pub source_dir: String,\n    pub source_document_id: String,\n    pub relative_path: String,\n    pub language_id: String,\n}",
+              "pub struct HashLocation {\n    pub project_label: String,\n    pub source_dir: String,\n    pub source_document_id: String,\n    pub source_revision: String,\n    pub source_hash: String,\n    pub relative_path: String,\n    pub language_id: String,\n}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct SourceBlob {\n    pub content: Vec<u8>,\n    pub encoding_hint: Option<String>,\n}",
+          )
+          replace_once(
+              "crates/sqlite/src/lib.rs",
+              "    // ----- source documents -----\n",
+              "    // ----- provider checkpoints -----\n\n    pub fn get_source_checkpoint(\n        &self,\n        project_id: ProjectId,\n    ) -> Result<Option<(String, Vec<u8>)>> {\n        Ok(self\n            .conn\n            .query_row(\n                \"SELECT workspace_id, checkpoint FROM project_source_checkpoints \\\n                 WHERE project_id = ?1\",\n                [project_id],\n                |row| Ok((row.get(0)?, row.get(1)?)),\n            )\n            .optional()?)\n    }\n\n    pub fn set_source_checkpoint(\n        &self,\n        project_id: ProjectId,\n        workspace_id: &str,\n        checkpoint: &[u8],\n    ) -> Result<()> {\n        self.conn.execute(\n            \"INSERT INTO project_source_checkpoints(\n                 project_id, workspace_id, checkpoint, updated_at)\n             VALUES (?1, ?2, ?3, datetime('now'))\n             ON CONFLICT(project_id) DO UPDATE SET\n                 workspace_id = excluded.workspace_id,\n                 checkpoint = excluded.checkpoint,\n                 updated_at = excluded.updated_at\",\n            params![project_id, workspace_id, checkpoint],\n        )?;\n        Ok(())\n    }\n\n    pub fn clear_source_checkpoint(&self, project_id: ProjectId) -> Result<()> {\n        self.conn.execute(\n            \"DELETE FROM project_source_checkpoints WHERE project_id = ?1\",\n            [project_id],\n        )?;\n        Ok(())\n    }\n\n    // ----- source documents -----\n",
+          )
+          replace_once(
+              "crates/sqlite/src/lib.rs",
+              "    // ----- units and representations -----\n",
+              "    // ----- durable source cache -----\n\n    pub fn put_source_blob(\n        &self,\n        source_hash: &str,\n        content: &[u8],\n        encoding_hint: Option<&str>,\n    ) -> Result<()> {\n        if let Some(existing) = self.get_source_blob(source_hash)? {\n            anyhow::ensure!(\n                existing.content == content,\n                \"source hash collision or corrupt source blob for {source_hash}\"\n            );\n            return Ok(());\n        }\n        self.conn.execute(\n            \"INSERT INTO source_blobs(\n                 source_hash, content, encoding_hint, size, created_at)\n             VALUES (?1, ?2, ?3, ?4, datetime('now'))\",\n            params![source_hash, content, encoding_hint, content.len() as i64],\n        )?;\n        Ok(())\n    }\n\n    pub fn get_source_blob(&self, source_hash: &str) -> Result<Option<SourceBlob>> {\n        Ok(self\n            .conn\n            .query_row(\n                \"SELECT content, encoding_hint FROM source_blobs WHERE source_hash = ?1\",\n                [source_hash],\n                |row| {\n                    Ok(SourceBlob {\n                        content: row.get(0)?,\n                        encoding_hint: row.get(1)?,\n                    })\n                },\n            )\n            .optional()?)\n    }\n\n    pub fn prune_orphan_source_blobs(&self) -> Result<usize> {\n        Ok(self.conn.execute(\n            \"DELETE FROM source_blobs\n             WHERE NOT EXISTS (\n               SELECT 1 FROM files f WHERE f.source_hash = source_blobs.source_hash\n             )\",\n            [],\n        )?)\n    }\n\n    // ----- units and representations -----\n",
+          )
+          replace_once(
+              "crates/sqlite/src/lib.rs",
+              "            \"SELECT p.label, p.source_dir, f.source_document_id, f.relative_path, f.language_id\n",
+              "            \"SELECT p.label, p.source_dir, f.source_document_id, f.source_revision,\n                    f.source_hash, f.relative_path, f.language_id\n",
+          )
+          replace_once(
+              "crates/sqlite/src/lib.rs",
+              "                        source_document_id: row.get(2)?,\n                        relative_path: row.get(3)?,\n                        language_id: row.get(4)?,",
+              "                        source_document_id: row.get(2)?,\n                        source_revision: row.get(3)?,\n                        source_hash: row.get(4)?,\n                        relative_path: row.get(5)?,\n                        language_id: row.get(6)?,",
+          )
+
+          # Source contract: bounded complete deltas and a real in-memory feed.
+          replace_once(
+              "crates/source/src/lib.rs",
+              "pub type ChangeIter<'a> = Box<dyn Iterator<Item = Result<SourceChange, SourceError>> + Send + 'a>;\n",
+              "pub type ChangeIter<'a> = Box<dyn Iterator<Item = Result<SourceChange, SourceError>> + Send + 'a>;\n\npub struct SourceDelta<'a> {\n    pub from: SourceCheckpoint,\n    pub to: SourceCheckpoint,\n    pub changes: ChangeIter<'a>,\n}\n",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "    Unsupported,\n    Other,",
+              "    Unsupported,\n    CheckpointExpired,\n    Other,",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "    fn changes_since<'a>(\n        &'a self,\n        _checkpoint: &'a SourceCheckpoint,\n        _query: &'a DocumentQuery,\n    ) -> Result<Option<ChangeIter<'a>>, SourceError> {\n        Ok(None)\n    }",
+              "    /// Return a complete change sequence bounded by two checkpoints.\n    /// Implementations must return every change in `(from, to]`, or report that\n    /// the checkpoint expired so the caller can perform a full reconciliation.\n    fn changes_between<'a>(\n        &'a self,\n        _from: &'a SourceCheckpoint,\n        _to: &'a SourceCheckpoint,\n        _query: &'a DocumentQuery,\n    ) -> Result<Option<SourceDelta<'a>>, SourceError> {\n        Ok(None)\n    }",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "    documents: RwLock<BTreeMap<DocumentId, MemoryDocument>>,\n}",
+              "    documents: RwLock<BTreeMap<DocumentId, MemoryDocument>>,\n    changes: RwLock<Vec<(u64, SourceChange)>>,\n}",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "                documents: RwLock::new(BTreeMap::new()),\n",
+              "                documents: RwLock::new(BTreeMap::new()),\n                changes: RwLock::new(Vec::new()),\n",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "        self.inner\n            .documents\n            .write()\n            .expect(\"memory workspace lock poisoned\")\n            .insert(id.clone(), MemoryDocument { descriptor, bytes });\n        id",
+              "        self.inner\n            .documents\n            .write()\n            .expect(\"memory workspace lock poisoned\")\n            .insert(\n                id.clone(),\n                MemoryDocument {\n                    descriptor: descriptor.clone(),\n                    bytes,\n                },\n            );\n        self.inner\n            .changes\n            .write()\n            .expect(\"memory workspace change log lock poisoned\")\n            .push((sequence, SourceChange::Upsert(descriptor)));\n        id",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "    pub fn remove(&self, id: &DocumentId) -> bool {\n        self.inner\n            .documents\n            .write()\n            .expect(\"memory workspace lock poisoned\")\n            .remove(id)\n            .is_some()\n    }",
+              "    pub fn remove(&self, id: &DocumentId) -> bool {\n        let removed = self\n            .inner\n            .documents\n            .write()\n            .expect(\"memory workspace lock poisoned\")\n            .remove(id)\n            .is_some();\n        if removed {\n            let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;\n            self.inner\n                .changes\n                .write()\n                .expect(\"memory workspace change log lock poisoned\")\n                .push((sequence, SourceChange::Remove(id.clone())));\n        }\n        removed\n    }",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "        document.descriptor.location.logical_path = logical_path.into();\n        let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;\n        document.descriptor.version.token = RevisionToken::new(format!(\"memory:{sequence}\"));\n        Ok(())",
+              "        document.descriptor.location.logical_path = logical_path.into();\n        let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;\n        document.descriptor.version.token = RevisionToken::new(format!(\"memory:{sequence}\"));\n        let change = SourceChange::Move {\n            id: id.clone(),\n            new_location: document.descriptor.location.clone(),\n            version: document.descriptor.version.clone(),\n        };\n        drop(documents);\n        self.inner\n            .changes\n            .write()\n            .map_err(|_| {\n                SourceError::new(SourceErrorKind::Other, \"memory workspace change log lock poisoned\")\n            })?\n            .push((sequence, change));\n        Ok(())",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "            change_feed: false,\n        }\n    }\n\n    fn open_snapshot(",
+              "            change_feed: true,\n        }\n    }\n\n    fn open_snapshot(",
+          )
+          replace_once(
+              "crates/source/src/lib.rs",
+              "        Ok(Arc::new(MemorySnapshot {\n            id: SnapshotId::new(format!(\"{}@{sequence}\", self.inner.descriptor.id)),\n            workspace_id: self.inner.descriptor.id.clone(),\n            documents,\n            checkpoint,\n        }))\n    }\n}",
+              "        Ok(Arc::new(MemorySnapshot {\n            id: SnapshotId::new(format!(\"{}@{sequence}\", self.inner.descriptor.id)),\n            workspace_id: self.inner.descriptor.id.clone(),\n            documents,\n            checkpoint,\n        }))\n    }\n\n    fn changes_between<'a>(\n        &'a self,\n        from: &'a SourceCheckpoint,\n        to: &'a SourceCheckpoint,\n        query: &'a DocumentQuery,\n    ) -> Result<Option<SourceDelta<'a>>, SourceError> {\n        let from_sequence = checkpoint_sequence(from, &self.inner.descriptor.id)?;\n        let to_sequence = checkpoint_sequence(to, &self.inner.descriptor.id)?;\n        let current = self.inner.sequence.load(Ordering::SeqCst);\n        if from_sequence > to_sequence || to_sequence > current {\n            return Err(SourceError::new(\n                SourceErrorKind::CheckpointExpired,\n                format!(\n                    \"memory checkpoint range {from_sequence}..={to_sequence} is unavailable at {current}\"\n                ),\n            ));\n        }\n        let changes = self\n            .inner\n            .changes\n            .read()\n            .map_err(|_| {\n                SourceError::new(SourceErrorKind::Other, \"memory workspace change log lock poisoned\")\n            })?\n            .iter()\n            .filter(|(sequence, _)| *sequence > from_sequence && *sequence <= to_sequence)\n            .filter_map(|(_, change)| match change {\n                SourceChange::Upsert(document) if !query.matches(document) => None,\n                _ => Some(Ok(change.clone())),\n            })\n            .collect::<Vec<_>>();\n        Ok(Some(SourceDelta {\n            from: from.clone(),\n            to: to.clone(),\n            changes: Box::new(changes.into_iter()),\n        }))\n    }\n}\n\nfn checkpoint_sequence(\n    checkpoint: &SourceCheckpoint,\n    workspace: &WorkspaceId,\n) -> Result<u64, SourceError> {\n    if &checkpoint.workspace != workspace {\n        return Err(SourceError::invalid(format!(\n            \"checkpoint belongs to workspace {}, expected {workspace}\",\n            checkpoint.workspace\n        )));\n    }\n    let bytes: [u8; 8] = checkpoint.token.as_ref().try_into().map_err(|_| {\n        SourceError::invalid(\"memory workspace checkpoint must contain an eight-byte sequence\")\n    })?;\n    Ok(u64::from_le_bytes(bytes))\n}",
+          )
+
+          # Source recovery catalog: require the exact indexed revision.
+          replace_once(
+              "crates/indexer/src/source.rs",
+              "    DocumentId, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,\n",
+              "    DocumentId, RevisionToken, SnapshotRequest, SourceErrorKind, SourceSnapshot,\n    SourceWorkspace,\n",
+          )
+          replace_once(
+              "crates/indexer/src/source.rs",
+              "        document_id: &str,\n        _relative_path: &str,\n        _language_id: &str,",
+              "        document_id: &str,\n        revision: &str,",
+          )
+          replace_once(
+              "crates/indexer/src/source.rs",
+              "        let id = DocumentId::new(document_id);\n        let Some(document) = snapshot.document(&id)? else {\n            return Ok(None);\n        };\n        let content = match snapshot.read(&document) {",
+              "        let id = DocumentId::new(document_id);\n        let content = match snapshot.read_by_id(&id, &RevisionToken::new(revision)) {",
+          )
+
+          # Recovery uses the durable cache first and only then an exact provider read.
+          replace_once(
+              "crates/indexer/src/embed.rs",
+              "        let source = if let Some(catalog) = sources {\n            catalog.read(\n                &location.project_label,\n                &location.source_document_id,\n                &location.relative_path,\n                &location.language_id,\n            )?\n        } else {\n            let path = std::path::Path::new(&location.source_dir).join(&location.relative_path);\n            std::fs::read_to_string(path).ok()\n        };",
+              "        let source = if let Some(blob) = db.get_source_blob(&location.source_hash)? {\n            Some(String::from_utf8(blob.content).with_context(|| {\n                format!(\"cached source {} is not UTF-8\", location.source_hash)\n            })?)\n        } else if let Some(catalog) = sources {\n            catalog.read(\n                &location.project_label,\n                &location.source_document_id,\n                &location.source_revision,\n            )?\n        } else {\n            None\n        };",
+          )
+          replace_once(
+              "crates/indexer/src/embed.rs",
+              "        let Some(source) = source else { continue };\n        let def = registry",
+              "        let Some(source) = source else { continue };\n        anyhow::ensure!(\n            codeindex_tree_sitter::normalizer::sha256_hex(&source) == location.source_hash,\n            \"source cache hash mismatch for {}\",\n            location.source_document_id\n        );\n        let def = registry",
+          )
+
+          # Indexer: bounded delta consumption and durable source caching.
+          replace_once(
+              "crates/indexer/src/lib.rs",
+              "use std::path::{Path, PathBuf};\nuse std::time::{SystemTime, UNIX_EPOCH};",
+              "use std::path::{Path, PathBuf};\nuse std::sync::Arc;\nuse std::time::{SystemTime, UNIX_EPOCH};",
+          )
+          replace_once(
+              "crates/indexer/src/lib.rs",
+              "use codeindex_source::{\n    DocumentDescriptor, DocumentQuery, LanguageHint, RevisionGuarantee, SnapshotRequest,\n};",
+              "use codeindex_source::{\n    DocumentDescriptor, DocumentId, DocumentQuery, LanguageHint, RevisionGuarantee,\n    SnapshotRequest, SourceChange, SourceCheckpoint, SourceErrorKind, SourceSnapshot,\n    SourceWorkspace,\n};",
+          )
+          replace_once(
+              "crates/indexer/src/lib.rs",
+              "    SourceCheckpoint, SourceContent, SourceDocument, SourceError, SourceKind, SourceProject,\n",
+              "    SourceChange, SourceCheckpoint, SourceContent, SourceDelta, SourceDocument, SourceError,\n    SourceErrorKind, SourceKind, SourceProject,\n",
+          )
+          replace_once(
+              "crates/indexer/src/lib.rs",
+              "    db.prune_orphan_embeddings()?;\n",
+              "    db.prune_orphan_embeddings()?;\n    db.prune_orphan_source_blobs()?;\n",
+          )
+
+          p = Path("crates/indexer/src/lib.rs")
+          text = p.read_text()
+          start = text.index("fn index_project(")
+          end = text.index("fn resolve_language(")
+          replacement = r'''enum RefreshPlan {
+    Full,
+    Delta(BTreeMap<DocumentId, bool>),
+}
+
+fn index_project(
+    db: &Db,
+    settings: &IndexSettings,
+    project: &SourceProject<'_>,
+    generation: i64,
+    enrichers: &[&dyn RepresentationEnricher],
+) -> Result<ProjectStats> {
+    let workspace = project.workspace;
+    let descriptor = workspace.descriptor();
+    let project_id = db.upsert_project(&project.label, &descriptor.persisted_locator())?;
+    let enabled: HashSet<String> = settings.enabled_languages.iter().cloned().collect();
+    let snapshot = workspace
+        .open_snapshot(&SnapshotRequest::default())
+        .with_context(|| format!("failed to open source snapshot for {}", project.label))?;
+    let plan = refresh_plan(db, workspace, project_id, snapshot.as_ref())?;
+    let extraction = ExtractOptions {
+        body_node_count_threshold: settings.body_node_count_threshold,
+        max_body_chars: settings.max_body_chars,
+    };
+    let registry = LanguageRegistry::global();
+    let mut stats = ProjectStats {
+        label: project.label.clone(),
+        ..ProjectStats::default()
+    };
+    let mut any_change = false;
+    let mut refresh_complete = true;
+
+    match plan {
+        RefreshPlan::Full => {
+            let mut document_ids = HashSet::new();
+            let mut seen = HashSet::new();
+            let mut paths = HashSet::new();
+            for document in snapshot.documents(&DocumentQuery::all())? {
+                let document = match document {
+                    Ok(document) => document,
+                    Err(error) => {
+                        eprintln!(
+                            "failed to enumerate source in project {}: {error}",
+                            project.label
+                        );
+                        stats.failed += 1;
+                        refresh_complete = false;
+                        continue;
+                    }
+                };
+                if !document_ids.insert(document.id.clone()) {
+                    anyhow::bail!(
+                        "source workspace {} returned duplicate document id {}",
+                        descriptor.id,
+                        document.id
+                    );
+                }
+                if !paths.insert(document.location.logical_path.clone()) {
+                    anyhow::bail!(
+                        "source workspace {} returned duplicate logical path {:?}",
+                        descriptor.id,
+                        document.location.logical_path
+                    );
+                }
+                seen.insert(document.id.to_string());
+                match index_document(
+                    db,
+                    settings,
+                    project,
+                    project_id,
+                    generation,
+                    enrichers,
+                    snapshot.as_ref(),
+                    &enabled,
+                    registry,
+                    &extraction,
+                    &document,
+                ) {
+                    Ok(outcome) => record_outcome(&mut stats, &mut any_change, outcome),
+                    Err(error) => {
+                        eprintln!(
+                            "failed to index {} in project {}: {error}",
+                            document.location.logical_path, project.label
+                        );
+                        stats.failed += 1;
+                    }
+                }
+            }
+            if refresh_complete {
+                for record in db.list_files(project_id)? {
+                    if !seen.contains(&record.source_document_id) {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                }
+            }
+        }
+        RefreshPlan::Delta(changes) => {
+            for (document_id, upsert) in changes {
+                if !upsert {
+                    if let Some(record) =
+                        db.get_file_by_source_id(project_id, document_id.as_str())?
+                    {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                    continue;
+                }
+                let Some(document) = snapshot.document(&document_id)? else {
+                    if let Some(record) =
+                        db.get_file_by_source_id(project_id, document_id.as_str())?
+                    {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                    continue;
+                };
+                match index_document(
+                    db,
+                    settings,
+                    project,
+                    project_id,
+                    generation,
+                    enrichers,
+                    snapshot.as_ref(),
+                    &enabled,
+                    registry,
+                    &extraction,
+                    &document,
+                ) {
+                    Ok(outcome) => record_outcome(&mut stats, &mut any_change, outcome),
+                    Err(error) => {
+                        eprintln!(
+                            "failed to index {} in project {}: {error}",
+                            document.location.logical_path, project.label
+                        );
+                        stats.failed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if any_change {
+        resolve_usage(db, project_id, settings.retention)?;
+    }
+    if refresh_complete && stats.failed == 0 {
+        if let Some(checkpoint) = snapshot.checkpoint() {
+            db.set_source_checkpoint(
+                project_id,
+                checkpoint.workspace.as_str(),
+                checkpoint.token.as_ref(),
+            )?;
+        } else {
+            db.clear_source_checkpoint(project_id)?;
+        }
+    }
+    stats.total_units = db.count_units_for_project(project_id)? as usize;
+    Ok(stats)
+}
+
+fn refresh_plan(
+    db: &Db,
+    workspace: &dyn SourceWorkspace,
+    project_id: ProjectId,
+    snapshot: &dyn SourceSnapshot,
+) -> Result<RefreshPlan> {
+    if !workspace.capabilities().change_feed {
+        return Ok(RefreshPlan::Full);
+    }
+    let Some(to) = snapshot.checkpoint() else {
+        return Ok(RefreshPlan::Full);
+    };
+    let Some((workspace_id, token)) = db.get_source_checkpoint(project_id)? else {
+        return Ok(RefreshPlan::Full);
+    };
+    if workspace_id != to.workspace.as_str() {
+        return Ok(RefreshPlan::Full);
+    }
+    let from = SourceCheckpoint {
+        workspace: to.workspace.clone(),
+        token: Arc::from(token),
+    };
+    let delta = match workspace.changes_between(&from, to, &DocumentQuery::all()) {
+        Ok(Some(delta)) => delta,
+        Ok(None) => return Ok(RefreshPlan::Full),
+        Err(error)
+            if matches!(
+                error.kind(),
+                SourceErrorKind::CheckpointExpired | SourceErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(RefreshPlan::Full);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        delta.from == from && delta.to == *to,
+        "source workspace returned a change range different from the requested checkpoints"
+    );
+    let mut changes = BTreeMap::new();
+    for change in delta.changes {
+        match change? {
+            SourceChange::Upsert(document) => {
+                changes.insert(document.id, true);
+            }
+            SourceChange::Remove(id) => {
+                changes.insert(id, false);
+            }
+            SourceChange::Move { id, .. } => {
+                changes.insert(id, true);
+            }
+        }
+    }
+    Ok(RefreshPlan::Delta(changes))
+}
+
+#[derive(Clone, Copy)]
+enum DocumentOutcome {
+    Skipped,
+    Indexed(usize),
+    Removed,
+}
+
+fn record_outcome(stats: &mut ProjectStats, any_change: &mut bool, outcome: DocumentOutcome) {
+    match outcome {
+        DocumentOutcome::Skipped => stats.skipped += 1,
+        DocumentOutcome::Indexed(units) => {
+            stats.indexed += 1;
+            stats.units += units;
+            *any_change = true;
+        }
+        DocumentOutcome::Removed => {
+            stats.removed += 1;
+            *any_change = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_document(
+    db: &Db,
+    settings: &IndexSettings,
+    project: &SourceProject<'_>,
+    project_id: ProjectId,
+    generation: i64,
+    enrichers: &[&dyn RepresentationEnricher],
+    snapshot: &dyn SourceSnapshot,
+    enabled: &HashSet<String>,
+    registry: &'static LanguageRegistry,
+    extraction: &ExtractOptions,
+    document: &DocumentDescriptor,
+) -> Result<DocumentOutcome> {
+    let source_document_id = document.id.to_string();
+    let relative_path = document.location.logical_path.clone();
+    let existing = db.get_file_by_source_id(project_id, &source_document_id)?;
+    let Some(language_id) = resolve_language(document, enabled, registry) else {
+        if let Some(record) = existing {
+            db.delete_file(record.id)?;
+            return Ok(DocumentOutcome::Removed);
+        }
+        return Ok(DocumentOutcome::Skipped);
+    };
+    let mtime_ns = modified_ns(document.version.modified_at);
+    let size = document.version.size.unwrap_or_default() as i64;
+    let metadata_unchanged = existing.as_ref().is_some_and(|record| {
+        record.source_revision == document.version.token.as_str()
+            && record.relative_path == relative_path
+            && record.language_id == language_id
+    });
+    let revision_is_trusted = document.version.guarantee == RevisionGuarantee::ContentIdentity
+        || settings.revision_verification == RevisionVerification::Fast;
+    if metadata_unchanged && revision_is_trusted {
+        return Ok(DocumentOutcome::Skipped);
+    }
+
+    let content = snapshot.read(document)?;
+    let source = content.utf8()?;
+    let source_hash = sha256_hex(source);
+    db.put_source_blob(
+        &source_hash,
+        source.as_bytes(),
+        content.encoding_hint.as_deref(),
+    )?;
+    if let Some(record) = &existing
+        && record.source_hash == source_hash
+        && record.relative_path == relative_path
+        && record.language_id == language_id
+    {
+        db.update_file_meta(
+            record.id,
+            document.version.token.as_str(),
+            mtime_ns,
+            content.observed_version.size.unwrap_or_default() as i64,
+        )?;
+        return Ok(DocumentOutcome::Skipped);
+    }
+
+    let def = registry
+        .get(&language_id)
+        .with_context(|| format!("unknown language {language_id}"))?;
+    let mut entities = extract_units(def, source, extraction)
+        .with_context(|| format!("failed to parse {relative_path}"))?;
+    for entity in &mut entities {
+        complete_representations(source, entity);
+        apply_enrichers(document, source, entity, enrichers)?;
+    }
+    let references = extract_references(def, source).unwrap_or_else(|error| {
+        eprintln!("failed to extract references from {relative_path}: {error}");
+        Vec::new()
+    });
+    let prior = match &existing {
+        Some(record) => db.list_units_for_file(record.id)?,
+        None => Vec::new(),
+    };
+    let mut units = assign_identity(
+        &project.label,
+        &source_document_id,
+        &prior,
+        entities,
+        generation,
+    );
+    apply_retention(&mut units, settings.retention);
+    let file_id = db.upsert_file(&NewFile {
+        project_id,
+        source_document_id,
+        source_revision: document.version.token.to_string(),
+        relative_path,
+        language_id,
+        mtime_ns,
+        size: content
+            .observed_version
+            .size
+            .unwrap_or(size.max(0) as u64) as i64,
+        source_hash,
+    })?;
+    let unit_ids = db.insert_units(file_id, &units)?;
+    stage_references(db, &units, &unit_ids, &references)?;
+    Ok(DocumentOutcome::Indexed(units.len()))
+}
+
+'''
+          p.write_text(text[:start] + replacement + text[end:])
+
+          # Tests for delta-only refresh and source recovery without the provider.
+          p = Path("crates/indexer/src/lib.rs")
+          text = p.read_text()
+          marker = "    #[test]\n    fn body_and_name_erased_channels_are_materialized()"
+          if marker not in text:
+              raise SystemExit("indexer test insertion marker missing")
+          insert = r'''    #[test]
+    fn memory_change_feed_only_reconciles_changed_documents() {
+        let source = MemorySource::new("memory://changes");
+        let alpha = source.insert("alpha.rs", "fn alpha() -> i32 { 1 }");
+        let beta = source.insert("beta.rs", "fn beta() -> i32 { 2 }");
+        source.insert("stable.rs", "fn stable() -> i32 { 3 }");
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            workspace: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+
+        source.insert_with_id(
+            alpha,
+            "alpha.rs",
+            "fn alpha() -> i32 { 10 }",
+            LanguageHint::Unknown,
+        );
+        source.remove(&beta);
+        source.insert("gamma.rs", "fn gamma() -> i32 { 4 }");
+        let stats = index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(stats[0].indexed, 2);
+        assert_eq!(stats[0].removed, 1);
+        assert_eq!(stats[0].skipped, 0);
+        assert_eq!(stats[0].total_units, 3);
+    }
+
+    #[test]
+    fn minimal_retention_recovers_from_durable_source_cache() {
+        use codeindex_embedding::config::{
+            EmbeddingConfig, EmbeddingRunConfig, SourceRecoveryConfig,
+        };
+        use codeindex_embedding::embed::hash::HashEmbedder;
+
+        let source = MemorySource::new("memory://cache");
+        let id = source.insert(
+            "lib.rs",
+            "fn cached(input: &str) -> usize { let value = input.len(); value }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let mut cache_settings = settings();
+        cache_settings.retention = RetentionMode::Minimal;
+        let projects = [SourceProject {
+            label: "main".into(),
+            workspace: &source,
+        }];
+        index_sources(&db, &cache_settings, &projects, None).unwrap();
+        source.remove(&id);
+
+        let config = EmbeddingRunConfig {
+            embedding: EmbeddingConfig::default(),
+            source_recovery: SourceRecoveryConfig {
+                body_node_count_threshold: 1,
+            },
+        };
+        let mut embedder = HashEmbedder::new(32);
+        let stats = embed_pending(&db, &mut embedder, &config).unwrap();
+        assert!(stats.embedded > 0);
+        assert_eq!(stats.unresolved, 0);
+    }
+
+'''
+          text = text.replace(marker, insert + marker, 1)
+          p.write_text(text)
+
+          # Roadmap/docs: mark the two requested capabilities complete.
+          replace_once(
+              "TODO.md",
+              "- [ ] **Source-provider ergonomics.** Add maintained Git-tree and editor-overlay\n       providers; optimize provider catalogs so source recovery does not need full\n       enumeration on every lookup.\n",
+              "- [ ] **Source-provider ergonomics.** Add a maintained Git-tree provider. Editor\n       overlays, direct source lookup, bounded checkpoint feeds, and durable\n       content-addressed recovery are implemented.\n",
+          )
+          replace_once(
+              "README.md",
+              "Providers expose stable document identities, logical paths, opaque revisions,\nand UTF-8 content. Database, object-store, Git-tree, archive, generated-source,\nand editor-overlay providers can reuse the same indexing pipeline.\n",
+              "Workspaces expose stable document identities, logical paths, revisions, coherent\nsnapshots, and optional bounded change feeds. The indexer persists provider\ncheckpoints and consumes complete deltas when available, falling back to a full\nreconciliation when a checkpoint expires. Indexed source is retained in a\ndeduplicated content-addressed cache so minimal/report representations can be\nreconstructed after the original snapshot disappears.\n",
+          )
+          PY
+          python /tmp/patch.py
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo check -p codeindex --features fastembed
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock README.md TODO.md crates
+          git commit -m "consume source deltas and cache source content"
+          git push origin HEAD:${{ github.head_ref }}
