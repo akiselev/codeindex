@@ -36,28 +36,34 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
+          (
+            set -euo pipefail
             if grep -q 'SCHEMA_VERSION: i64 = 3' crates/sqlite/src/migrations.rs; then
               echo 'incremental source implementation already applied'
               exit 0
             fi
             python - <<'PY'
           from pathlib import Path
-          import textwrap
 
           workflow = Path('.github/workflows/source-incremental-cas-fixup.yml').read_text()
           start_marker = "          cat > /tmp/patch.py <<'PY'\n"
           end_marker = "\n          PY\n"
           start = workflow.index(start_marker) + len(start_marker)
           end = workflow.index(end_marker, start)
-          Path('/tmp/patch.py').write_text(textwrap.dedent(workflow[start:end]))
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in lines
+          ) + '\n'
+          Path('/tmp/patch.py').write_text(script)
           PY
             python /tmp/patch.py
+            grep -q 'SCHEMA_VERSION: i64 = 3' crates/sqlite/src/migrations.rs
             cargo fmt --all
             cargo clippy --workspace --all-targets -- -D warnings
             cargo test --workspace
             cargo check -p codeindex --features fastembed
-          } > source-fixup.log 2>&1
+          ) > source-fixup.log 2>&1
           status=$?
           cat source-fixup.log
           exit $status
