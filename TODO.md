@@ -7,14 +7,13 @@ by priority.
 
 ## P0 — release hygiene (blocks any external consumer)
 
-- [ ] **License.** No crate declares a license and there is no `LICENSE` file.
-      Decide the license (recommendation: dual `MIT OR Apache-2.0`, the Rust
-      ecosystem norm — needs owner sign-off), add `LICENSE-MIT` /
-      `LICENSE-APACHE`, and set `license = "MIT OR Apache-2.0"` on every crate.
-- [ ] **Crate metadata.** Add `repository`, `authors`, `keywords`, `categories`,
-      and a one-line `description` (present) to each `crates/*/Cargo.toml`.
-      Consider a `[workspace.package]` block so the shared fields live in one
-      place.
+- [x] **License.** *(done 2026-07-11)* Dual `MIT OR Apache-2.0`: `LICENSE-MIT` /
+      `LICENSE-APACHE` at the repo root; `license` inherited from
+      `[workspace.package]`.
+- [x] **Crate metadata.** *(done 2026-07-11)* Shared `version` / `edition` /
+      `authors` / `repository` / `keywords` / `categories` live in
+      `[workspace.package]`; each crate inherits them and keeps its own
+      one-line `description`.
 - [ ] **Publish scope.** All 7 crates are `publish = false`. Decide what ships to
       crates.io (facade + the six members) vs stays internal, and flip the flag
       once license + metadata land. Reserve the crate names early if publishing.

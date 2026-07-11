@@ -1,7 +1,12 @@
 [package]
 name = "codeindex"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Facade over the reusable codeindex crates"
 publish = false
 

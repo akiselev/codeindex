@@ -1,7 +1,12 @@
 [package]
 name = "codeindex-indexer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Incremental filesystem indexing orchestration for codeindex"
 publish = false
 

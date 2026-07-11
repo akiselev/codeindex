@@ -1,7 +1,12 @@
 [package]
 name = "codeindex-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Application-neutral domain model for source-code indexing"
 publish = false
 

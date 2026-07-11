@@ -1,7 +1,12 @@
 [package]
 name = "codeindex-search"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "End-to-end semantic search over a code index: load, embed, verify, rank, resolve"
 publish = false
 

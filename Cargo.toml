@@ -11,6 +11,15 @@ members = [
     "crates/tree-sitter",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Alexander Kiselev <alex@akiselev.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/akiselev/codeindex"
+keywords = ["code-search", "embeddings", "indexing", "semantic-search", "tree-sitter"]
+categories = ["development-tools", "text-processing"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
