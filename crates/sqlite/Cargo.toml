@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.103"
-codeindex-core = { path = "../codeindex-core" }
+codeindex-core = { path = "../core" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1.0.150"
 

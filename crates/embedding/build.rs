@@ -5,8 +5,8 @@ fn main() {
     let lock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
     let text = std::fs::read_to_string(lock).unwrap_or_default();
     for (package, var) in [
-        ("fastembed", "DECOMBINE_FASTEMBED_VERSION"),
-        ("ort", "DECOMBINE_ORT_VERSION"),
+        ("fastembed", "CODEINDEX_FASTEMBED_VERSION"),
+        ("ort", "CODEINDEX_ORT_VERSION"),
     ] {
         let version = locked_version(&text, package).unwrap_or_else(|| "unknown".to_string());
         println!("cargo:rustc-env={var}={version}");

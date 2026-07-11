@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.103"
-codeindex-core = { path = "../codeindex-core" }
+codeindex-core = { path = "../core" }
 fastembed = { version = "5.17.2", optional = true }
 hex = "0.4.3"
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false }

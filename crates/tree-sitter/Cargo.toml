@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.103"
-codeindex-core = { path = "../codeindex-core" }
+codeindex-core = { path = "../core" }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"

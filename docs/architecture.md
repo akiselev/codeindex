@@ -98,7 +98,7 @@ NewCodeUnit  ──▶  code_units table          (codeindex-indexer::index)
 
 - **A new language** = a Tree-sitter grammar dependency + `assets/languages/
   <id>.toml` + `assets/languages/<id>/units.scm`, added to the `bundled!` list
-  in `codeindex-tree-sitter/src/language.rs`. Reach for a `LanguageAdapter` only
+  in `crates/tree-sitter/src/language.rs`. Reach for a `LanguageAdapter` only
   when a capture cannot be expressed in the query.
 - **A new backend** = another `Embedder` implementation plus a branch in
   `embedder_from_config`. Backends must be deterministic for a fixed identity.

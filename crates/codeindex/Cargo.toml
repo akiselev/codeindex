@@ -6,12 +6,12 @@ description = "Facade over the reusable codeindex crates"
 publish = false
 
 [dependencies]
-codeindex-core = { path = "../codeindex-core" }
-codeindex-embedding = { path = "../codeindex-embedding", default-features = false }
-codeindex-indexer = { path = "../codeindex-indexer" }
-codeindex-query = { path = "../codeindex-query" }
-codeindex-sqlite = { path = "../codeindex-sqlite" }
-codeindex-tree-sitter = { path = "../codeindex-tree-sitter" }
+codeindex-core = { path = "../core" }
+codeindex-embedding = { path = "../embedding", default-features = false }
+codeindex-indexer = { path = "../indexer" }
+codeindex-query = { path = "../query" }
+codeindex-sqlite = { path = "../sqlite" }
+codeindex-tree-sitter = { path = "../tree-sitter" }
 
 [features]
 default = []

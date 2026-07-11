@@ -143,8 +143,8 @@ impl FastembedBackend {
             return Ok(Self {
                 identity: ModelIdentity {
                     backend: "fastembed".into(),
-                    backend_version: env!("DECOMBINE_FASTEMBED_VERSION").into(),
-                    runtime_version: Some(format!("ort {}", env!("DECOMBINE_ORT_VERSION"))),
+                    backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
+                    runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
                     model: config.model.clone(),
                     revision: Some(format!(
                         "custom:{} pooling={} max_length={}",
@@ -185,8 +185,8 @@ impl FastembedBackend {
             return Ok(Self {
                 identity: ModelIdentity {
                     backend: "fastembed".into(),
-                    backend_version: env!("DECOMBINE_FASTEMBED_VERSION").into(),
-                    runtime_version: Some(format!("ort {}", env!("DECOMBINE_ORT_VERSION"))),
+                    backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
+                    runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
                     model: config.model.clone(),
                     // Path-independent so the identity is stable across machines,
                     // unlike an explicit custom block's absolute-path revision.
@@ -227,8 +227,8 @@ impl FastembedBackend {
         Ok(Self {
             identity: ModelIdentity {
                 backend: "fastembed".into(),
-                backend_version: env!("DECOMBINE_FASTEMBED_VERSION").into(),
-                runtime_version: Some(format!("ort {}", env!("DECOMBINE_ORT_VERSION"))),
+                backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
+                runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
                 model: config.model.clone(),
                 revision: Some(model_code),
                 dimensions,

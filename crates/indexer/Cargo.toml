@@ -7,10 +7,10 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.103"
-codeindex-core = { path = "../codeindex-core" }
-codeindex-embedding = { path = "../codeindex-embedding", default-features = false }
-codeindex-sqlite = { path = "../codeindex-sqlite" }
-codeindex-tree-sitter = { path = "../codeindex-tree-sitter" }
+codeindex-core = { path = "../core" }
+codeindex-embedding = { path = "../embedding", default-features = false }
+codeindex-sqlite = { path = "../sqlite" }
+codeindex-tree-sitter = { path = "../tree-sitter" }
 ignore = "0.4.27"
 
 [dev-dependencies]

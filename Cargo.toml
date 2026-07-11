@@ -2,12 +2,12 @@
 resolver = "3"
 members = [
     "crates/codeindex",
-    "crates/codeindex-core",
-    "crates/codeindex-embedding",
-    "crates/codeindex-indexer",
-    "crates/codeindex-query",
-    "crates/codeindex-sqlite",
-    "crates/codeindex-tree-sitter",
+    "crates/core",
+    "crates/embedding",
+    "crates/indexer",
+    "crates/query",
+    "crates/sqlite",
+    "crates/tree-sitter",
 ]
 
 [profile.release]
