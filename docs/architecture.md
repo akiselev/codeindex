@@ -1,107 +1,254 @@
 # Architecture
 
-`codeindex` is split by **dependency and change boundary**, not by command. The
-guiding constraint is that the pure embedding primitives must never drag in
-storage or parser code, so that a lightweight consumer (e.g. a Python/PyO3
-binding for exploring embeddings in a notebook) can depend on just the embedder
-without compiling bundled SQLite or twelve Tree-sitter grammars.
+`codeindex` is split by dependency and change boundary, not by command or user
+interface. The workspace is a reusable library substrate. A future
+`codeindex-cli`, IDE extension, daemon, binding, or analyzer is a consumer of
+these crates rather than part of the core architecture.
 
-## The crates
+## Crate boundaries
 
-- **`codeindex-core`** — application-neutral vocabulary with no dependencies of
-  its own: `LanguageId`, `EntityKind`, `SourceSpan`, the `RepresentationKind`
-  channels, `ExtractedEntity`/`ExtractedFile`, and the embedding `ModelIdentity`.
-  `ModelIdentity` lives here (not in the store) because it is the shared contract
-  between the backends that *produce* it and the persistence layer that *stores*
-  it; keeping it in the leaf lets `codeindex-embedding` name it without depending
-  on SQLite.
+### `codeindex-core`
 
-- **`codeindex-tree-sitter`** — the language frontend. Grammars are compiled in;
-  each language is declared by `assets/languages/<id>.toml` (extensions, comment
-  node kinds, scope rules, adapter name) plus `<id>/units.scm` (the Tree-sitter
-  query that captures units, names, bodies, and strip ranges). Irregular cases
-  that a query cannot express — anonymous-function naming, receiver scopes,
-  docstring stripping — live in `LanguageAdapter` implementations in
-  `language.rs`. Extraction produces parser-neutral `ExtractedEntity` values.
+Application-neutral vocabulary:
 
-- **`codeindex-sqlite`** — the incremental schema, migrations, model-identity
-  rows, vector blobs, immutable-setting guards, and the persistence API (`Db`).
-  It owns the single `impl From<ExtractedEntity> for NewCodeUnit` — the one place
-  the representation channels map onto the current schema's
-  `display_source`/`embedding_text` columns.
+- source languages and spans;
+- logical `EntityId` and exact `EntityVersionId`;
+- `RepresentationKind`, `Representation`, and `RepresentationOrigin`;
+- exact `ModelIdentity`;
+- named `EmbeddingSpaceId` and `EmbeddingSpaceIdentity`.
 
-- **`codeindex-indexer`** — orchestration over the store. `index()` walks a
-  project root (honoring `.gitignore` and explicit excludes), detects unchanged
-  files by mtime/size then content hash, extracts, applies a retention policy,
-  and writes transactionally. Its `embed` module is the **stored-corpus
-  embedding workflow**: `embed_pending` resumably projects every distinct
-  un-embedded body into a vector, recovers embedding text from source when lean
-  retention did not store it, and `token_report` measures token-length
-  distributions. This is the storage- and parser-coupled half of embedding.
+The model and space contracts live in the leaf crate because embedding backends,
+stores, search, and consumers all need to name them without depending on one
+another.
 
-- **`codeindex-embedding`** — the storage/parser-free half. The `Embedder`
-  trait, the fastembed/ONNX backend (feature-gated), provider diagnostics, the
-  length-sorted **batch packer** (bounds a batch's padded token area — the term
-  ONNX attention memory scales with), vector normalization, and `TokenStats`.
-  Depends only on `codeindex-core`.
+### `codeindex-tree-sitter`
 
-- **`codeindex-query`** — read-side primitives an agent-facing query layer needs:
-  the `UnitView` trait, stable `unit:<hash>` selectors and one-line rendering,
-  `WhereFilter` (`project=`, `language=`, `kind=`, `name=`, `scope=`, `path=`,
-  `min_nodes=`), deterministic `rank_candidates`, and `identity_diff` for
-  explaining a model-identity mismatch.
+The bundled language frontend. Language metadata and Tree-sitter queries extract
+parser-neutral entities, signatures, documentation, symbols, and raw call sites.
+Language adapters handle cases queries cannot express cleanly, such as anonymous
+function naming, receiver scopes, and docstring stripping.
 
-- **`codeindex`** — a facade that re-exports the six crates as `core`,
-  `tree_sitter`, `sqlite`, `indexer`, `embedding`, and `query` for consumers
-  that prefer a single dependency, forwarding the `fastembed`/`accel` features.
+### `codeindex-storage`
+
+The serializable read-side seam. `IndexSnapshot` contains selected projects,
+units with all representations and provenance, and zero or more named embedding
+spaces. `codeindex-search` loads only this type and has no SQLite dependency.
+Alternative stores need only construct a valid snapshot to reuse search.
+
+### `codeindex-sqlite`
+
+The default incremental store. It persists:
+
+- projects and provider-defined source document identities/revisions;
+- a logical entity ledger and current entity versions;
+- normalized representation rows with provenance;
+- exact embedding models;
+- named embedding spaces;
+- vectors keyed by `(space_id, content_hash)`;
+- staged call references and analysis provenance.
+
+The schema is pre-release. Incompatible epochs are rejected and require a
+reindex rather than being silently accepted or partially migrated.
+
+### `codeindex-indexer`
+
+The orchestration layer. Its primary entry point is provider-neutral
+`index_sources`; filesystem `index` is a compatibility convenience built over
+`FileSystemSource`.
+
+The indexer:
+
+1. enumerates `SourceDocument` values from each `SourceProvider`;
+2. performs cheap revision checks, then verifies changed content by hash;
+3. extracts entities and deterministic representations;
+4. completes `Body` and `BodyWithoutDeclaredName` channels;
+5. runs optional `RepresentationEnricher` implementations;
+6. carries logical entity identity across unambiguous edits and renames;
+7. persists units and representations;
+8. resolves call sites into the derived `Usage` channel;
+9. projects representation content into explicit embedding spaces.
+
+`SourceProviderCatalog` supplies the same source abstraction during embedding
+text recovery under lean retention.
+
+### `codeindex-embedding`
+
+Storage- and parser-free embedding primitives:
+
+- `Embedder`;
+- fastembed/custom ONNX execution;
+- managed models and accelerator diagnostics;
+- exact tokenizer accounting;
+- length-sorted token-area batch packing;
+- vector normalization and token statistics.
+
+### `codeindex-query`
+
+Embedding-free read-side kernels: metadata filters, stable selectors,
+deterministic vector ranking, and model identity diagnostics.
+
+### `codeindex-search`
+
+The high-level search service. It validates an `IndexSnapshot`, aligns each
+space's vectors with units through representation hashes, and exposes:
+
+- text search in an explicit embedding space;
+- vector search;
+- unit-to-unit similarity;
+- weighted reciprocal-rank fusion across spaces.
+
+Raw cosine values from different models are never directly averaged. Fusion
+combines ranks and retains each space's raw score as evidence.
+
+### `codeindex`
+
+A thin facade re-exporting all component crates.
+
+## Source-provider boundary
+
+A provider exposes four concepts:
+
+```text
+project locator
+  └── SourceDocument
+        ├── stable provider-local id
+        ├── logical relative path
+        ├── language id
+        ├── opaque revision metadata
+        └── UTF-8 content
+```
+
+The provider is not a virtual filesystem. Database rows, Git objects, editor
+buffers, object-store keys, archives, generated code, and actual files can all
+implement the same contract without inventing filesystem operations they do not
+support.
+
+Document identity and display path are separate. A provider can preserve the
+same document id across a move, allowing the indexer to retain entity identity
+while updating location metadata.
+
+## Representation model
+
+An entity version owns N representations:
+
+```text
+EntityId
+  └── EntityVersionId
+        ├── FullSource
+        ├── Implementation
+        ├── Body
+        ├── BodyWithoutDeclaredName
+        ├── Signature
+        ├── Symbol
+        ├── Documentation
+        ├── Usage
+        ├── GeneratedDescription
+        └── Custom(...)
+```
+
+Each representation stores a content hash, optional retained content, and
+provenance:
+
+- `Extracted`: deterministic frontend output recoverable from source;
+- `Derived`: synthesized from indexed facts, such as Usage;
+- `Imported`: supplied by a consumer, model, or external system.
+
+Retention is provenance-aware. Lean modes may drop extracted text that can be
+recovered through the source provider. Derived/imported text is retained unless
+its producer supplies another recovery mechanism.
+
+## Entity identity
+
+The current identity matcher is deliberately conservative and within one stable
+source document:
+
+1. exact `(kind, scope, name)` match;
+2. otherwise, a unique matching normalized body and kind;
+3. otherwise, mint a new logical entity id.
+
+Duplicate identical bodies are not assigned by incidental ordering. Ambiguous
+matches mint new identities. Cross-document move tracking remains future work.
+
+## Embedding spaces
+
+A representation channel and an embedding model are different axes. An
+`EmbeddingSpaceIdentity` binds:
+
+```text
+space id
++ representation channel
++ exact model identity
++ input transform
+```
+
+This permits, for example:
+
+```text
+code       = Implementation × CodeRankEmbed
+body       = BodyWithoutDeclaredName × CodeRankEmbed
+docs       = Documentation × text embedding model
+usage      = Usage × text/code model
+description = GeneratedDescription × text embedding model
+```
+
+Identical representation hashes share one vector inside a space. The same
+content can be embedded in multiple spaces without collisions. Space ids are
+immutable semantic keys: an existing id cannot silently change channel, model,
+or input transform.
 
 ## Data flow
 
+```text
+SourceProvider
+    │ enumerate/read
+    ▼
+SourceDocument
+    │ Tree-sitter frontend + adapters
+    ▼
+ExtractedEntity
+    │ representation completion + enrichers + identity assignment
+    ▼
+entities / code_units / representations
+    │ call-site resolution
+    ├──────────────► Usage representation
+    │
+    │ embed_space_pending(space identity, embedder)
+    ▼
+embedding_spaces / embeddings
+    │ Db::snapshot or another backend
+    ▼
+IndexSnapshot
+    │ SearchIndex::from_snapshot (validated)
+    ▼
+per-space search / similarity / rank fusion
 ```
-source files
-   │  codeindex-tree-sitter: parse + query + adapters + normalize
-   ▼
-ExtractedEntity            (parser-neutral, N representation channels)
-   │  From<ExtractedEntity>  (codeindex-sqlite)
-   ▼
-NewCodeUnit  ──▶  code_units table          (codeindex-indexer::index)
-                     │  distinct normalized_body_hash
-                     ▼
-                 embed_pending               (codeindex-indexer::embed)
-                     │  Embedder (codeindex-embedding), batch-packed
-                     ▼
-                 embeddings table  (vector blob keyed by model_id + body_hash)
-                     │
-                     ▼
-                 rank_candidates             (codeindex-query)
-```
 
-## Design invariants
+## Invariants
 
-- **Determinism.** For a fixed `ModelIdentity`, embeddings are reproducible;
-  `rank_candidates` breaks score ties by index; `unit_id` is a stable hash over
-  `(project, path, byte range, body hash, name, scope, language)`.
-- **Model identity is a key, not a label.** A database binds to one
-  `ModelIdentity`; embeddings for different backends/models/providers never
-  share a row. Immutable settings (body threshold, retention, normalization,
-  model identity) are checked on every run.
-- **Incremental by content.** Re-indexing skips files whose mtime/size are
-  unchanged, then whose content hash is unchanged. Embeddings are keyed by
-  `(model, body-hash)`, so they survive re-indexing and are shared across
-  identical bodies.
-- **Retention is a projection, not a parse-time decision.** `Full` keeps display
-  source and embedding text; `Report` drops embedding text; `Minimal` drops both
-  and re-derives them from source when needed. Extraction output is identical
-  across modes.
+- **Determinism.** Providers return deterministic ordering; persisted and
+  snapshot rows are ordered; ranking breaks ties deterministically.
+- **Stable semantic keys.** Model identities and embedding-space identities are
+  persisted contracts, not display labels.
+- **Incremental by provider revision and content.** Equal revisions avoid reads;
+  changed revisions are verified with source hashes.
+- **Content-addressed representations.** Embeddings survive reindexing whenever
+  a representation's content hash remains present.
+- **Storage-neutral search.** Search validates public snapshot data and returns
+  errors for malformed dimensions, duplicate space ids/hashes, or non-finite
+  vectors rather than panicking.
+- **Application neutrality.** The core reports semantic evidence. Duplicate,
+  security, correctness, ownership, and migration conclusions belong to
+  consumers such as `decombine`.
 
-## Extending
+## Extension points
 
-- **A new language** = a Tree-sitter grammar dependency + `assets/languages/
-  <id>.toml` + `assets/languages/<id>/units.scm`, added to the `bundled!` list
-  in `crates/tree-sitter/src/language.rs`. Reach for a `LanguageAdapter` only
-  when a capture cannot be expressed in the query.
-- **A new backend** = another `Embedder` implementation plus a branch in
-  `embedder_from_config`. Backends must be deterministic for a fixed identity.
-- **A new representation channel** = a `RepresentationKind` variant emitted by
-  the frontend; persisting more than one channel is a schema migration in
-  `codeindex-sqlite`, deliberately kept separate from extraction.
+- New source: implement `SourceProvider`.
+- New derived/imported channel: implement `RepresentationEnricher` or write a
+  representation with explicit provenance.
+- New language: add a grammar, language metadata, unit/reference queries, and
+  fixtures; use an adapter only when necessary.
+- New embedding backend: implement `Embedder` with a reproducible
+  `ModelIdentity`.
+- New persistence backend: construct `IndexSnapshot` for search; a generalized
+  incremental write-side store interface may be added when a second backend
+  needs to reuse the indexer.
