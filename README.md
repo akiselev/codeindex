@@ -124,7 +124,9 @@ snapshots, and optional bounded change feeds. The indexer persists provider
 checkpoints and consumes complete deltas when available, falling back to a full
 reconciliation when a checkpoint expires. Indexed source is retained in a
 deduplicated content-addressed cache so minimal/report representations can be
-reconstructed after the original snapshot disappears.
+reconstructed after the original snapshot disappears. Cache entries are retained
+while their indexed file version remains present and are pruned when no indexed
+file references that source hash.
 
 ## Representations
 
