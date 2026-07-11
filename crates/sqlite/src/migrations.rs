@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-/// The current schema version. The project is pre-release, so the schema is a
-/// single clean bootstrap rather than an append-only migration ledger: opening
-/// a database at a different version is a hard error (delete and reindex), not
-/// a migration. `PRAGMA user_version` records the applied version.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Schema epoch. Version 1 was the pre-space M4 prototype; it is intentionally
+/// rejected rather than migrated because the project remains pre-release.
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE metadata(
@@ -30,17 +28,18 @@ CREATE TABLE projects(
 CREATE TABLE files(
   id INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_document_id TEXT NOT NULL,
+  source_revision TEXT NOT NULL,
   relative_path TEXT NOT NULL,
   language_id TEXT NOT NULL,
   mtime_ns INTEGER NOT NULL,
   size INTEGER NOT NULL,
   source_hash TEXT NOT NULL,
+  UNIQUE (project_id, source_document_id),
   UNIQUE (project_id, relative_path)
 );
 CREATE INDEX idx_files_source_hash ON files(source_hash);
 
--- Logical-identity ledger: one row per entity that persists across index
--- generations (M4). A renamed function keeps its entity_id.
 CREATE TABLE entities(
   entity_id        TEXT PRIMARY KEY,
   project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -75,13 +74,12 @@ CREATE INDEX idx_code_units_body_hash ON code_units(normalized_body_hash);
 CREATE INDEX idx_code_units_entity ON code_units(entity_id);
 CREATE INDEX idx_code_units_file_range ON code_units(file_id, start_byte, end_byte);
 
--- One row per representation channel of a unit (M4). `content` is NULL under
--- report/minimal retention; `content_hash` is the embedding key.
 CREATE TABLE representations(
   unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   content TEXT,
+  origin_json TEXT NOT NULL,
   PRIMARY KEY (unit_id, kind)
 );
 CREATE INDEX idx_repr_channel_hash ON representations(kind, content_hash);
@@ -106,20 +104,25 @@ CREATE TABLE embedding_models(
   )
 );
 
--- Vectors keyed by (model, channel, content_hash): every representation channel
--- is embedded and searched independently (M4).
-CREATE TABLE embeddings(
+CREATE TABLE embedding_spaces(
+  space_id TEXT PRIMARY KEY,
   model_id INTEGER NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
   channel TEXT NOT NULL,
+  input_transform TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_spaces_channel ON embedding_spaces(channel);
+CREATE INDEX idx_spaces_model ON embedding_spaces(model_id);
+
+CREATE TABLE embeddings(
+  space_id TEXT NOT NULL REFERENCES embedding_spaces(space_id) ON DELETE CASCADE,
   content_hash TEXT NOT NULL,
   vector_blob BLOB NOT NULL,
   norm REAL NOT NULL,
   created_at TEXT NOT NULL,
-  PRIMARY KEY (model_id, channel, content_hash)
+  PRIMARY KEY (space_id, content_hash)
 );
 
--- Raw call sites staged during indexing; resolved into the Usage channel by
--- the indexer's whole-corpus pass (M4). caller_unit_id is the enclosing unit.
 CREATE TABLE references_raw(
   caller_unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,
   callee_symbol TEXT NOT NULL,
@@ -133,6 +136,7 @@ CREATE TABLE analysis_runs(
   id INTEGER PRIMARY KEY,
   analysis_kind TEXT NOT NULL,
   model_id INTEGER NOT NULL REFERENCES embedding_models(id),
+  space_id TEXT REFERENCES embedding_spaces(space_id),
   project_scope_json TEXT NOT NULL,
   config_json TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -150,9 +154,7 @@ CREATE TABLE analysis_artifacts(
 );
 "#;
 
-/// Bring a freshly opened connection up to the current schema. Because there is
-/// no migration path yet, a non-empty database at a different `user_version` is
-/// rejected rather than migrated.
+/// Initialize a new database or reject any incompatible pre-release epoch.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == SCHEMA_VERSION {
