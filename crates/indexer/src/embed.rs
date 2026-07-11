@@ -1,38 +1,33 @@
-//! Embedding a *stored* corpus, channel by channel: resumable projection of
-//! each representation channel's distinct content into vectors, source-text
-//! recovery under lean retention, and offline token reports. This is the
-//! storage- and parser-coupled half of embedding; the parser/storage-free
-//! primitives it builds on (the [`Embedder`] trait, batch packing,
-//! normalization, token stats) live in `codeindex-embedding`.
+//! Embedding a stored corpus into one or more independently queryable spaces.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use codeindex_core::RepresentationKind;
+use codeindex_core::{
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelIdentity, RepresentationKind,
+};
 use codeindex_embedding::config::EmbeddingRunConfig;
 use codeindex_embedding::{
     Embedder, TokenStats, estimated_tokens, normalize_in_place, pack_batches,
 };
-use codeindex_sqlite::{Db, ModelId, ModelIdentity};
+use codeindex_sqlite::{Db, ModelId};
 use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_units};
+
+use crate::SourceProviderCatalog;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EmbedStats {
-    /// Distinct (channel, content) pairs pending at the start of this run.
     pub pending_total: usize,
-    /// Distinct (channel, content) pairs embedded in this run.
     pub embedded: usize,
-    /// Pending hashes whose text could not be recovered (stale files in
-    /// `minimal`/`report` retention).
     pub unresolved: usize,
     pub batches: usize,
-    /// Token-length instrumentation over embedded inputs (post-truncation
-    /// counts from the packer).
+    pub spaces: usize,
     pub tokens: TokenStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedProgress {
+    pub space_id: EmbeddingSpaceId,
     pub pending_total: usize,
     pub embedded: usize,
     pub unresolved: usize,
@@ -40,9 +35,8 @@ pub struct EmbedProgress {
     pub current_batch: usize,
 }
 
-/// Embed every distinct un-embedded content hash of every channel with this
-/// embedder, enforcing model-identity immutability and resuming where a prior
-/// run stopped.
+/// Convenience projection: create one `default/<channel>` space for every
+/// embeddable representation channel using the same model.
 pub fn embed_pending(
     db: &Db,
     embedder: &mut dyn Embedder,
@@ -57,41 +51,89 @@ pub fn embed_pending_with_progress(
     config: &EmbeddingRunConfig,
     mut progress: impl FnMut(EmbedProgress),
 ) -> Result<EmbedStats> {
-    let identity = embedder.identity().clone();
-    db.check_or_set_immutable("embedding.backend", &identity.backend)?;
-    db.check_or_set_immutable("embedding.model", &identity.model)?;
-    db.check_or_set_immutable("embedding.dimensions", &identity.dimensions.to_string())?;
-    db.check_or_set_immutable("embedding.normalize", &identity.normalize.to_string())?;
-    let model_id = db.find_or_create_model(&identity)?;
-
-    let channels = db.embeddable_channels()?;
-    let mut stats = EmbedStats::default();
-    for channel in &channels {
-        stats.pending_total += db.count_unembedded_hashes(model_id, channel)? as usize;
+    let mut total = EmbedStats::default();
+    for channel in db.embeddable_channels()? {
+        let identity = EmbeddingSpaceIdentity::new(
+            EmbeddingSpaceId::new(format!("default/{channel}")),
+            channel,
+            embedder.identity().clone(),
+        );
+        let stats = embed_space_pending_with_progress(
+            db,
+            embedder,
+            config,
+            &identity,
+            None,
+            &mut progress,
+        )?;
+        merge_stats(&mut total, stats);
     }
-
-    for channel in &channels {
-        embed_channel(db, embedder, config, model_id, &identity, channel, &mut stats, &mut progress)?;
-    }
-    Ok(stats)
+    Ok(total)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn embed_channel(
+/// Embed one explicit space. Different spaces may use different models even
+/// when they target the same representation channel.
+pub fn embed_space_pending(
     db: &Db,
     embedder: &mut dyn Embedder,
     config: &EmbeddingRunConfig,
-    model_id: ModelId,
-    identity: &ModelIdentity,
-    channel: &RepresentationKind,
+    space: &EmbeddingSpaceIdentity,
+) -> Result<EmbedStats> {
+    embed_space_pending_with_progress(db, embedder, config, space, None, &mut |_| {})
+}
+
+/// Embed one explicit space with provider-backed source recovery and progress.
+pub fn embed_space_pending_with_progress(
+    db: &Db,
+    embedder: &mut dyn Embedder,
+    config: &EmbeddingRunConfig,
+    space: &EmbeddingSpaceIdentity,
+    sources: Option<&SourceProviderCatalog<'_>>,
+    progress: &mut impl FnMut(EmbedProgress),
+) -> Result<EmbedStats> {
+    anyhow::ensure!(
+        embedder.identity() == &space.model,
+        "embedder identity does not match embedding space {}",
+        space.id
+    );
+    anyhow::ensure!(
+        space.input_transform == "identity",
+        "embedding space {} requests unsupported input transform {:?}",
+        space.id,
+        space.input_transform
+    );
+    db.find_or_create_space(space)?;
+
+    let mut stats = EmbedStats {
+        pending_total: db.count_unembedded_hashes(&space.id)? as usize,
+        spaces: 1,
+        ..EmbedStats::default()
+    };
+    embed_space(
+        db,
+        embedder,
+        config,
+        space,
+        sources,
+        &mut stats,
+        progress,
+    )?;
+    Ok(stats)
+}
+
+fn embed_space(
+    db: &Db,
+    embedder: &mut dyn Embedder,
+    config: &EmbeddingRunConfig,
+    space: &EmbeddingSpaceIdentity,
+    sources: Option<&SourceProviderCatalog<'_>>,
     stats: &mut EmbedStats,
     progress: &mut impl FnMut(EmbedProgress),
 ) -> Result<()> {
     let mut after_hash: Option<String> = None;
     loop {
         let pending = db.unembedded_hashes_page(
-            model_id,
-            channel,
+            &space.id,
             after_hash.as_deref(),
             config.embedding.pending_page_size,
         )?;
@@ -100,8 +142,8 @@ fn embed_channel(
         }
         after_hash = pending.last().map(|(hash, _)| hash.clone());
 
-        let mut resolved: Vec<(String, String)> = Vec::with_capacity(pending.len());
-        let mut missing: Vec<String> = Vec::new();
+        let mut resolved = Vec::with_capacity(pending.len());
+        let mut missing = Vec::new();
         for (hash, text) in pending {
             match text {
                 Some(text) => resolved.push((hash, text)),
@@ -109,7 +151,13 @@ fn embed_channel(
             }
         }
         if !missing.is_empty() {
-            let recovered = recover_channel_texts(db, config, channel, &missing)?;
+            let recovered = recover_channel_texts(
+                db,
+                config,
+                &space.identity_channel(),
+                &missing,
+                sources,
+            )?;
             for hash in missing {
                 match recovered.get(&hash) {
                     Some(text) => resolved.push((hash, text.clone())),
@@ -117,9 +165,7 @@ fn embed_channel(
                 }
             }
         }
-        // Pack length-sorted items so every batch's padded token area stays
-        // under budget (see `pack_batches`). Hash order only matters for the
-        // page cursor above, not within a page.
+
         let max_sequence_length = embedder.max_sequence_length();
         let mut sized: Vec<(String, String, usize)> = resolved
             .into_iter()
@@ -131,7 +177,7 @@ fn embed_channel(
                 (hash, text, tokens)
             })
             .collect();
-        sized.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        sized.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
 
         for batch in pack_batches(
             &sized,
@@ -141,8 +187,11 @@ fn embed_channel(
         ) {
             stats
                 .tokens
-                .record_batch(batch.iter().map(|(_, _, t)| *t), max_sequence_length);
-            let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
+                .record_batch(batch.iter().map(|(_, _, tokens)| *tokens), max_sequence_length);
+            let texts: Vec<String> = batch
+                .iter()
+                .map(|(_, text, _)| text.clone())
+                .collect();
             let vectors = embedder.embed(&texts)?;
             anyhow::ensure!(
                 vectors.len() == batch.len(),
@@ -152,20 +201,21 @@ fn embed_channel(
             );
             for ((hash, _, _), mut vector) in batch.iter().zip(vectors) {
                 anyhow::ensure!(
-                    vector.len() == identity.dimensions,
+                    vector.len() == space.model.dimensions,
                     "model {} returned {} dimensions, expected {}",
-                    identity.model,
+                    space.model.model,
                     vector.len(),
-                    identity.dimensions
+                    space.model.dimensions
                 );
-                if identity.normalize {
+                if space.model.normalize {
                     normalize_in_place(&mut vector);
                 }
-                db.insert_embedding(model_id, channel, hash, &vector)?;
+                db.insert_embedding(&space.id, hash, &vector)?;
                 stats.embedded += 1;
             }
             stats.batches += 1;
             progress(EmbedProgress {
+                space_id: space.id.clone(),
                 pending_total: stats.pending_total,
                 embedded: stats.embedded,
                 unresolved: stats.unresolved,
@@ -177,30 +227,57 @@ fn embed_channel(
     Ok(())
 }
 
-/// The stored model row for this identity, creating it if this is the first
-/// run for the identity.
+trait SpaceChannel {
+    fn identity_channel(&self) -> RepresentationKind;
+}
+
+impl SpaceChannel for EmbeddingSpaceIdentity {
+    fn identity_channel(&self) -> RepresentationKind {
+        self.channel.clone()
+    }
+}
+
+fn merge_stats(total: &mut EmbedStats, stats: EmbedStats) {
+    total.pending_total += stats.pending_total;
+    total.embedded += stats.embedded;
+    total.unresolved += stats.unresolved;
+    total.batches += stats.batches;
+    total.spaces += stats.spaces;
+    total.tokens.merge(&stats.tokens);
+}
+
 pub fn find_or_create_model_id(db: &Db, identity: &ModelIdentity) -> Result<ModelId> {
     db.find_or_create_model(identity)
 }
 
-/// One language's untruncated token-length distribution.
 #[derive(Debug, Clone)]
 pub struct LanguageTokens {
     pub language: String,
     pub stats: TokenStats,
 }
 
-/// Measure the true (untruncated) token-length distribution of every indexed
-/// unit body (the `Implementation` channel), bucketed by language, using the
-/// model's own tokenizer. Scans all units regardless of embedding state and
-/// recovers text from source under report/minimal retention.
 pub fn token_report(
     db: &Db,
     config: &EmbeddingRunConfig,
     embedder: &dyn Embedder,
 ) -> Result<Vec<LanguageTokens>> {
-    let channel = RepresentationKind::Implementation;
-    let rows = db.channel_texts(&channel)?;
+    token_report_channel(
+        db,
+        config,
+        embedder,
+        &RepresentationKind::Implementation,
+        None,
+    )
+}
+
+pub fn token_report_channel(
+    db: &Db,
+    config: &EmbeddingRunConfig,
+    embedder: &dyn Embedder,
+    channel: &RepresentationKind,
+    sources: Option<&SourceProviderCatalog<'_>>,
+) -> Result<Vec<LanguageTokens>> {
+    let rows = db.channel_texts(channel)?;
     let missing: Vec<String> = rows
         .iter()
         .filter(|(_, _, text)| text.is_none())
@@ -209,7 +286,7 @@ pub fn token_report(
     let recovered = if missing.is_empty() {
         HashMap::new()
     } else {
-        recover_channel_texts(db, config, &channel, &missing)?
+        recover_channel_texts(db, config, channel, &missing, sources)?
     };
 
     let mut by_language: BTreeMap<String, TokenStats> = BTreeMap::new();
@@ -235,16 +312,14 @@ pub fn token_report(
         .collect())
 }
 
-/// In `report`/`minimal` retention a channel's text is not stored; recover it
-/// by re-extracting the source files that contain the pending hashes and
-/// matching each entity's representation for this channel.
 fn recover_channel_texts(
     db: &Db,
     config: &EmbeddingRunConfig,
     channel: &RepresentationKind,
     hashes: &[String],
+    sources: Option<&SourceProviderCatalog<'_>>,
 ) -> Result<HashMap<String, String>> {
-    let wanted: HashSet<&str> = hashes.iter().map(|s| s.as_str()).collect();
+    let wanted: HashSet<&str> = hashes.iter().map(String::as_str).collect();
     let locations = db.locations_for_content_hashes(channel, hashes)?;
     let options = ExtractOptions {
         body_node_count_threshold: config.source_recovery.body_node_count_threshold,
@@ -253,18 +328,30 @@ fn recover_channel_texts(
     let registry = LanguageRegistry::global();
     let mut recovered = HashMap::new();
     for location in locations {
-        let path = std::path::Path::new(&location.source_dir).join(&location.relative_path);
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
+        let source = if let Some(catalog) = sources {
+            catalog.read(
+                &location.project_label,
+                &location.source_document_id,
+                &location.relative_path,
+                &location.language_id,
+            )?
+        } else {
+            let path = std::path::Path::new(&location.source_dir).join(&location.relative_path);
+            std::fs::read_to_string(path).ok()
         };
+        let Some(source) = source else { continue };
         let def = registry
             .get(&location.language_id)
             .with_context(|| format!("unknown language {}", location.language_id))?;
-        for entity in extract_units(def, &source, &options)? {
-            if let Some(repr) = entity.representation(channel)
-                && wanted.contains(repr.content_hash.as_str())
+        for mut entity in extract_units(def, &source, &options)? {
+            super::complete_representations(&source, &mut entity);
+            if let Some(representation) = entity.representation(channel)
+                && wanted.contains(representation.content_hash.as_str())
             {
-                recovered.insert(repr.content_hash.clone(), repr.content.clone());
+                recovered.insert(
+                    representation.content_hash.clone(),
+                    representation.content.clone(),
+                );
             }
         }
     }
