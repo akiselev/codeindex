@@ -321,10 +321,7 @@ pub trait SourceSnapshot: Send + Sync {
         None
     }
 
-    fn documents<'a>(
-        &'a self,
-        query: &'a DocumentQuery,
-    ) -> Result<DocumentIter<'a>, SourceError>;
+    fn documents<'a>(&'a self, query: &'a DocumentQuery) -> Result<DocumentIter<'a>, SourceError>;
 
     fn document(&self, id: &DocumentId) -> Result<Option<DocumentDescriptor>, SourceError> {
         let query = DocumentQuery::all();
@@ -360,7 +357,10 @@ pub trait SourceSnapshot: Send + Sync {
         &self,
         documents: &[DocumentDescriptor],
     ) -> Vec<Result<SourceContent, SourceError>> {
-        documents.iter().map(|document| self.read(document)).collect()
+        documents
+            .iter()
+            .map(|document| self.read(document))
+            .collect()
     }
 }
 
@@ -500,11 +500,9 @@ impl MemoryWorkspace {
         id: &DocumentId,
         logical_path: impl Into<String>,
     ) -> Result<(), SourceError> {
-        let mut documents = self
-            .inner
-            .documents
-            .write()
-            .map_err(|_| SourceError::new(SourceErrorKind::Other, "memory workspace lock poisoned"))?;
+        let mut documents = self.inner.documents.write().map_err(|_| {
+            SourceError::new(SourceErrorKind::Other, "memory workspace lock poisoned")
+        })?;
         let document = documents
             .get_mut(id)
             .ok_or_else(|| SourceError::not_found(format!("unknown source document {id}")))?;
@@ -538,7 +536,9 @@ impl SourceWorkspace for MemoryWorkspace {
             .inner
             .documents
             .read()
-            .map_err(|_| SourceError::new(SourceErrorKind::Other, "memory workspace lock poisoned"))?
+            .map_err(|_| {
+                SourceError::new(SourceErrorKind::Other, "memory workspace lock poisoned")
+            })?
             .clone();
         let checkpoint = SourceCheckpoint {
             workspace: self.inner.descriptor.id.clone(),
@@ -577,10 +577,7 @@ impl SourceSnapshot for MemorySnapshot {
         Some(&self.checkpoint)
     }
 
-    fn documents<'a>(
-        &'a self,
-        query: &'a DocumentQuery,
-    ) -> Result<DocumentIter<'a>, SourceError> {
+    fn documents<'a>(&'a self, query: &'a DocumentQuery) -> Result<DocumentIter<'a>, SourceError> {
         Ok(Box::new(
             self.documents
                 .values()
@@ -598,10 +595,9 @@ impl SourceSnapshot for MemorySnapshot {
     }
 
     fn read(&self, document: &DocumentDescriptor) -> Result<SourceContent, SourceError> {
-        let stored = self
-            .documents
-            .get(&document.id)
-            .ok_or_else(|| SourceError::not_found(format!("unknown source document {}", document.id)))?;
+        let stored = self.documents.get(&document.id).ok_or_else(|| {
+            SourceError::not_found(format!("unknown source document {}", document.id))
+        })?;
         if stored.descriptor.version.token != document.version.token {
             return Err(SourceError::stale(format!(
                 "source document {} is at revision {}, expected {}",
@@ -720,10 +716,7 @@ impl SourceSnapshot for OverlaySnapshot {
         self.consistency
     }
 
-    fn documents<'a>(
-        &'a self,
-        query: &'a DocumentQuery,
-    ) -> Result<DocumentIter<'a>, SourceError> {
+    fn documents<'a>(&'a self, query: &'a DocumentQuery) -> Result<DocumentIter<'a>, SourceError> {
         Ok(Box::new(
             self.documents
                 .iter()
@@ -746,7 +739,9 @@ impl SourceSnapshot for OverlaySnapshot {
             .documents
             .iter()
             .find(|entry| entry.descriptor.id == document.id)
-            .ok_or_else(|| SourceError::not_found(format!("unknown source document {}", document.id)))?;
+            .ok_or_else(|| {
+                SourceError::not_found(format!("unknown source document {}", document.id))
+            })?;
         entry.source.read(&entry.descriptor)
     }
 }
@@ -757,7 +752,9 @@ pub fn validate_snapshot(snapshot: &dyn SourceSnapshot) -> Result<(), SourceErro
     for document in snapshot.documents(&DocumentQuery::all())? {
         let document = document?;
         if document.id.as_str().is_empty() {
-            return Err(SourceError::invalid("source snapshot returned an empty document id"));
+            return Err(SourceError::invalid(
+                "source snapshot returned an empty document id",
+            ));
         }
         if document.location.logical_path.is_empty() {
             return Err(SourceError::invalid(
@@ -815,14 +812,23 @@ mod tests {
             b"fn answer() -> i32 { 42 }".to_vec(),
             LanguageHint::Known("rust".to_string()),
         );
-        let snapshot = workspace.open_snapshot(&SnapshotRequest::default()).unwrap();
+        let snapshot = workspace
+            .open_snapshot(&SnapshotRequest::default())
+            .unwrap();
         let document = snapshot.document(&id).unwrap().unwrap();
         workspace.insert_with_language(
             "src/lib.rs",
             b"fn answer() -> i32 { 43 }".to_vec(),
             LanguageHint::Known("rust".to_string()),
         );
-        assert!(snapshot.read(&document).unwrap().utf8().unwrap().contains("42"));
+        assert!(
+            snapshot
+                .read(&document)
+                .unwrap()
+                .utf8()
+                .unwrap()
+                .contains("42")
+        );
         validate_snapshot(snapshot.as_ref()).unwrap();
     }
 
@@ -833,13 +839,18 @@ mod tests {
         let overlay = MemoryWorkspace::new("memory://overlay");
         overlay.insert("src/lib.rs", b"overlay".to_vec());
         let workspace = OverlayWorkspace::new("overlay", Arc::new(base), Arc::new(overlay));
-        let snapshot = workspace.open_snapshot(&SnapshotRequest::default()).unwrap();
+        let snapshot = workspace
+            .open_snapshot(&SnapshotRequest::default())
+            .unwrap();
         let documents: Vec<_> = snapshot
             .documents(&DocumentQuery::all())
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(documents.len(), 1);
-        assert_eq!(snapshot.read(&documents[0]).unwrap().utf8().unwrap(), "overlay");
+        assert_eq!(
+            snapshot.read(&documents[0]).unwrap().utf8().unwrap(),
+            "overlay"
+        );
     }
 }

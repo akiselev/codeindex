@@ -10,11 +10,11 @@ use codeindex_source::{
     DocumentDescriptor, DocumentId, DocumentIter, DocumentLocation, DocumentMetadata,
     DocumentQuery, DocumentVersion, LanguageHint, RevisionGuarantee, RevisionToken,
     SnapshotConsistency, SnapshotId, SnapshotRequest, SourceCapabilities, SourceContent,
-    SourceError, SourceErrorKind, SourceRootId, SourceSnapshot, SourceWorkspace, SourceKind,
+    SourceError, SourceErrorKind, SourceKind, SourceRootId, SourceSnapshot, SourceWorkspace,
     WorkspaceDescriptor, WorkspaceId,
 };
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 
 #[derive(Clone, Debug)]
 pub struct FilesystemWorkspace {
@@ -146,10 +146,7 @@ impl SourceSnapshot for FilesystemSnapshot {
         SnapshotConsistency::Validated
     }
 
-    fn documents<'a>(
-        &'a self,
-        query: &'a DocumentQuery,
-    ) -> Result<DocumentIter<'a>, SourceError> {
+    fn documents<'a>(&'a self, query: &'a DocumentQuery) -> Result<DocumentIter<'a>, SourceError> {
         Ok(Box::new(
             self.documents
                 .values()
@@ -164,10 +161,9 @@ impl SourceSnapshot for FilesystemSnapshot {
     }
 
     fn read(&self, document: &DocumentDescriptor) -> Result<SourceContent, SourceError> {
-        let indexed = self
-            .documents
-            .get(&document.id)
-            .ok_or_else(|| SourceError::not_found(format!("unknown source document {}", document.id)))?;
+        let indexed = self.documents.get(&document.id).ok_or_else(|| {
+            SourceError::not_found(format!("unknown source document {}", document.id))
+        })?;
         if indexed.version.token != document.version.token {
             return Err(SourceError::stale(format!(
                 "source document {} was enumerated at revision {}, requested {}",
@@ -207,9 +203,9 @@ fn scan_documents(
 ) -> Result<BTreeMap<DocumentId, DocumentDescriptor>, SourceError> {
     let mut overrides = OverrideBuilder::new(root);
     for pattern in exclude {
-        overrides
-            .add(&format!("!{pattern}"))
-            .map_err(|error| SourceError::invalid(format!("bad exclude pattern {pattern:?}: {error}")))?;
+        overrides.add(&format!("!{pattern}")).map_err(|error| {
+            SourceError::invalid(format!("bad exclude pattern {pattern:?}: {error}"))
+        })?;
     }
     let overrides = overrides
         .build()
@@ -221,10 +217,16 @@ fn scan_documents(
     let mut documents = BTreeMap::new();
     for entry in walk.build() {
         let entry = entry.map_err(|error| {
-            SourceError::new(SourceErrorKind::Unavailable, format!("filesystem walk failed: {error}"))
-                .retryable(true)
+            SourceError::new(
+                SourceErrorKind::Unavailable,
+                format!("filesystem walk failed: {error}"),
+            )
+            .retryable(true)
         })?;
-        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
             continue;
         }
         let path = entry.path();
@@ -292,7 +294,7 @@ fn version_from_metadata(metadata: &Metadata) -> DocumentVersion {
 fn snapshot_fingerprint<'a>(documents: impl Iterator<Item = &'a DocumentDescriptor>) -> String {
     let mut count = 0_u64;
     let mut bytes = 0_u64;
-    let mut latest = SystemTime::UNIX_EPOCH;
+    let mut latest = UNIX_EPOCH;
     for document in documents {
         count += 1;
         bytes = bytes.saturating_add(document.version.size.unwrap_or_default());
@@ -316,8 +318,11 @@ fn io_error(path: &Path, error: std::io::Error) -> SourceError {
         | std::io::ErrorKind::TimedOut => SourceErrorKind::Unavailable,
         _ => SourceErrorKind::Other,
     };
-    SourceError::new(kind, format!("failed to access {}: {error}", path.display()))
-        .retryable(matches!(kind, SourceErrorKind::Unavailable))
+    SourceError::new(
+        kind,
+        format!("failed to access {}: {error}", path.display()),
+    )
+    .retryable(matches!(kind, SourceErrorKind::Unavailable))
 }
 
 #[cfg(test)]
@@ -339,7 +344,9 @@ mod tests {
         let workspace = FilesystemWorkspace::builder(directory.path())
             .excludes(vec!["vendor/**".to_string()])
             .build();
-        let snapshot = workspace.open_snapshot(&SnapshotRequest::default()).unwrap();
+        let snapshot = workspace
+            .open_snapshot(&SnapshotRequest::default())
+            .unwrap();
         let documents: Vec<_> = snapshot
             .documents(&DocumentQuery::all())
             .unwrap()
@@ -355,7 +362,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         write(directory.path(), "src/lib.rs", "fn answer() -> i32 { 42 }");
         let workspace = FilesystemWorkspace::new(directory.path());
-        let snapshot = workspace.open_snapshot(&SnapshotRequest::default()).unwrap();
+        let snapshot = workspace
+            .open_snapshot(&SnapshotRequest::default())
+            .unwrap();
         let document = snapshot
             .documents(&DocumentQuery::all())
             .unwrap()
@@ -363,6 +372,9 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::write(directory.path().join("src/lib.rs"), "different length").unwrap();
-        assert_eq!(snapshot.read(&document).unwrap_err().kind(), SourceErrorKind::StaleRevision);
+        assert_eq!(
+            snapshot.read(&document).unwrap_err().kind(),
+            SourceErrorKind::StaleRevision
+        );
     }
 }

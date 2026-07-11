@@ -15,7 +15,6 @@ use codeindex_core::{
 };
 use codeindex_source::{
     DocumentDescriptor, DocumentQuery, LanguageHint, RevisionGuarantee, SnapshotRequest,
-    SourceWorkspace,
 };
 use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
 use codeindex_tree_sitter::normalizer::{normalize_for_hash, sha256_hex};
@@ -221,6 +220,7 @@ fn index_project(
         label: project.label.clone(),
         ..ProjectStats::default()
     };
+    let mut document_ids = HashSet::new();
     let mut seen = HashSet::new();
     let mut paths = HashSet::new();
     let mut any_change = false;
@@ -229,12 +229,15 @@ fn index_project(
         let document = match document {
             Ok(document) => document,
             Err(error) => {
-                eprintln!("failed to enumerate source in project {}: {error}", project.label);
+                eprintln!(
+                    "failed to enumerate source in project {}: {error}",
+                    project.label
+                );
                 stats.failed += 1;
                 continue;
             }
         };
-        if !seen.insert(document.id.to_string()) {
+        if !document_ids.insert(document.id.to_string()) {
             anyhow::bail!(
                 "source workspace {} returned duplicate document id {}",
                 descriptor.id,
@@ -251,6 +254,7 @@ fn index_project(
         let Some(language_id) = resolve_language(&document, &enabled, registry) else {
             continue;
         };
+        seen.insert(document.id.to_string());
         let source_document_id = document.id.to_string();
         let relative_path = document.location.logical_path.clone();
         let existing = db.get_file_by_source_id(project_id, &source_document_id)?;
@@ -401,10 +405,7 @@ fn resolve_language(
     enabled.contains(&hinted).then_some(hinted)
 }
 
-fn language_from_shebang(
-    shebang: &str,
-    registry: &'static LanguageRegistry,
-) -> Option<String> {
+fn language_from_shebang(shebang: &str, registry: &'static LanguageRegistry) -> Option<String> {
     let extension = if shebang.contains("python") {
         "py"
     } else if shebang.contains("node") || shebang.contains("deno") {
