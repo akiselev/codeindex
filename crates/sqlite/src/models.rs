@@ -1,4 +1,7 @@
-use codeindex_core::{ExtractedEntity, RepresentationKind};
+use codeindex_core::{
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, ExtractedEntity,
+    RepresentationKind, RepresentationOrigin,
+};
 
 pub use codeindex_core::ModelIdentity;
 
@@ -11,6 +14,8 @@ pub type ModelId = i64;
 pub struct Project {
     pub id: ProjectId,
     pub label: String,
+    /// Provider-defined project locator. The historical name is retained for API
+    /// compatibility; values such as `memory://project` are valid.
     pub source_dir: String,
     pub role: Option<String>,
 }
@@ -19,6 +24,8 @@ pub struct Project {
 pub struct FileRecord {
     pub id: FileId,
     pub project_id: ProjectId,
+    pub source_document_id: String,
+    pub source_revision: String,
     pub relative_path: String,
     pub language_id: String,
     pub mtime_ns: i64,
@@ -26,10 +33,12 @@ pub struct FileRecord {
     pub source_hash: String,
 }
 
-/// A new file row before it has an id.
+/// A new source document row before it has an id.
 #[derive(Debug, Clone)]
 pub struct NewFile {
     pub project_id: ProjectId,
+    pub source_document_id: String,
+    pub source_revision: String,
     pub relative_path: String,
     pub language_id: String,
     pub mtime_ns: i64,
@@ -37,22 +46,21 @@ pub struct NewFile {
     pub source_hash: String,
 }
 
-/// One representation channel to persist for a unit. `content` is `None` when
-/// retention drops the text (it can be recovered from source); the
-/// `content_hash` is always present and is the embedding lookup key.
+/// One representation channel to persist for a unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRepresentation {
     pub kind: RepresentationKind,
     pub content_hash: String,
     pub content: Option<String>,
+    pub origin: RepresentationOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeUnit {
     pub id: UnitId,
     pub file_id: FileId,
-    pub entity_id: String,
-    pub entity_version_id: String,
+    pub entity_id: EntityId,
+    pub entity_version_id: EntityVersionId,
     pub generation: i64,
     pub language_id: String,
     pub kind: String,
@@ -67,13 +75,11 @@ pub struct CodeUnit {
     pub normalized_body_hash: String,
 }
 
-/// A new code unit before it has an id. Identity (`entity_id`,
-/// `entity_version_id`, `generation`) is assigned by the indexer; the parser
-/// frontend only supplies the location/representation payload.
+/// A new code unit before it has an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCodeUnit {
-    pub entity_id: String,
-    pub entity_version_id: String,
+    pub entity_id: EntityId,
+    pub entity_version_id: EntityVersionId,
     pub generation: i64,
     pub language_id: String,
     pub kind: String,
@@ -90,14 +96,10 @@ pub struct NewCodeUnit {
 }
 
 impl NewCodeUnit {
-    /// Project a parser-neutral entity onto a persistence row, given the
-    /// identity the indexer assigned it. This is the single place the
-    /// representation channels the frontend emitted map onto storage — every
-    /// channel is carried, not a fixed two.
     pub fn from_entity(
         entity: ExtractedEntity,
-        entity_id: impl Into<String>,
-        entity_version_id: impl Into<String>,
+        entity_id: impl Into<EntityId>,
+        entity_version_id: impl Into<EntityVersionId>,
         generation: i64,
     ) -> Self {
         let representations = entity
@@ -107,6 +109,7 @@ impl NewCodeUnit {
                 kind: repr.kind,
                 content_hash: repr.content_hash,
                 content: Some(repr.content),
+                origin: repr.origin,
             })
             .collect();
         NewCodeUnit {
@@ -128,12 +131,11 @@ impl NewCodeUnit {
         }
     }
 
-    /// The content hash for a channel, if this unit carries that channel.
     pub fn content_hash(&self, kind: &RepresentationKind) -> Option<&str> {
         self.representations
             .iter()
-            .find(|r| &r.kind == kind)
-            .map(|r| r.content_hash.as_str())
+            .find(|repr| &repr.kind == kind)
+            .map(|repr| repr.content_hash.as_str())
     }
 }
 
@@ -141,6 +143,18 @@ impl NewCodeUnit {
 pub struct EmbeddingModelRecord {
     pub id: ModelId,
     pub identity: ModelIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSpaceRecord {
+    pub identity: EmbeddingSpaceIdentity,
+    pub model_id: ModelId,
+}
+
+impl EmbeddingSpaceRecord {
+    pub fn id(&self) -> &EmbeddingSpaceId {
+        &self.identity.id
+    }
 }
 
 /// Encode a vector as a little-endian f32 blob.
