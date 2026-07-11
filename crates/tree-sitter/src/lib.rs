@@ -6,7 +6,9 @@ mod extractor;
 pub mod language;
 pub mod normalizer;
 
-pub use extractor::{ExtractOptions, RawReference, extract_file, extract_references, extract_units};
+pub use extractor::{
+    ExtractOptions, RawReference, extract_file, extract_references, extract_units,
+};
 pub use language::{LanguageDef, LanguageRegistry, LanguageSpec, ScopeRule};
 
 /// Language identifiers compiled into this frontend crate.

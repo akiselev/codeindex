@@ -1,51 +1,57 @@
 # Getting started
 
-This walks the full pipeline: index a project, embed its bodies, and run a
-semantic query. All examples assume the `fastembed` feature is enabled so a real
-model can run.
+This guide covers the current library pipeline:
+
+```text
+source provider → entities/representations → embedding spaces → snapshot → search
+```
+
+Examples use the facade crate. Enable `fastembed` for local ONNX inference.
 
 ```toml
 [dependencies]
-codeindex = { path = "../codeindex/crates/codeindex", features = ["fastembed"] }
 anyhow = "1"
+codeindex = { path = "../codeindex/crates/codeindex", features = ["fastembed"] }
 ```
 
-## 1. Embed text (no store, no parser)
+## 1. Embed arbitrary text without storage or parsers
 
-The leanest use is the `Embedder` itself. This path compiles neither SQLite nor
-the grammars — depend only on `codeindex-embedding`.
+Depend directly on `codeindex-embedding` for the leanest path.
 
 ```rust
-use codeindex_embedding::{config::EmbeddingConfig, embedder_from_config};
+use codeindex_embedding::{
+    Embedder,
+    config::EmbeddingConfig,
+    embedder_from_config,
+};
 
 fn main() -> anyhow::Result<()> {
-    // BGESmallENV15 is small and downloads quickly; the default model is the
-    // larger CodeRankEmbed (2048-token context, ~550 MB, fetched on first use).
-    let cfg = EmbeddingConfig { model: "BGESmallENV15".into(), ..Default::default() };
-    let mut embedder = embedder_from_config(&cfg)?;
-
+    let config = EmbeddingConfig {
+        model: "BGESmallENV15".into(),
+        ..Default::default()
+    };
+    let mut embedder = embedder_from_config(&config)?;
     let vectors = embedder.embed(&[
         "fn parse(input: &str) -> Result<Ast>".to_string(),
         "def parse(input): return build_ast(input)".to_string(),
     ])?;
-
-    println!("{} dims", vectors[0].len());
+    println!("{} dimensions", vectors[0].len());
     Ok(())
 }
 ```
 
-## 2. Index a project
+This compiles neither SQLite nor bundled language grammars.
 
-Indexing scans a root, extracts every unit above `body_node_count_threshold`,
-and writes into SQLite. It is incremental — unchanged files are skipped on
-re-runs.
+## 2. Index ordinary filesystem projects
+
+The common filesystem API remains `indexer::index`. It delegates to the same
+provider-neutral pipeline used by custom sources.
 
 ```rust
 use codeindex::{indexer, sqlite, tree_sitter};
 use codeindex::indexer::{IndexOptions, ProjectSpec, RetentionMode};
 
 let db = sqlite::open_or_create(std::path::Path::new("index.db"))?;
-
 let options = IndexOptions {
     projects: vec![ProjectSpec {
         label: "main".into(),
@@ -54,99 +60,217 @@ let options = IndexOptions {
     }],
     enabled_languages: tree_sitter::BUNDLED_LANGUAGE_IDS
         .iter()
-        .map(|s| s.to_string())
+        .map(|id| id.to_string())
         .collect(),
     body_node_count_threshold: 10,
     max_body_chars: 10_000,
-    retention: RetentionMode::Full, // Full | Report | Minimal
-    };
+    retention: RetentionMode::Full,
+};
 
 let stats = indexer::index(&db, &options, None)?;
-for project in &stats {
+for project in stats {
     println!("{}: {} units", project.label, project.total_units);
 }
 ```
 
-`RetentionMode` trades storage for the ability to re-derive text:
+The indexer extracts multiple representations for each entity, including body,
+signature, symbol, documentation, and—where reference extraction is available—
+usage call sites.
 
-- `Full` stores display source and embedding text.
-- `Report` drops embedding text (recovered from source when embedding).
-- `Minimal` stores only hashes and ranges; reports re-read source files.
+## 3. Index a custom source provider
 
-## 3. Embed the indexed corpus
-
-`embed_pending` embeds every distinct un-embedded body under the current model
-identity. It is resumable: re-run it after indexing more code and it only
-processes what is new.
+A provider does not need to emulate a filesystem. It exposes stable document
+identities, logical paths, revisions, and UTF-8 content.
 
 ```rust
-use codeindex::indexer;
+use codeindex::{indexer, sqlite};
+use codeindex::indexer::{
+    IndexSettings, MemorySource, RetentionMode, SourceProject,
+};
+
+let db = sqlite::open_in_memory()?;
+let mut source = MemorySource::new("memory://workspace");
+source.insert(
+    "src/lib.rs",
+    "fn answer() -> i32 { let value = 42; value }",
+);
+
+let settings = IndexSettings {
+    enabled_languages: vec!["rust".into()],
+    body_node_count_threshold: 1,
+    max_body_chars: 10_000,
+    retention: RetentionMode::Full,
+};
+let projects = [SourceProject {
+    label: "main".into(),
+    provider: &source,
+}];
+indexer::index_sources(&db, &settings, &projects, None)?;
+```
+
+Implement `SourceProvider` for database rows, Git objects, object-store keys,
+archives, editor buffers, or generated code. Preserve the same document id
+across a logical move when the provider can do so reliably.
+
+## 4. Retention and provenance
+
+Representations carry provenance:
+
+- `Extracted`: deterministic frontend output, recoverable from source;
+- `Derived`: synthesized from indexed facts, such as `Usage`;
+- `Imported`: supplied by a consumer or external model.
+
+Retention modes are provenance-aware:
+
+- `Full` retains all text.
+- `Report` may drop extracted embed-only text while retaining display and
+  non-recoverable derived/imported text.
+- `Minimal` may drop all recoverable extracted text.
+
+For non-filesystem providers, pass a `SourceProviderCatalog` to explicit-space
+embedding when dropped text must be recovered.
+
+## 5. Embed one explicit space
+
+An embedding space binds a channel to an exact model identity. Spaces are
+independent: a code model can embed implementations while a text model embeds
+documentation.
+
+```rust
+use codeindex::core::{EmbeddingSpaceIdentity, RepresentationKind};
 use codeindex::embedding::{
+    Embedder,
     config::{EmbeddingConfig, EmbeddingRunConfig, SourceRecoveryConfig},
     embedder_from_config,
 };
+use codeindex::indexer;
 
-let embedding = EmbeddingConfig { model: "BGESmallENV15".into(), ..Default::default() };
-let run = EmbeddingRunConfig {
-    embedding: embedding.clone(),
-    // Only consulted under Report/Minimal retention, to re-derive dropped text.
-    source_recovery: SourceRecoveryConfig { body_node_count_threshold: 10 },
+let embedding_config = EmbeddingConfig {
+    model: "BGESmallENV15".into(),
+    ..Default::default()
 };
-
-let mut embedder = embedder_from_config(&embedding)?;
-let stats = indexer::embed_pending(&db, embedder.as_mut(), &run)?;
-println!("embedded {} of {} pending bodies", stats.embedded, stats.pending_total);
+let run_config = EmbeddingRunConfig {
+    embedding: embedding_config.clone(),
+    source_recovery: SourceRecoveryConfig {
+        body_node_count_threshold: 10,
+    },
+};
+let mut embedder = embedder_from_config(&embedding_config)?;
+let space = EmbeddingSpaceIdentity::new(
+    "docs",
+    RepresentationKind::Documentation,
+    embedder.identity().clone(),
+);
+let stats = indexer::embed_space_pending(
+    &db,
+    embedder.as_mut(),
+    &run_config,
+    &space,
+)?;
+println!("embedded {} representations", stats.embedded);
 ```
 
-The database binds to the first model identity it sees; embedding again with a
-different backend, model, dimension count, or normalization setting is rejected
-(delete the DB to re-index under a new model).
+Reusing the id `docs` with a different channel, model identity, or input
+transform is rejected.
 
-## 4. Semantic search
+`embed_pending` is a convenience operation that uses one embedder for every
+present channel, creating spaces named `default/<channel>`.
 
-Ranking is a pure operation over stored vectors. Embed the query with the *same*
-model, then score it against every stored embedding.
+## 6. Load a storage-neutral search index
+
+SQLite exports the public `IndexSnapshot`; another backend can construct the
+same type directly.
 
 ```rust
-use codeindex::{embedding, indexer, query};
+use codeindex::search::SearchIndex;
 
-let model_id = indexer::find_or_create_model_id(&db, embedder.identity())?;
-let stored = db.all_embeddings(model_id)?; // Vec<(body_hash, Vec<f32>)>
+let snapshot = db.snapshot(&[])?; // empty project list = all projects
+let index = SearchIndex::from_snapshot(snapshot)?;
 
-let mut q = embedder.embed(&["retry an HTTP request with backoff".to_string()])?.remove(0);
-embedding::normalize_in_place(&mut q);
-
-let ranked = query::rank_candidates(
-    &q,
-    stored.iter().enumerate().map(|(i, (_, v))| (i, v.as_slice())),
-    0.0, // score threshold
-);
-
-for scored in ranked.iter().take(5) {
-    let (body_hash, _) = &stored[scored.index];
-    println!("{:.4}  {}", scored.score, body_hash);
+for space in index.embedded_spaces() {
+    println!("{}: {} via {}", space.id, space.channel, space.model.model);
 }
 ```
 
-`rank_candidates` returns `ScoredIndex { index, score }` sorted by descending
-score with deterministic tie-breaking. Resolving a `body_hash` back to a unit's
-file, line range, name, and scope is a join the application layer performs over
-`code_units` — decombine's `AnalysisContext` (in the `decombine` repo,
-`src/query/mod.rs` and `src/analyze/context.rs`) is the reference implementation,
-including model-identity verification via `query::identity_diff` and the
-`unit:<id>` selectors from `query::unit_id`.
+Snapshot loading validates dimensions, duplicate ids/hashes, and finite vector
+values rather than trusting external stores.
 
-## Filtering
+## 7. Search an explicit space
 
-`codeindex-query::WhereFilter` parses the same `key=value` expression the CLI
-uses and matches any `UnitView`:
+The query embedder must exactly match the selected space's model identity.
+
+```rust
+use codeindex::core::EmbeddingSpaceId;
+use codeindex::query::WhereFilter;
+
+let results = index.search_text(
+    embedder.as_mut(),
+    "parse command line flags",
+    &EmbeddingSpaceId::new("docs"),
+    &WhereFilter::default(),
+    10,
+)?;
+
+for hit in results.hits {
+    let unit = &index.units[hit.index];
+    println!("{:.4}  {}  {}", hit.score, unit.location(), unit.name);
+}
+```
+
+Use `similar_to_unit` for query-by-example retrieval in one space.
+
+## 8. Fuse multiple spaces
+
+Do not add cosine scores from different models. Embed each query with the
+corresponding model, normalize according to that space, then fuse ranked lists
+with weighted reciprocal rank:
+
+```rust
+use codeindex::core::EmbeddingSpaceId;
+use codeindex::query::WhereFilter;
+use codeindex::search::SpaceVectorQuery;
+
+let code_id = EmbeddingSpaceId::new("code");
+let docs_id = EmbeddingSpaceId::new("docs");
+let fused = index.search_vectors_fused(
+    &[
+        SpaceVectorQuery {
+            space_id: &code_id,
+            vector: &code_query_vector,
+            weight: 1.0,
+        },
+        SpaceVectorQuery {
+            space_id: &docs_id,
+            vector: &docs_query_vector,
+            weight: 0.8,
+        },
+    ],
+    &WhereFilter::default(),
+    20,
+    60,
+)?;
+```
+
+Each fused hit preserves its rank, raw score, weight-derived contribution, and
+space id for explanation.
+
+## 9. Metadata filtering
+
+`WhereFilter` is independent of storage and embedding space:
 
 ```rust
 use codeindex::query::WhereFilter;
 
-let filter = WhereFilter::parse(Some("language=rust kind=function path=src/** min_nodes=20"))?;
-// filter.matches(&unit)  where unit: impl UnitView
+let filter = WhereFilter::parse(Some(
+    "language=rust kind=function path=src/** min_nodes=20",
+))?;
 ```
 
-Supported keys: `project`, `language`, `kind` (exact); `name`, `scope`, `path`
-(glob); `min_nodes` (integer).
+Supported keys are `project`, `language`, `kind`, `name`, `scope`, `path`, and
+`min_nodes`.
+
+## Schema compatibility
+
+The schema is pre-release. Databases from an incompatible epoch are rejected
+with a delete-and-reindex message. This avoids accepting an old layout and
+failing later with unrelated SQL errors.

@@ -1,53 +1,44 @@
 #![forbid(unsafe_code)]
 
-//! The storage-neutral, serializable contract between a persistence backend and
-//! the search engine.
+//! Storage-neutral, serializable contracts between persistence backends and the
+//! search engine.
 //!
-//! `codeindex-search` loads a corpus exclusively from an [`IndexSnapshot`]; it
-//! never touches SQLite (or any other store) directly. A backend's only
-//! obligation is to *produce an `IndexSnapshot`* — `codeindex-sqlite` does it
-//! with SQL in `Db::snapshot`, but any other database can do it by running its
-//! own queries and deserializing the rows into these `serde` types. That is the
-//! whole "support any database" story: it is deserialization into a public type,
-//! not a store-specific trait the engine has to know about.
-//!
-//! The snapshot is the *canonical* contract. A streaming reader for corpora too
-//! large to hold in memory is a possible future addition, but every backend must
-//! be expressible as one of these values.
+//! `codeindex-search` loads a corpus exclusively from [`IndexSnapshot`]. SQLite
+//! produces one through `Db::snapshot`; any other store can construct or
+//! deserialize the same public types. Embedding spaces are first-class: one
+//! snapshot can carry different models for implementation, documentation,
+//! usage, or any custom representation channel.
 
 use std::collections::HashMap;
 
-use codeindex_core::{ModelIdentity, RepresentationKind, SourceSpan};
+use codeindex_core::{
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, RepresentationKind,
+    RepresentationOrigin, SourceSpan,
+};
 use serde::{Deserialize, Serialize};
 
-/// A complete, self-contained view of one embedding model's corpus: the model
-/// identity, the selected projects, their code units (with every representation
-/// channel), and the dense vectors for each embedded channel.
-///
-/// One snapshot binds to exactly one [`ModelIdentity`] — the same invariant the
-/// stores enforce (a database holds a single embedding model).
+/// A complete, self-contained view of selected projects and all requested
+/// embedding spaces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexSnapshot {
-    pub model: ModelIdentity,
     pub projects: Vec<ProjectRecord>,
     pub units: Vec<UnitRecord>,
-    /// One entry per representation channel that has stored embeddings.
-    pub channels: Vec<ChannelEmbeddings>,
+    pub spaces: Vec<EmbeddingSpaceSnapshot>,
 }
 
 impl IndexSnapshot {
-    /// The embeddings for one channel, if any were stored for it.
-    pub fn channel(&self, kind: &RepresentationKind) -> Option<&ChannelEmbeddings> {
-        self.channels.iter().find(|c| &c.channel == kind)
+    pub fn space(&self, id: &EmbeddingSpaceId) -> Option<&EmbeddingSpaceSnapshot> {
+        self.spaces.iter().find(|space| &space.identity.id == id)
     }
 
-    /// The channels that actually carry vectors, in stored order.
-    pub fn embedded_channels(&self) -> impl Iterator<Item = &RepresentationKind> {
-        self.channels.iter().map(|c| &c.channel)
+    pub fn embedding_spaces(&self) -> impl Iterator<Item = &EmbeddingSpaceIdentity> {
+        self.spaces.iter().map(|space| &space.identity)
     }
 }
 
-/// A project (a labelled source root) in the snapshot.
+/// A project in the snapshot. `source_dir` is retained for wire compatibility,
+/// but semantically it is the provider's opaque project locator and need not be
+/// a filesystem path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub label: String,
@@ -55,16 +46,11 @@ pub struct ProjectRecord {
     pub role: Option<String>,
 }
 
-/// One code unit: its stable/version identity, location, and every stored
-/// representation channel. Vectors live in [`ChannelEmbeddings`], keyed by the
-/// per-channel `content_hash` found here.
+/// One code unit: stable/version identity, location, and stored representations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnitRecord {
-    /// Stable logical identity carried across index generations (M4).
-    pub entity_id: String,
-    /// Exact identity of this indexed version of the entity (M4).
-    pub entity_version_id: String,
-    /// The generation (index run) this version was written in.
+    pub entity_id: EntityId,
+    pub entity_version_id: EntityVersionId,
     pub generation: u64,
     pub project_label: String,
     pub relative_path: String,
@@ -74,51 +60,43 @@ pub struct UnitRecord {
     pub scope: Option<String>,
     pub span: SourceSpan,
     pub body_node_count: usize,
-    /// Every representation channel for this unit. `content` is `None` when
-    /// retention dropped the text (it can be recovered from source); the
-    /// `content_hash` is always present and is the embedding lookup key.
     pub representations: Vec<RepresentationRef>,
 }
 
 impl UnitRecord {
-    /// The stored representation for a channel, if this unit has one.
     pub fn representation(&self, kind: &RepresentationKind) -> Option<&RepresentationRef> {
-        self.representations.iter().find(|r| &r.kind == kind)
+        self.representations.iter().find(|repr| &repr.kind == kind)
     }
 
-    /// The content hash for a channel — the key into [`ChannelEmbeddings`].
     pub fn content_hash(&self, kind: &RepresentationKind) -> Option<&str> {
-        self.representation(kind).map(|r| r.content_hash.as_str())
+        self.representation(kind)
+            .map(|repr| repr.content_hash.as_str())
     }
 
-    /// The stored text for a channel, when retention kept it.
     pub fn content(&self, kind: &RepresentationKind) -> Option<&str> {
-        self.representation(kind).and_then(|r| r.content.as_deref())
+        self.representation(kind)
+            .and_then(|repr| repr.content.as_deref())
     }
 }
 
-/// One representation channel of a unit: which channel, its content hash, and
-/// optionally the text itself.
+/// One representation channel of a unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepresentationRef {
     pub kind: RepresentationKind,
     pub content_hash: String,
     pub content: Option<String>,
+    pub origin: RepresentationOrigin,
 }
 
-/// The dense vectors stored for one representation channel, keyed by content
-/// hash. Units share a vector whenever their channel content hashes match, so
-/// this holds one entry per *distinct* content, not per unit.
+/// Dense vectors for one independently queryable embedding space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChannelEmbeddings {
-    pub channel: RepresentationKind,
-    pub dimensions: usize,
-    /// `content_hash -> vector`.
+pub struct EmbeddingSpaceSnapshot {
+    pub identity: EmbeddingSpaceIdentity,
+    /// `content_hash -> vector`. Identical representations share one vector.
     pub vectors: Vec<(String, Vec<f32>)>,
 }
 
-impl ChannelEmbeddings {
-    /// Index the vectors by content hash for lookup.
+impl EmbeddingSpaceSnapshot {
     pub fn by_hash(&self) -> HashMap<&str, &[f32]> {
         self.vectors
             .iter()
@@ -129,33 +107,38 @@ impl ChannelEmbeddings {
 
 #[cfg(test)]
 mod tests {
+    use codeindex_core::{ModelIdentity, RepresentationOrigin};
+
     use super::*;
 
+    fn model(name: &str, dimensions: usize) -> ModelIdentity {
+        ModelIdentity {
+            backend: "hash".into(),
+            backend_version: "0".into(),
+            runtime_version: None,
+            model: name.into(),
+            revision: None,
+            dimensions,
+            tokenizer_hash: None,
+            model_hash: None,
+            normalize: true,
+            execution_provider: "cpu".into(),
+            quantization: None,
+            cache_path: None,
+        }
+    }
+
     #[test]
-    fn snapshot_json_round_trips() {
+    fn snapshot_json_round_trips_multiple_spaces() {
         let snapshot = IndexSnapshot {
-            model: ModelIdentity {
-                backend: "hash".into(),
-                backend_version: "0".into(),
-                runtime_version: None,
-                model: "test".into(),
-                revision: None,
-                dimensions: 2,
-                tokenizer_hash: None,
-                model_hash: None,
-                normalize: true,
-                execution_provider: "cpu".into(),
-                quantization: None,
-                cache_path: None,
-            },
             projects: vec![ProjectRecord {
                 label: "main".into(),
-                source_dir: "/src".into(),
+                source_dir: "memory://fixture".into(),
                 role: None,
             }],
             units: vec![UnitRecord {
-                entity_id: "e1".into(),
-                entity_version_id: "v1".into(),
+                entity_id: EntityId::new("e1"),
+                entity_version_id: EntityVersionId::new("v1"),
                 generation: 1,
                 project_label: "main".into(),
                 relative_path: "lib.rs".into(),
@@ -169,19 +152,32 @@ mod tests {
                     kind: RepresentationKind::Implementation,
                     content_hash: "h".into(),
                     content: Some("fn parse() {}".into()),
+                    origin: RepresentationOrigin::default(),
                 }],
             }],
-            channels: vec![ChannelEmbeddings {
-                channel: RepresentationKind::Implementation,
-                dimensions: 2,
-                vectors: vec![("h".into(), vec![1.0, 0.0])],
-            }],
+            spaces: vec![
+                EmbeddingSpaceSnapshot {
+                    identity: EmbeddingSpaceIdentity::new(
+                        "code",
+                        RepresentationKind::Implementation,
+                        model("code-model", 2),
+                    ),
+                    vectors: vec![("h".into(), vec![1.0, 0.0])],
+                },
+                EmbeddingSpaceSnapshot {
+                    identity: EmbeddingSpaceIdentity::new(
+                        "docs",
+                        RepresentationKind::Documentation,
+                        model("text-model", 3),
+                    ),
+                    vectors: Vec::new(),
+                },
+            ],
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: IndexSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot, back);
-        // Channels serialize by their canonical string token.
-        assert!(json.contains("\"implementation\""));
+        assert_eq!(back.spaces.len(), 2);
         assert_eq!(
             back.units[0].content_hash(&RepresentationKind::Implementation),
             Some("h")

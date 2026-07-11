@@ -1,46 +1,26 @@
 #![forbid(unsafe_code)]
 
-//! The end-to-end semantic search service over a code index.
-//!
-//! This crate owns the *operation* a consumer wants:
-//!
-//! > natural-language sentence → embed with the corpus's model → verify model
-//! > compatibility → retrieve candidate vectors for a channel → rank/filter →
-//! > resolve back to code-unit metadata → structured results
-//!
-//! It loads exclusively from a storage-neutral [`codeindex_storage::IndexSnapshot`]
-//! ([`SearchIndex::from_snapshot`]); it never touches SQLite or any other store
-//! directly. Any backend that can produce an `IndexSnapshot` — SQLite via
-//! `Db::snapshot`, or any other database by deserializing its rows into the
-//! public snapshot type — can be searched.
-//!
-//! Every representation channel (`Implementation`, `Signature`, `Documentation`,
-//! `Symbol`, `Usage`, …) is embedded and searched independently: a query
-//! targets one channel. Presentation (JSON envelopes, text formatting) is left
-//! to the caller.
+//! Storage-neutral semantic search over independently modelled embedding spaces.
 
 pub mod vector_store;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context as _, Result, bail};
-use codeindex_core::{ModelIdentity, RepresentationKind};
+use codeindex_core::{
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, RepresentationKind,
+};
 use codeindex_embedding::{Embedder, normalize_in_place};
 use codeindex_query::{UnitView, WhereFilter, identity_diff, rank_candidates, unit_id};
 use codeindex_storage::{IndexSnapshot, ProjectRecord, RepresentationRef};
 
+pub use codeindex_storage as storage;
 pub use vector_store::{ScoredPair, VectorStore, dot};
 
-/// Re-export the snapshot types so consumers can name what the service loads
-/// from without depending on `codeindex-storage` directly.
-pub use codeindex_storage as storage;
-
-/// A code unit joined with its file and project — the metadata a search result
-/// resolves back to. Built from a [`codeindex_storage::UnitRecord`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeUnitRef {
-    pub entity_id: String,
-    pub entity_version_id: String,
+    pub entity_id: EntityId,
+    pub entity_version_id: EntityVersionId,
     pub generation: u64,
     pub project_label: String,
     pub relative_path: String,
@@ -53,28 +33,21 @@ pub struct CodeUnitRef {
     pub start_line: usize,
     pub end_line: usize,
     pub body_node_count: usize,
-    /// The `Implementation` channel content hash — the stable body identity used
-    /// by [`unit_id`] and rename detection.
     pub normalized_body_hash: String,
-    /// `FullSource` content, when retention kept it.
     pub display_source: Option<String>,
-    /// Every representation channel of this unit (used to look up its vector in
-    /// a given channel by content hash).
     pub representations: Vec<RepresentationRef>,
 }
 
 impl CodeUnitRef {
-    /// `label:path` display location.
     pub fn location(&self) -> String {
         format!("{}:{}", self.project_label, self.relative_path)
     }
 
-    /// The content hash for a channel, if this unit carries it.
     pub fn content_hash(&self, kind: &RepresentationKind) -> Option<&str> {
         self.representations
             .iter()
-            .find(|r| &r.kind == kind)
-            .map(|r| r.content_hash.as_str())
+            .find(|representation| &representation.kind == kind)
+            .map(|representation| representation.content_hash.as_str())
     }
 }
 
@@ -117,44 +90,70 @@ impl UnitView for CodeUnitRef {
     }
 }
 
-/// One ranked hit: an index into [`SearchIndex::units`] and its cosine score.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchHit {
     pub index: usize,
     pub score: f32,
 }
 
-/// The outcome of a search: the hits returned (already truncated to the
-/// caller's limit) plus how many candidates matched before truncation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     pub matched: usize,
     pub hits: Vec<SearchHit>,
 }
 
-/// The loaded corpus: projects, their code units, the single embedding model's
-/// identity, and one [`VectorStore`] per embedded representation channel.
+pub struct SearchSpace {
+    pub identity: EmbeddingSpaceIdentity,
+    pub vectors: VectorStore,
+}
+
 pub struct SearchIndex {
-    pub identity: ModelIdentity,
     pub projects: Vec<ProjectRecord>,
-    /// Sorted by (project label, path, start byte) for determinism.
     pub units: Vec<CodeUnitRef>,
-    /// One vector store per channel, each aligned with `units`.
-    pub channels: HashMap<RepresentationKind, VectorStore>,
+    /// Deterministic by space id.
+    pub spaces: BTreeMap<EmbeddingSpaceId, SearchSpace>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpaceVectorQuery<'a> {
+    pub space_id: &'a EmbeddingSpaceId,
+    pub vector: &'a [f32],
+    pub weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceContribution {
+    pub space_id: EmbeddingSpaceId,
+    pub rank: usize,
+    pub raw_score: f32,
+    pub contribution: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedSearchHit {
+    pub index: usize,
+    pub score: f32,
+    pub contributions: Vec<SpaceContribution>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedSearchResults {
+    pub matched: usize,
+    pub hits: Vec<FusedSearchHit>,
 }
 
 impl SearchIndex {
-    /// Build the search index from a storage-neutral snapshot. This is the only
-    /// entry point: SQLite and every other backend feed search through here.
-    pub fn from_snapshot(snapshot: IndexSnapshot) -> SearchIndex {
-        let identity = snapshot.model;
+    /// Validate and load a storage-neutral snapshot. Malformed external-backend
+    /// data returns an error rather than panicking inside the vector store.
+    pub fn from_snapshot(snapshot: IndexSnapshot) -> Result<SearchIndex> {
         let projects = snapshot.projects;
         let units: Vec<CodeUnitRef> = snapshot
             .units
             .into_iter()
             .map(|unit| {
                 let normalized_body_hash = unit
-                    .content_hash(&RepresentationKind::Implementation)
+                    .content_hash(&RepresentationKind::Body)
+                    .or_else(|| unit.content_hash(&RepresentationKind::Implementation))
                     .unwrap_or_default()
                     .to_string();
                 let display_source = unit
@@ -182,51 +181,98 @@ impl SearchIndex {
             })
             .collect();
 
-        // Build one vector store per channel, aligning each unit to its vector
-        // in that channel by content hash.
-        let mut channels = HashMap::new();
-        for channel in &snapshot.channels {
-            let by_hash = channel.by_hash();
-            let vectors: Vec<Option<Vec<f32>>> = units
+        let mut spaces = BTreeMap::new();
+        for snapshot_space in snapshot.spaces {
+            let identity = snapshot_space.identity;
+            if identity.model.dimensions == 0 {
+                bail!("embedding space {} has zero dimensions", identity.id);
+            }
+            if spaces.contains_key(&identity.id) {
+                bail!("duplicate embedding space id {}", identity.id);
+            }
+            let mut by_hash = HashMap::new();
+            for (hash, vector) in snapshot_space.vectors {
+                if vector.len() != identity.model.dimensions {
+                    bail!(
+                        "embedding space {} vector {hash:?} has {} dimensions, expected {}",
+                        identity.id,
+                        vector.len(),
+                        identity.model.dimensions
+                    );
+                }
+                if !vector.iter().all(|value| value.is_finite()) {
+                    bail!(
+                        "embedding space {} vector {hash:?} contains non-finite values",
+                        identity.id
+                    );
+                }
+                if by_hash.insert(hash.clone(), vector).is_some() {
+                    bail!(
+                        "embedding space {} contains duplicate content hash {hash:?}",
+                        identity.id
+                    );
+                }
+            }
+            let vectors = units
                 .iter()
                 .map(|unit| {
-                    unit.content_hash(&channel.channel)
+                    unit.content_hash(&identity.channel)
                         .and_then(|hash| by_hash.get(hash))
-                        .map(|vector| vector.to_vec())
+                        .cloned()
                 })
                 .collect();
-            channels.insert(
-                channel.channel.clone(),
-                VectorStore::from_unit_vectors(channel.dimensions, vectors),
+            spaces.insert(
+                identity.id.clone(),
+                SearchSpace {
+                    vectors: VectorStore::from_unit_vectors(identity.model.dimensions, vectors),
+                    identity,
+                },
             );
         }
 
-        SearchIndex {
-            identity,
+        Ok(SearchIndex {
             projects,
             units,
-            channels,
-        }
-    }
-
-    fn channel_store(&self, channel: &RepresentationKind) -> Result<&VectorStore> {
-        self.channels.get(channel).with_context(|| {
-            format!(
-                "channel {channel} has no embeddings in this index; embedded channels: {}",
-                self.embedded_channels()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            spaces,
         })
     }
 
-    /// The channels that carry vectors in this index.
-    pub fn embedded_channels(&self) -> impl Iterator<Item = &RepresentationKind> {
-        self.channels.keys()
+    pub fn embedded_spaces(&self) -> impl Iterator<Item = &EmbeddingSpaceIdentity> {
+        self.spaces.values().map(|space| &space.identity)
     }
 
-    /// Unit indices belonging to one project label.
+    pub fn spaces_for_channel(
+        &self,
+        channel: &RepresentationKind,
+    ) -> impl Iterator<Item = &EmbeddingSpaceIdentity> {
+        self.spaces
+            .values()
+            .filter(move |space| &space.identity.channel == channel)
+            .map(|space| &space.identity)
+    }
+
+    pub fn space(&self, id: &EmbeddingSpaceId) -> Result<&SearchSpace> {
+        self.spaces
+            .get(id)
+            .with_context(|| format!("embedding space {id} is not loaded"))
+    }
+
+    pub fn unique_space_for_channel(
+        &self,
+        channel: &RepresentationKind,
+    ) -> Result<&EmbeddingSpaceIdentity> {
+        let mut matches = self.spaces_for_channel(channel);
+        let first = matches
+            .next()
+            .with_context(|| format!("no embedding space targets channel {channel}"))?;
+        if matches.next().is_some() {
+            bail!(
+                "multiple embedding spaces target channel {channel}; choose an explicit space id"
+            );
+        }
+        Ok(first)
+    }
+
     pub fn unit_indices_for_project(&self, label: &str) -> Vec<usize> {
         self.units
             .iter()
@@ -236,92 +282,175 @@ impl SearchIndex {
             .collect()
     }
 
-    /// Embed `text` with `embedder`, verify it matches the corpus's model, then
-    /// rank every unit embedded in `channel` that passes `filter`. This is the
-    /// full sentence → results path.
     pub fn search_text(
         &self,
         embedder: &mut dyn Embedder,
         text: &str,
-        channel: &RepresentationKind,
+        space_id: &EmbeddingSpaceId,
         filter: &WhereFilter,
         limit: usize,
     ) -> Result<SearchResults> {
+        let space = self.space(space_id)?;
         let identity = embedder.identity();
-        if *identity != self.identity {
+        if identity != &space.identity.model {
             bail!(
-                "search queries must be embedded with the same model identity as the indexed \
-                 code units; the configured embedder differs from the database on: {}",
-                identity_diff(&self.identity, identity).join(", ")
+                "search queries for space {} must use its model identity; differing fields: {}",
+                space_id,
+                identity_diff(&space.identity.model, identity).join(", ")
             );
         }
         let mut vectors = embedder.embed(std::slice::from_ref(&text.to_owned()))?;
-        let mut query_vector = vectors.pop().context("embedder returned no vector")?;
-        normalize_in_place(&mut query_vector);
-        self.search_vector(&query_vector, channel, filter, limit)
+        let mut query = vectors.pop().context("embedder returned no vector")?;
+        if space.identity.model.normalize {
+            normalize_in_place(&mut query);
+        }
+        self.search_vector(&query, space_id, filter, limit)
     }
 
-    /// Rank every unit embedded in `channel` that passes `filter` against an
-    /// already-normalized query vector.
     pub fn search_vector(
         &self,
         query: &[f32],
-        channel: &RepresentationKind,
+        space_id: &EmbeddingSpaceId,
         filter: &WhereFilter,
         limit: usize,
     ) -> Result<SearchResults> {
-        let store = self.channel_store(channel)?;
+        let space = self.space(space_id)?;
+        ensure_query_dimensions(query, &space.identity)?;
         let candidates = (0..self.units.len()).filter_map(|index| {
             if !filter.matches(&self.units[index]) {
                 return None;
             }
-            let row = store.row_for_unit(index)?;
-            Some((index, store.vector(row)))
+            let row = space.vectors.row_for_unit(index)?;
+            Some((index, space.vectors.vector(row)))
         });
-        Ok(self.finish(rank_candidates(query, candidates, -1.0), limit))
+        Ok(finish(rank_candidates(query, candidates, -1.0), limit))
     }
 
-    /// The top units most similar to `query_index` in `channel`, excluding the
-    /// query unit and keeping only hits at or above `threshold`.
     pub fn similar_to_unit(
         &self,
         query_index: usize,
-        channel: &RepresentationKind,
+        space_id: &EmbeddingSpaceId,
         filter: &WhereFilter,
         limit: usize,
         threshold: f32,
     ) -> Result<SearchResults> {
-        let store = self.channel_store(channel)?;
-        let query_row = store
+        let space = self.space(space_id)?;
+        let query_row = space
+            .vectors
             .row_for_unit(query_index)
-            .context("query unit has no stored embedding in this channel")?;
-        let query_vector = store.vector(query_row).to_vec();
+            .context("query unit has no stored embedding in this space")?;
+        let query = space.vectors.vector(query_row).to_vec();
         let candidates = (0..self.units.len()).filter_map(|index| {
             if index == query_index || !filter.matches(&self.units[index]) {
                 return None;
             }
-            let row = store.row_for_unit(index)?;
-            Some((index, store.vector(row)))
+            let row = space.vectors.row_for_unit(index)?;
+            Some((index, space.vectors.vector(row)))
         });
-        Ok(self.finish(rank_candidates(&query_vector, candidates, threshold), limit))
+        Ok(finish(
+            rank_candidates(&query, candidates, threshold),
+            limit,
+        ))
     }
 
-    fn finish(&self, scored: Vec<codeindex_query::ScoredIndex>, limit: usize) -> SearchResults {
-        let matched = scored.len();
-        let hits = scored
+    /// Fuse independently ranked spaces with weighted reciprocal rank. Raw
+    /// cosine values are retained as evidence but are never added across models.
+    pub fn search_vectors_fused(
+        &self,
+        queries: &[SpaceVectorQuery<'_>],
+        filter: &WhereFilter,
+        limit: usize,
+        rrf_k: usize,
+    ) -> Result<FusedSearchResults> {
+        anyhow::ensure!(
+            !queries.is_empty(),
+            "fusion requires at least one space query"
+        );
+        let mut fused: HashMap<usize, (f32, Vec<SpaceContribution>)> = HashMap::new();
+        for query in queries {
+            anyhow::ensure!(
+                query.weight.is_finite() && query.weight > 0.0,
+                "fusion weight for {} must be finite and positive",
+                query.space_id
+            );
+            let space = self.space(query.space_id)?;
+            ensure_query_dimensions(query.vector, &space.identity)?;
+            let candidates = (0..self.units.len()).filter_map(|index| {
+                if !filter.matches(&self.units[index]) {
+                    return None;
+                }
+                let row = space.vectors.row_for_unit(index)?;
+                Some((index, space.vectors.vector(row)))
+            });
+            for (zero_rank, scored) in rank_candidates(query.vector, candidates, -1.0)
+                .into_iter()
+                .enumerate()
+            {
+                let rank = zero_rank + 1;
+                let contribution = query.weight / (rrf_k + rank) as f32;
+                let entry = fused.entry(scored.index).or_default();
+                entry.0 += contribution;
+                entry.1.push(SpaceContribution {
+                    space_id: query.space_id.clone(),
+                    rank,
+                    raw_score: scored.score,
+                    contribution,
+                });
+            }
+        }
+
+        let matched = fused.len();
+        let mut hits: Vec<FusedSearchHit> = fused
             .into_iter()
-            .take(limit)
-            .map(|s| SearchHit {
-                index: s.index,
-                score: s.score,
+            .map(|(index, (score, mut contributions))| {
+                contributions.sort_by(|left, right| left.space_id.cmp(&right.space_id));
+                FusedSearchHit {
+                    index,
+                    score,
+                    contributions,
+                }
             })
             .collect();
-        SearchResults { matched, hits }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then(left.index.cmp(&right.index))
+        });
+        hits.truncate(limit);
+        Ok(FusedSearchResults { matched, hits })
     }
 }
 
-/// Resolve a `unit:<id>` selector (as printed by query/report output) to an
-/// index into `units`. The IDs are the deterministic [`unit_id`] hashes.
+fn ensure_query_dimensions(query: &[f32], identity: &EmbeddingSpaceIdentity) -> Result<()> {
+    anyhow::ensure!(
+        query.len() == identity.model.dimensions,
+        "query for embedding space {} has {} dimensions, expected {}",
+        identity.id,
+        query.len(),
+        identity.model.dimensions
+    );
+    anyhow::ensure!(
+        query.iter().all(|value| value.is_finite()),
+        "query for embedding space {} contains non-finite values",
+        identity.id
+    );
+    Ok(())
+}
+
+fn finish(scored: Vec<codeindex_query::ScoredIndex>, limit: usize) -> SearchResults {
+    let matched = scored.len();
+    let hits = scored
+        .into_iter()
+        .take(limit)
+        .map(|scored| SearchHit {
+            index: scored.index,
+            score: scored.score,
+        })
+        .collect();
+    SearchResults { matched, hits }
+}
+
 pub fn resolve_selector(units: &[CodeUnitRef], selector: &str) -> Result<usize> {
     if !selector.starts_with("unit:") {
         bail!(
@@ -332,11 +461,5 @@ pub fn resolve_selector(units: &[CodeUnitRef], selector: &str) -> Result<usize> 
     units
         .iter()
         .position(|unit| unit_id(unit) == selector)
-        .with_context(|| {
-            format!(
-                "{selector} not found in the current index. Unit IDs are deterministic per index \
-                 generation and change when code is re-indexed; re-run the query that produced \
-                 the ID, or list units."
-            )
-        })
+        .with_context(|| format!("{selector} not found in the current index"))
 }

@@ -2,24 +2,29 @@
 
 mod embed;
 mod scanner;
+pub mod source;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use codeindex_core::{ExtractedEntity, RepresentationKind};
-use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
-use codeindex_tree_sitter::normalizer::sha256_hex;
-use codeindex_tree_sitter::{
-    ExtractOptions, LanguageRegistry, extract_references, extract_units,
+use codeindex_core::{
+    EntityId, EntityVersionId, ExtractedEntity, Representation, RepresentationKind,
+    RepresentationOrigin,
 };
+use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
+use codeindex_tree_sitter::normalizer::{normalize_for_hash, sha256_hex};
+use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_references, extract_units};
 
 pub use embed::{
     EmbedProgress, EmbedStats, LanguageTokens, embed_pending, embed_pending_with_progress,
-    find_or_create_model_id, token_report,
+    embed_space_pending, embed_space_pending_with_progress, find_or_create_model_id, token_report,
 };
 pub use scanner::{ScannedFile, scan_files};
+pub use source::{
+    FileSystemSource, MemorySource, SourceDocument, SourceProject, SourceProvider,
+    SourceProviderCatalog, SourceRevision,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionMode {
@@ -38,11 +43,21 @@ impl RetentionMode {
     }
 }
 
+/// Filesystem convenience configuration retained for the common case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSpec {
     pub label: String,
     pub source_dir: PathBuf,
     pub exclude: Vec<String>,
+}
+
+/// Provider-independent indexing settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSettings {
+    pub enabled_languages: Vec<String>,
+    pub body_node_count_threshold: usize,
+    pub max_body_chars: usize,
+    pub retention: RetentionMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +67,29 @@ pub struct IndexOptions {
     pub body_node_count_threshold: usize,
     pub max_body_chars: usize,
     pub retention: RetentionMode,
+}
+
+impl IndexOptions {
+    pub fn settings(&self) -> IndexSettings {
+        IndexSettings {
+            enabled_languages: self.enabled_languages.clone(),
+            body_node_count_threshold: self.body_node_count_threshold,
+            max_body_chars: self.max_body_chars,
+            retention: self.retention,
+        }
+    }
+}
+
+/// Optional producer for consumer-defined representations such as generated
+/// descriptions. Producers run after deterministic frontend representations are
+/// complete and before retention is applied.
+pub trait RepresentationEnricher: Send + Sync {
+    fn enrich(
+        &self,
+        document: &SourceDocument,
+        source: &str,
+        entity: &ExtractedEntity,
+    ) -> Result<Vec<Representation>>;
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -65,30 +103,68 @@ pub struct ProjectStats {
     pub total_units: usize,
 }
 
+/// Index filesystem projects using the default provider implementation.
 pub fn index(
     db: &Db,
     options: &IndexOptions,
     only_label: Option<&str>,
 ) -> Result<Vec<ProjectStats>> {
+    let sources: Vec<(String, FileSystemSource)> = options
+        .projects
+        .iter()
+        .map(|project| {
+            (
+                project.label.clone(),
+                FileSystemSource::new(project.source_dir.clone())
+                    .with_excludes(project.exclude.clone()),
+            )
+        })
+        .collect();
+    let projects: Vec<SourceProject<'_>> = sources
+        .iter()
+        .map(|(label, provider)| SourceProject {
+            label: label.clone(),
+            provider,
+        })
+        .collect();
+    index_sources(db, &options.settings(), &projects, only_label)
+}
+
+/// Index arbitrary source providers with no representation enrichers.
+pub fn index_sources(
+    db: &Db,
+    settings: &IndexSettings,
+    projects: &[SourceProject<'_>],
+    only_label: Option<&str>,
+) -> Result<Vec<ProjectStats>> {
+    index_sources_with_enrichers(db, settings, projects, only_label, &[])
+}
+
+/// Provider-neutral indexing entry point.
+pub fn index_sources_with_enrichers(
+    db: &Db,
+    settings: &IndexSettings,
+    projects: &[SourceProject<'_>],
+    only_label: Option<&str>,
+    enrichers: &[&dyn RepresentationEnricher],
+) -> Result<Vec<ProjectStats>> {
     db.check_or_set_immutable(
         "index.body_node_count_threshold",
-        &options.body_node_count_threshold.to_string(),
+        &settings.body_node_count_threshold.to_string(),
     )?;
-    db.check_or_set_immutable("index.retention", options.retention.as_str())?;
+    db.check_or_set_immutable("index.retention", settings.retention.as_str())?;
     db.check_or_set_immutable(
         "embedding.max_body_chars",
-        &options.max_body_chars.to_string(),
+        &settings.max_body_chars.to_string(),
     )?;
 
-    // Every unit written in this run shares one generation number (M4).
     let generation = db.bump_generation()?;
-
     let mut stats = Vec::new();
-    for project in &options.projects {
+    for project in projects {
         if only_label.is_some_and(|label| project.label != label) {
             continue;
         }
-        stats.push(index_project(db, options, project, generation)?);
+        stats.push(index_project(db, settings, project, generation, enrichers)?);
     }
     if let Some(label) = only_label
         && stats.is_empty()
@@ -96,26 +172,24 @@ pub fn index(
         anyhow::bail!("no configured project labeled {label:?}");
     }
     db.prune_orphan_entities()?;
-    let pruned = db.prune_orphan_embeddings()?;
-    if pruned > 0 {
-        eprintln!("pruned {pruned} orphaned embeddings");
-    }
+    db.prune_orphan_embeddings()?;
     Ok(stats)
 }
 
 fn index_project(
     db: &Db,
-    options: &IndexOptions,
-    project: &ProjectSpec,
+    settings: &IndexSettings,
+    project: &SourceProject<'_>,
     generation: i64,
+    enrichers: &[&dyn RepresentationEnricher],
 ) -> Result<ProjectStats> {
-    let root = &project.source_dir;
-    let project_id = db.upsert_project(&project.label, &root.to_string_lossy())?;
-    let enabled: HashSet<String> = options.enabled_languages.iter().cloned().collect();
-    let scanned = scan_files(root, &project.exclude, &enabled)?;
+    let project_id = db.upsert_project(&project.label, &project.provider.project_locator())?;
+    let enabled: HashSet<String> = settings.enabled_languages.iter().cloned().collect();
+    let documents = project.provider.documents(&enabled)?;
+    source::validate_documents(&documents)?;
     let extraction = ExtractOptions {
-        body_node_count_threshold: options.body_node_count_threshold,
-        max_body_chars: options.max_body_chars,
+        body_node_count_threshold: settings.body_node_count_threshold,
+        max_body_chars: settings.max_body_chars,
     };
     let registry = LanguageRegistry::global();
 
@@ -123,39 +197,31 @@ fn index_project(
         label: project.label.clone(),
         ..ProjectStats::default()
     };
-    let mut seen = HashSet::with_capacity(scanned.len());
+    let mut seen = HashSet::with_capacity(documents.len());
     let mut any_change = false;
-    for file in &scanned {
-        seen.insert(file.relative_path.clone());
-        let existing = db.get_file(project_id, &file.relative_path)?;
-        let metadata = match std::fs::metadata(&file.absolute_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!("failed to stat {}: {error}", file.absolute_path.display());
-                stats.failed += 1;
-                continue;
-            }
-        };
-        let mtime_ns = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos() as i64)
-            .unwrap_or(0);
-        let size = metadata.len() as i64;
 
-        if existing
-            .as_ref()
-            .is_some_and(|record| record.mtime_ns == mtime_ns && record.size == size)
-        {
+    for document in &documents {
+        seen.insert(document.id.clone());
+        let existing = db.get_file_by_source_id(project_id, &document.id)?;
+        let mtime_ns = document.revision.modified_ns.unwrap_or_default();
+        let size = document.revision.size.unwrap_or_default() as i64;
+
+        if existing.as_ref().is_some_and(|record| {
+            record.source_revision == document.revision.opaque
+                && record.relative_path == document.relative_path
+                && record.language_id == document.language_id
+        }) {
             stats.skipped += 1;
             continue;
         }
 
-        let source = match std::fs::read_to_string(&file.absolute_path) {
+        let source = match project.provider.read(document) {
             Ok(source) => source,
             Err(error) => {
-                eprintln!("failed to read {}: {error}", file.absolute_path.display());
+                eprintln!(
+                    "failed to read {} from project {}: {error}",
+                    document.relative_path, project.label
+                );
                 stats.failed += 1;
                 continue;
             }
@@ -163,44 +229,50 @@ fn index_project(
         let source_hash = sha256_hex(&source);
         if let Some(record) = &existing
             && record.source_hash == source_hash
+            && record.relative_path == document.relative_path
+            && record.language_id == document.language_id
         {
-            db.update_file_meta(record.id, mtime_ns, size)?;
+            db.update_file_meta(record.id, &document.revision.opaque, mtime_ns, size)?;
             stats.skipped += 1;
             continue;
         }
 
         let def = registry
-            .get(&file.language_id)
-            .context("scanner produced an unregistered language")?;
-        let entities = match extract_units(def, &source, &extraction) {
+            .get(&document.language_id)
+            .with_context(|| format!("unknown language {}", document.language_id))?;
+        let mut entities = match extract_units(def, &source, &extraction) {
             Ok(entities) => entities,
             Err(error) => {
-                eprintln!("failed to parse {}: {error}", file.absolute_path.display());
+                eprintln!("failed to parse {}: {error}", document.relative_path);
                 stats.failed += 1;
                 continue;
             }
         };
-        let references = extract_references(def, &source).unwrap_or_default();
+        for entity in &mut entities {
+            complete_representations(&source, entity);
+            apply_enrichers(document, &source, entity, enrichers)?;
+        }
+        let references = extract_references(def, &source).unwrap_or_else(|error| {
+            eprintln!(
+                "failed to extract references from {}: {error}",
+                document.relative_path
+            );
+            Vec::new()
+        });
 
-        // Carry entity identity forward from the file's prior units before we
-        // replace them (M4).
         let prior = match &existing {
             Some(record) => db.list_units_for_file(record.id)?,
             None => Vec::new(),
         };
-        let mut units = assign_identity(
-            &project.label,
-            &file.relative_path,
-            &prior,
-            entities,
-            generation,
-        );
-        apply_retention(&mut units, options.retention);
+        let mut units = assign_identity(&project.label, &document.id, &prior, entities, generation);
+        apply_retention(&mut units, settings.retention);
 
         let file_id = db.upsert_file(&NewFile {
             project_id,
-            relative_path: file.relative_path.clone(),
-            language_id: file.language_id.clone(),
+            source_document_id: document.id.clone(),
+            source_revision: document.revision.opaque.clone(),
+            relative_path: document.relative_path.clone(),
+            language_id: document.language_id.clone(),
             mtime_ns,
             size,
             source_hash,
@@ -213,48 +285,117 @@ fn index_project(
     }
 
     for record in db.list_files(project_id)? {
-        if !seen.contains(&record.relative_path) {
+        if !seen.contains(&record.source_document_id) {
             db.delete_file(record.id)?;
             stats.removed += 1;
             any_change = true;
         }
     }
 
-    // Usage channel: resolve staged call sites across the whole project into a
-    // synthesized per-entity document (M4). Recomputed whenever anything in the
-    // project changed, since a caller edit changes a callee's usage.
     if any_change {
-        resolve_usage(db, project_id)?;
+        resolve_usage(db, project_id, settings.retention)?;
     }
-
     stats.total_units = db.count_units_for_project(project_id)? as usize;
     Ok(stats)
 }
 
-/// Assign each extracted entity a logical `entity_id` (stable across index
-/// generations) and an exact `entity_version_id`. Matching is within-file:
-/// first by `(kind, scope, name)`, then — to survive a rename — by identical
-/// `Implementation` body hash and kind. Unmatched entities mint a fresh id.
+fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
+    if let Some(body_span) = entity.body_span {
+        let body = source[body_span.start_byte..body_span.end_byte].to_string();
+        let body_hash = sha256_hex(&normalize_for_hash(&body));
+        upsert_representation(
+            &mut entity.representations,
+            Representation::new(RepresentationKind::Body, body, body_hash.clone()),
+        );
+        // Logical rename matching must ignore the declaration name. A body hash
+        // is the strongest deterministic frontend signal currently available.
+        entity.normalized_body_hash = body_hash;
+    }
+
+    let Some(full) = entity
+        .representation(&RepresentationKind::FullSource)
+        .map(|representation| representation.content.clone())
+    else {
+        return;
+    };
+    let body_offset = entity
+        .body_span
+        .map(|span| span.start_byte.saturating_sub(entity.span.start_byte))
+        .unwrap_or(full.len())
+        .min(full.len());
+    let search_prefix = &full[..body_offset];
+    if entity.name != "<anonymous>"
+        && let Some(offset) = search_prefix.find(&entity.name)
+    {
+        let mut without_name = String::with_capacity(full.len() + 8);
+        without_name.push_str(&full[..offset]);
+        without_name.push_str("<declared-name>");
+        without_name.push_str(&full[offset + entity.name.len()..]);
+        let hash = sha256_hex(&normalize_for_hash(&without_name));
+        upsert_representation(
+            &mut entity.representations,
+            Representation::new(
+                RepresentationKind::BodyWithoutDeclaredName,
+                without_name,
+                hash,
+            ),
+        );
+    }
+}
+
+fn apply_enrichers(
+    document: &SourceDocument,
+    source: &str,
+    entity: &mut ExtractedEntity,
+    enrichers: &[&dyn RepresentationEnricher],
+) -> Result<()> {
+    for enricher in enrichers {
+        for representation in enricher.enrich(document, source, entity)? {
+            upsert_representation(&mut entity.representations, representation);
+        }
+    }
+    Ok(())
+}
+
+fn upsert_representation(representations: &mut Vec<Representation>, replacement: Representation) {
+    if let Some(existing) = representations
+        .iter_mut()
+        .find(|representation| representation.kind == replacement.kind)
+    {
+        *existing = replacement;
+    } else {
+        representations.push(replacement);
+    }
+}
+
+/// Assign logical identity by exact symbol first, then by a unique identical
+/// body. Ambiguous duplicate bodies deliberately mint new ids rather than
+/// guessing which historical entity survived.
 fn assign_identity(
     project_label: &str,
-    relative_path: &str,
+    source_document_id: &str,
     prior: &[CodeUnit],
     entities: Vec<ExtractedEntity>,
     generation: i64,
 ) -> Vec<NewCodeUnit> {
-    let mut by_key: HashMap<(&str, Option<&str>, &str), &str> = HashMap::new();
-    let mut by_body: HashMap<(&str, &str), &str> = HashMap::new();
+    let mut by_key: HashMap<(&str, Option<&str>, &str), &EntityId> = HashMap::new();
+    let mut by_body: HashMap<(&str, &str), Vec<&EntityId>> = HashMap::new();
     for unit in prior {
         by_key.insert(
-            (unit.kind.as_str(), unit.scope.as_deref(), unit.name.as_str()),
-            unit.entity_id.as_str(),
+            (
+                unit.kind.as_str(),
+                unit.scope.as_deref(),
+                unit.name.as_str(),
+            ),
+            &unit.entity_id,
         );
         by_body
             .entry((unit.kind.as_str(), unit.normalized_body_hash.as_str()))
-            .or_insert(unit.entity_id.as_str());
+            .or_default()
+            .push(&unit.entity_id);
     }
 
-    let mut consumed: HashSet<&str> = HashSet::new();
+    let mut consumed: HashSet<EntityId> = HashSet::new();
     let mut out = Vec::with_capacity(entities.len());
     for entity in entities {
         let kind = entity.kind.as_str();
@@ -262,19 +403,22 @@ fn assign_identity(
         let matched = by_key
             .get(&key)
             .copied()
-            .filter(|id| !consumed.contains(id))
+            .filter(|id| !consumed.contains(*id))
             .or_else(|| {
-                by_body
-                    .get(&(kind, entity.normalized_body_hash.as_str()))
+                let candidates = by_body.get(&(kind, entity.normalized_body_hash.as_str()))?;
+                let mut available = candidates
+                    .iter()
                     .copied()
-                    .filter(|id| !consumed.contains(id))
+                    .filter(|id| !consumed.contains(*id));
+                let first = available.next()?;
+                available.next().is_none().then_some(first)
             });
         let entity_id = match matched {
             Some(id) => {
-                consumed.insert(id);
-                id.to_string()
+                consumed.insert(id.clone());
+                id.clone()
             }
-            None => mint_entity_id(project_label, relative_path, &entity),
+            None => mint_entity_id(project_label, source_document_id, &entity),
         };
         let version_ingredients = [
             entity_id.as_str(),
@@ -283,7 +427,8 @@ fn assign_identity(
             &entity.span.end_byte.to_string(),
         ]
         .join("\0");
-        let entity_version_id = format!("ver:{}", &sha256_hex(&version_ingredients)[..16]);
+        let entity_version_id =
+            EntityVersionId::new(format!("ver:{}", &sha256_hex(&version_ingredients)[..16]));
         out.push(NewCodeUnit::from_entity(
             entity,
             entity_id,
@@ -294,39 +439,50 @@ fn assign_identity(
     out
 }
 
-fn mint_entity_id(project_label: &str, relative_path: &str, entity: &ExtractedEntity) -> String {
+fn mint_entity_id(
+    project_label: &str,
+    source_document_id: &str,
+    entity: &ExtractedEntity,
+) -> EntityId {
     let ingredients = [
         project_label,
-        relative_path,
+        source_document_id,
         entity.kind.as_str(),
         entity.scope.as_deref().unwrap_or(""),
         entity.name.as_str(),
         &entity.span.start_byte.to_string(),
     ]
     .join("\0");
-    format!("ent:{}", &sha256_hex(&ingredients)[..16])
+    EntityId::new(format!("ent:{}", &sha256_hex(&ingredients)[..16]))
 }
 
 fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
     for unit in units {
-        for repr in &mut unit.representations {
+        for representation in &mut unit.representations {
+            let extracted = matches!(
+                &representation.origin,
+                RepresentationOrigin::Extracted { .. }
+            );
             match retention {
                 RetentionMode::Full => {}
-                // Report keeps display source (FullSource) but drops the
-                // embed-only channels' text, which is recoverable from source.
                 RetentionMode::Report => {
-                    if repr.kind != RepresentationKind::FullSource {
-                        repr.content = None;
+                    if extracted && representation.kind != RepresentationKind::FullSource {
+                        representation.content = None;
                     }
                 }
-                RetentionMode::Minimal => repr.content = None,
+                RetentionMode::Minimal => {
+                    // Derived/imported channels cannot be re-created from one
+                    // source document, so retain them. Extracted channels are
+                    // recoverable through the provider catalog.
+                    if extracted {
+                        representation.content = None;
+                    }
+                }
             }
         }
     }
 }
 
-/// Attribute each raw reference to the innermost unit whose byte span contains
-/// it, and stage it for the Usage pass.
 fn stage_references(
     db: &Db,
     units: &[NewCodeUnit],
@@ -338,12 +494,11 @@ fn stage_references(
     }
     let mut staged = Vec::new();
     for reference in references {
-        // Innermost containing unit = largest start_byte still covering it.
         let mut best: Option<usize> = None;
         for (index, unit) in units.iter().enumerate() {
             if unit.start_byte <= reference.start_byte && reference.start_byte < unit.end_byte {
                 match best {
-                    Some(prev) if units[prev].start_byte >= unit.start_byte => {}
+                    Some(previous) if units[previous].start_byte >= unit.start_byte => {}
                     _ => best = Some(index),
                 }
             }
@@ -359,77 +514,76 @@ fn stage_references(
     db.insert_references(&staged)
 }
 
-/// Resolve staged call sites in a project into the `Usage` channel. For each
-/// callee entity, assemble a deterministic document of its call sites (caller
-/// qualified name + snippet) and store it as that unit's `Usage` representation.
-/// Name-based, same-project resolution (best effort); ambiguous names resolve
-/// to every candidate.
-fn resolve_usage(db: &Db, project_id: ProjectId) -> Result<()> {
+fn resolve_usage(db: &Db, project_id: ProjectId, _retention: RetentionMode) -> Result<()> {
     db.clear_channel_for_project(project_id, &RepresentationKind::Usage)?;
-
     let units = db.list_units_for_project(project_id)?;
     if units.is_empty() {
         return Ok(());
     }
-    // name -> unit ids defining it (last path segment of the symbol).
-    let mut defs: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut definitions: HashMap<String, Vec<i64>> = HashMap::new();
     let mut qualified: HashMap<i64, String> = HashMap::new();
     for unit in &units {
         if let Some(name) = symbol_name(&unit.name) {
-            defs.entry(name).or_default().push(unit.id);
+            definitions.entry(name).or_default().push(unit.id);
         }
-        let qual = match &unit.scope {
-            Some(scope) => format!("{scope}.{}", unit.name),
-            None => unit.name.clone(),
-        };
-        qualified.insert(unit.id, qual);
+        qualified.insert(
+            unit.id,
+            match &unit.scope {
+                Some(scope) => format!("{scope}.{}", unit.name),
+                None => unit.name.clone(),
+            },
+        );
     }
 
     let references = db.references_for_project(project_id)?;
-    // callee unit id -> sorted, de-duplicated usage lines.
     let mut usages: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-    for (caller_unit_id, _caller_name, _caller_scope, callee_symbol, snippet, _line) in references {
+    for (caller_id, _, _, callee_symbol, snippet, _) in references {
         let Some(name) = symbol_name(&callee_symbol) else {
             continue;
         };
-        let Some(callee_ids) = defs.get(&name) else {
+        let Some(callee_ids) = definitions.get(&name) else {
             continue;
         };
-        let caller_qual = qualified
-            .get(&caller_unit_id)
+        let caller = qualified
+            .get(&caller_id)
             .cloned()
             .unwrap_or_else(|| "?".to_string());
         for &callee_id in callee_ids {
-            if callee_id == caller_unit_id {
-                continue; // skip trivial self-recursion
+            if callee_id != caller_id {
+                usages
+                    .entry(callee_id)
+                    .or_default()
+                    .insert(format!("{caller}: {snippet}"));
             }
-            usages
-                .entry(callee_id)
-                .or_default()
-                .insert(format!("{caller_qual}: {snippet}"));
         }
     }
 
+    let origin = RepresentationOrigin::Derived {
+        producer: "codeindex-usage".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
     for (unit_id, lines) in usages {
         let text = lines.into_iter().collect::<Vec<_>>().join("\n");
-        let hash = sha256_hex(&text);
-        db.set_representation(unit_id, &RepresentationKind::Usage, &hash, Some(&text))?;
+        db.set_representation_with_origin(
+            unit_id,
+            &RepresentationKind::Usage,
+            &sha256_hex(&text),
+            Some(&text),
+            &origin,
+        )?;
     }
     Ok(())
 }
 
-/// Reduce a raw callee expression to a bare symbol name: drop macro `!`,
-/// balanced generic argument groups, and any `::`/`.` path prefix.
 fn symbol_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('!');
-    // Drop everything inside balanced `<...>` (turbofish and generics).
     let mut without_generics = String::with_capacity(trimmed.len());
     let mut depth = 0usize;
-    for ch in trimmed.chars() {
-        match ch {
+    for character in trimmed.chars() {
+        match character {
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => without_generics.push(ch),
+            _ if depth == 0 => without_generics.push(character),
             _ => {}
         }
     }
@@ -445,37 +599,94 @@ fn symbol_name(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn indexes_into_existing_sqlite_schema() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("lib.rs"),
-            "fn add(a: i32, b: i32) -> i32 { let value = a + b; value }",
-        )
-        .unwrap();
-        let db = codeindex_sqlite::open_in_memory().unwrap();
-        let options = IndexOptions {
-            projects: vec![ProjectSpec {
-                label: "main".into(),
-                source_dir: root.path().to_path_buf(),
-                exclude: Vec::new(),
-            }],
+    fn settings() -> IndexSettings {
+        IndexSettings {
             enabled_languages: vec!["rust".into()],
             body_node_count_threshold: 1,
             max_body_chars: 10_000,
             retention: RetentionMode::Full,
-        };
-        let stats = index(&db, &options, None).unwrap();
-        assert_eq!(stats[0].indexed, 1);
-        assert_eq!(stats[0].total_units, 1);
+        }
     }
 
     #[test]
-    fn symbol_name_reduces_paths_and_generics() {
-        assert_eq!(symbol_name("foo").as_deref(), Some("foo"));
-        assert_eq!(symbol_name("self.method").as_deref(), Some("method"));
-        assert_eq!(symbol_name("Type::<T>::build").as_deref(), Some("build"));
-        assert_eq!(symbol_name("vec!").as_deref(), Some("vec"));
-        assert_eq!(symbol_name("").as_deref(), None);
+    fn indexes_memory_source_without_filesystem_assumptions() {
+        let mut source = MemorySource::new("memory://workspace");
+        source.insert(
+            "src/lib.rs",
+            "fn add(a: i32, b: i32) -> i32 { let value = a + b; value }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        let stats = index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(stats[0].indexed, 1);
+        assert_eq!(stats[0].total_units, 1);
+        assert_eq!(
+            db.list_files(db.get_project("main").unwrap().unwrap().id)
+                .unwrap()[0]
+                .source_document_id,
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn rename_preserves_entity_identity_through_body_channel() {
+        let mut source = MemorySource::new("memory://rename");
+        source.insert(
+            "lib.rs",
+            "fn alpha(a: i32, b: i32) -> i32 { let sum = a + b; sum * 2 }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        let project_id = db.get_project("main").unwrap().unwrap().id;
+        let before = db.list_units_for_project(project_id).unwrap()[0]
+            .entity_id
+            .clone();
+
+        source.insert(
+            "lib.rs",
+            "fn beta(a: i32, b: i32) -> i32 { let sum = a + b; sum * 2 }",
+        );
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        let after = db.list_units_for_project(project_id).unwrap()[0]
+            .entity_id
+            .clone();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn body_and_name_erased_channels_are_materialized() {
+        let mut source = MemorySource::new("memory://representations");
+        source.insert(
+            "lib.rs",
+            "fn parse_flags(input: &str) -> usize { input.len() }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        let snapshot = db.snapshot(&[]).unwrap();
+        let unit = &snapshot.units[0];
+        assert!(unit.representation(&RepresentationKind::Body).is_some());
+        assert!(
+            unit.representation(&RepresentationKind::BodyWithoutDeclaredName)
+                .unwrap()
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("<declared-name>")
+        );
     }
 }

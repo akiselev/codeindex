@@ -1,63 +1,73 @@
 # TODO — codeindex 0.1
 
-Goal of 0.1: a **coherent, consumable substrate** — the crates that were
-extracted from decombine, cleaned up enough that a second consumer (a CLI, a
-Python binding) can depend on them without reaching back into decombine. Ordered
-by priority.
+Goal: a coherent, consumable library substrate that `decombine`,
+`codeindex-cli`, bindings, IDE integrations, and agents can use without copying
+implementation logic or depending on application-specific modules.
 
-## P0 — release hygiene (blocks any external consumer)
+## Completed foundation
 
-- [x] **License.** *(done 2026-07-11)* Dual `MIT OR Apache-2.0`: `LICENSE-MIT` /
-      `LICENSE-APACHE` at the repo root; `license` inherited from
-      `[workspace.package]`.
-- [x] **Crate metadata.** *(done 2026-07-11)* Shared `version` / `edition` /
-      `authors` / `repository` / `keywords` / `categories` live in
-      `[workspace.package]`; each crate inherits them and keeps its own
-      one-line `description`.
-- [ ] **Publish scope.** All 7 crates are `publish = false`. Decide what ships to
-      crates.io (facade + the six members) vs stays internal, and flip the flag
-      once license + metadata land. Reserve the crate names early if publishing.
+- [x] Split the workspace into dependency/change boundaries.
+- [x] Keep `codeindex-embedding` free of SQLite and language grammars.
+- [x] Add high-level storage-neutral search and stable selectors.
+- [x] Normalize multi-representation persistence with entity/version identity.
+- [x] Add `Body`, name-erased body, signature, documentation, symbol, Usage, and
+      custom/generated representation paths.
+- [x] Persist representation provenance.
+- [x] Add provider-neutral indexing with filesystem and memory implementations.
+- [x] Separate stable source document identity from logical path and revision.
+- [x] Add named embedding spaces with different models/dimensions in one corpus.
+- [x] Add explicit-space search and reciprocal-rank fusion.
+- [x] Filter storage-neutral snapshots to selected-project vectors and validate
+      snapshots on load.
+- [x] Reject the incompatible previous pre-release schema epoch.
+- [x] CI: rustfmt, Clippy with warnings denied, workspace tests, and fastembed
+      feature compile check.
 
-## P1 — make the substrate usable on its own
+## P0 — release blockers
 
-- [x] **High-level search API.** *(done 2026-07-11)* The end-to-end
-      "embed a sentence → verify model identity → rank → resolve `body_hash` back
-      to unit metadata" flow now lives in the new **`codeindex-search`** crate
-      (`SearchIndex::{load, search_text, search_vector, similar_to_unit}`,
-      `resolve_selector`), depending on `sqlite` + `embedding` + `query`.
-      `codeindex-query` stays a pure, embedding-free compute layer. decombine's
-      `AnalysisContext`/`VectorStore`/`query::{search,similar}` are now thin
-      shims over it (presentation-only). Agents query by sentence with one call.
-- [x] **Workspace integration test.** *(done 2026-07-11)*
-      `crates/search/tests/round_trip.rs` walks sqlite → embedding (hash backend)
-      → query → search across the seams: load, `search_text` ranking, the
-      identity-mismatch error, and `similar_to_unit`.
-- [ ] **`examples/`.** Turn the `docs/getting-started.md` snippets into compiled
-      examples so the docs cannot rot (`cargo test --examples` in CI).
+- [ ] **Publish scope.** Decide which of the facade and eight component crates are
+      public, reserve names, and remove `publish = false` where appropriate.
+- [ ] **Compiled examples.** Convert source-provider, explicit-space, fusion, and
+      ordinary filesystem quickstarts into `examples/` compiled by CI.
+- [ ] **Public API audit.** Review ownership, error types, naming, and future
+      extensibility of `SourceProvider`, `IndexSnapshot`, representation
+      enrichment, and embedding-space APIs before external adoption.
+- [ ] **Downstream migration.** Update `decombine` to the explicit space APIs and
+      typed entity ids, then use it as the first compatibility proof.
 
-## P2 — debt and polish
+## P1 — documentation and quality
 
-- [ ] **Dormant core vocabulary.** `codeindex-core` ships `EntityId`,
-      `EntityVersionId`, and 8 of 10 `RepresentationKind` variants that no
-      consumer uses yet (the pipeline wires only `FullSource` + `Implementation`).
-      It is deliberate seeding for the multi-representation schema (see ROADMAP),
-      but decide whether to feature-gate it behind `unstable` or trim it until
-      that lands, so the public 0.1 surface reflects what actually works.
-- [ ] **Rustdoc coverage.** Add crate- and item-level docs on the public API and
-      turn on `#![deny(missing_docs)]` per crate for docs.rs readiness. (Crate
-      root docs exist for `codeindex`, `codeindex-embedding`, and `-indexer`.)
-- [ ] **CI depth.** CI compiles the fastembed backend but never runs it (model
-      download + heavy link). Consider a scheduled job that actually embeds with a
-      small model against a fixture, to catch backend regressions the
-      compile-only check misses.
+- [ ] **Rustdoc coverage.** Document every public item and enable
+      `#![deny(missing_docs)]` crate by crate.
+- [ ] **Getting-started rewrite.** Replace the pre-space workflow and document
+      delete/reindex behavior for schema epoch 2.
+- [ ] **CHANGELOG and compatibility policy.** State schema, snapshot, and public
+      Rust API guarantees for 0.x releases.
+- [ ] **Real backend smoke test.** Add a scheduled or manually triggered test that
+      downloads a small model and executes inference, rather than compile-only
+      checking fastembed.
 
-## Done in the extraction (2026-07-11)
+## P2 — next substrate capabilities
 
-- Split into 7 crates along dependency/change boundaries; `codeindex-embedding`
-  is storage/parser-free (only `codeindex-core`), so a lean binding compiles
-  neither bundled SQLite nor the grammars.
-- Single `impl From<ExtractedEntity> for NewCodeUnit`; `ModelIdentity` moved to
-  `codeindex-core`; language assets relocated into the `tree-sitter` crate
-  (self-contained); build-script env vars renamed `DECOMBINE_*` → `CODEINDEX_*`.
-- Docs: `README.md`, `docs/architecture.md`, `docs/getting-started.md`; CI
-  (fmt, clippy, test, fastembed compile-check). All crates green.
+- [ ] **Relations.** Replace the Rust-only name-based Usage resolver with a
+      parser-neutral relation model carrying provenance and resolution quality.
+- [ ] **Language reference coverage.** Populate and test `references.scm` for
+      bundled languages beyond Rust.
+- [ ] **Cross-document entity moves.** Preserve logical identity across provider
+      document moves only when matching is unique and evidence is explicit.
+- [ ] **Source-provider ergonomics.** Add maintained Git-tree and editor-overlay
+      providers; optimize provider catalogs so source recovery does not need full
+      enumeration on every lookup.
+- [ ] **Write-side store seam.** Introduce one only when a second persistence
+      backend needs to reuse incremental indexing and embedding projection.
+- [ ] **Streaming search.** Add a streaming snapshot/index interface when measured
+      corpora no longer fit the in-memory search model.
+- [ ] **Retrieval evaluation.** Benchmark channels, models, generated
+      descriptions, and fusion independently; move substrate-level evaluation
+      out of `decombine`.
+
+## Deliberately deferred
+
+- ANN/vector indexes until exact-search benchmarks establish a concrete trigger.
+- Hosted embedding as a required service; local-first remains the default.
+- Duplicate, correctness, security, or migration conclusions in the core crate.

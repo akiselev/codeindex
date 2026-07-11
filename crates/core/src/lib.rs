@@ -42,9 +42,6 @@ impl fmt::Display for LanguageId {
 }
 
 /// Logical identity for a source entity across index generations.
-///
-/// Frontends produce `ExtractedEntity` values before repository-qualified
-/// identity is available; the persistence layer assigns this identity later.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EntityId(String);
@@ -56,6 +53,28 @@ impl EntityId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for EntityId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for EntityId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for EntityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -71,6 +90,70 @@ impl EntityVersionId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for EntityVersionId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for EntityVersionId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for EntityVersionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Stable identifier for one independently queryable embedding space.
+///
+/// A space binds one representation channel to one exact model identity and an
+/// input transform. Human-readable ids such as `code`, `docs`, or
+/// `implementation/coderank` are encouraged; stores enforce that an existing id
+/// cannot silently change meaning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EmbeddingSpaceId(String);
+
+impl EmbeddingSpaceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for EmbeddingSpaceId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for EmbeddingSpaceId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for EmbeddingSpaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -171,11 +254,6 @@ impl SourceSpan {
 }
 
 /// A reproducible textual projection of a source entity.
-///
-/// The `as_str`/`From<&str>` pair is the canonical persisted and serialized
-/// form (a stable snake-case token), so this enum can be a database TEXT key
-/// and a JSON field without two encodings drifting apart. Unknown tokens round
-/// trip losslessly through [`RepresentationKind::Custom`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum RepresentationKind {
@@ -251,12 +329,33 @@ impl<'de> Deserialize<'de> for RepresentationKind {
     }
 }
 
-/// Text and identity for one representation channel.
+/// Provenance for a representation channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepresentationOrigin {
+    /// Deterministically extracted from source by a language frontend.
+    Extracted { frontend: String },
+    /// Synthesized from other indexed facts, such as call sites.
+    Derived { producer: String, version: String },
+    /// Supplied by a consumer, such as an LLM-generated description.
+    Imported { producer: String, version: String },
+}
+
+impl Default for RepresentationOrigin {
+    fn default() -> Self {
+        Self::Extracted {
+            frontend: "tree-sitter".to_string(),
+        }
+    }
+}
+
+/// Text, identity, and provenance for one representation channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Representation {
     pub kind: RepresentationKind,
     pub content: String,
     pub content_hash: String,
+    pub origin: RepresentationOrigin,
 }
 
 impl Representation {
@@ -269,7 +368,13 @@ impl Representation {
             kind,
             content: content.into(),
             content_hash: content_hash.into(),
+            origin: RepresentationOrigin::default(),
         }
+    }
+
+    pub fn with_origin(mut self, origin: RepresentationOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -313,9 +418,6 @@ pub struct ExtractedFile {
 }
 
 /// Everything that identifies an embedding model for reproducible runs.
-/// Two runs with the same identity produce comparable vectors. This is the
-/// shared vocabulary between the embedding backends that produce it and the
-/// persistence layer that stores it, so it lives in the neutral core crate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
     pub backend: String,
@@ -331,6 +433,32 @@ pub struct ModelIdentity {
     pub execution_provider: String,
     pub quantization: Option<String>,
     pub cache_path: Option<String>,
+}
+
+/// Immutable meaning of one embedding space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingSpaceIdentity {
+    pub id: EmbeddingSpaceId,
+    pub channel: RepresentationKind,
+    pub model: ModelIdentity,
+    /// Stable name for preprocessing applied before embedding. `identity` means
+    /// the stored representation text is embedded verbatim.
+    pub input_transform: String,
+}
+
+impl EmbeddingSpaceIdentity {
+    pub fn new(
+        id: impl Into<EmbeddingSpaceId>,
+        channel: RepresentationKind,
+        model: ModelIdentity,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            channel,
+            model,
+            input_transform: "identity".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -370,5 +498,13 @@ mod tests {
             entity.representation_text(&RepresentationKind::Documentation),
             None
         );
+    }
+
+    #[test]
+    fn embedding_space_ids_are_serializable_map_keys() {
+        let id = EmbeddingSpaceId::new("docs");
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"docs\"");
+        assert_eq!(serde_json::from_str::<EmbeddingSpaceId>(&json).unwrap(), id);
     }
 }
