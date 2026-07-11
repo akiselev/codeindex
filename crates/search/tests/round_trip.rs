@@ -55,11 +55,7 @@ fn unit(name: &str, body: &str, docs: &str, start: usize) -> NewCodeUnit {
         source_hash: format!("src-{name}"),
         normalized_body_hash: format!("body-{name}"),
         representations: vec![
-            representation(
-                RepresentationKind::FullSource,
-                format!("src-{name}"),
-                body,
-            ),
+            representation(RepresentationKind::FullSource, format!("src-{name}"), body),
             representation(
                 RepresentationKind::Implementation,
                 format!("impl-{name}"),

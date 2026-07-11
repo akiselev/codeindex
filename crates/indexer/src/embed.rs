@@ -3,9 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use codeindex_core::{
-    EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelIdentity, RepresentationKind,
-};
+use codeindex_core::{EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelIdentity, RepresentationKind};
 use codeindex_embedding::config::EmbeddingRunConfig;
 use codeindex_embedding::{
     Embedder, TokenStats, estimated_tokens, normalize_in_place, pack_batches,
@@ -109,15 +107,7 @@ pub fn embed_space_pending_with_progress(
         spaces: 1,
         ..EmbedStats::default()
     };
-    embed_space(
-        db,
-        embedder,
-        config,
-        space,
-        sources,
-        &mut stats,
-        progress,
-    )?;
+    embed_space(db, embedder, config, space, sources, &mut stats, progress)?;
     Ok(stats)
 }
 
@@ -151,13 +141,8 @@ fn embed_space(
             }
         }
         if !missing.is_empty() {
-            let recovered = recover_channel_texts(
-                db,
-                config,
-                &space.identity_channel(),
-                &missing,
-                sources,
-            )?;
+            let recovered =
+                recover_channel_texts(db, config, &space.identity_channel(), &missing, sources)?;
             for hash in missing {
                 match recovered.get(&hash) {
                     Some(text) => resolved.push((hash, text.clone())),
@@ -185,13 +170,11 @@ fn embed_space(
             config.embedding.max_batch_chars,
             config.embedding.max_batch_token_area,
         ) {
-            stats
-                .tokens
-                .record_batch(batch.iter().map(|(_, _, tokens)| *tokens), max_sequence_length);
-            let texts: Vec<String> = batch
-                .iter()
-                .map(|(_, text, _)| text.clone())
-                .collect();
+            stats.tokens.record_batch(
+                batch.iter().map(|(_, _, tokens)| *tokens),
+                max_sequence_length,
+            );
+            let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
             let vectors = embedder.embed(&texts)?;
             anyhow::ensure!(
                 vectors.len() == batch.len(),

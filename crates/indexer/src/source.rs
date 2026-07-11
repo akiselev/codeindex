@@ -102,9 +102,11 @@ impl<'a> SourceProviderCatalog<'a> {
             .into_iter()
             .find(|document| document.id == document_id)
             .or_else(|| {
-                provider.documents(&enabled).ok()?.into_iter().find(|document| {
-                    document.relative_path == relative_path
-                })
+                provider
+                    .documents(&enabled)
+                    .ok()?
+                    .into_iter()
+                    .find(|document| document.relative_path == relative_path)
             });
         match document {
             Some(document) => provider.read(&document).map(Some),
@@ -260,7 +262,10 @@ pub(crate) fn validate_documents(documents: &[SourceDocument]) -> Result<()> {
             bail!("source provider returned an empty relative path");
         }
         if !ids.insert(document.id.as_str()) {
-            bail!("source provider returned duplicate document id {:?}", document.id);
+            bail!(
+                "source provider returned duplicate document id {:?}",
+                document.id
+            );
         }
         if !paths.insert(document.relative_path.as_str()) {
             bail!(

@@ -362,7 +362,10 @@ impl SearchIndex {
         limit: usize,
         rrf_k: usize,
     ) -> Result<FusedSearchResults> {
-        anyhow::ensure!(!queries.is_empty(), "fusion requires at least one space query");
+        anyhow::ensure!(
+            !queries.is_empty(),
+            "fusion requires at least one space query"
+        );
         let mut fused: HashMap<usize, (f32, Vec<SpaceContribution>)> = HashMap::new();
         for query in queries {
             anyhow::ensure!(

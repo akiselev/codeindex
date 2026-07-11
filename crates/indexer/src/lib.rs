@@ -14,9 +14,7 @@ use codeindex_core::{
 };
 use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
 use codeindex_tree_sitter::normalizer::{normalize_for_hash, sha256_hex};
-use codeindex_tree_sitter::{
-    ExtractOptions, LanguageRegistry, extract_references, extract_units,
-};
+use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_references, extract_units};
 
 pub use embed::{
     EmbedProgress, EmbedStats, LanguageTokens, embed_pending, embed_pending_with_progress,
@@ -117,7 +115,8 @@ pub fn index(
         .map(|project| {
             (
                 project.label.clone(),
-                FileSystemSource::new(&project.source_dir).with_excludes(project.exclude.clone()),
+                FileSystemSource::new(project.source_dir.clone())
+                    .with_excludes(project.exclude.clone()),
             )
         })
         .collect();
@@ -165,13 +164,7 @@ pub fn index_sources_with_enrichers(
         if only_label.is_some_and(|label| project.label != label) {
             continue;
         }
-        stats.push(index_project(
-            db,
-            settings,
-            project,
-            generation,
-            enrichers,
-        )?);
+        stats.push(index_project(db, settings, project, generation, enrichers)?);
     }
     if let Some(label) = only_label
         && stats.is_empty()
@@ -239,12 +232,7 @@ fn index_project(
             && record.relative_path == document.relative_path
             && record.language_id == document.language_id
         {
-            db.update_file_meta(
-                record.id,
-                &document.revision.opaque,
-                mtime_ns,
-                size,
-            )?;
+            db.update_file_meta(record.id, &document.revision.opaque, mtime_ns, size)?;
             stats.skipped += 1;
             continue;
         }
@@ -276,13 +264,7 @@ fn index_project(
             Some(record) => db.list_units_for_file(record.id)?,
             None => Vec::new(),
         };
-        let mut units = assign_identity(
-            &project.label,
-            &document.id,
-            &prior,
-            entities,
-            generation,
-        );
+        let mut units = assign_identity(&project.label, &document.id, &prior, entities, generation);
         apply_retention(&mut units, settings.retention);
 
         let file_id = db.upsert_file(&NewFile {
@@ -400,7 +382,11 @@ fn assign_identity(
     let mut by_body: HashMap<(&str, &str), Vec<&EntityId>> = HashMap::new();
     for unit in prior {
         by_key.insert(
-            (unit.kind.as_str(), unit.scope.as_deref(), unit.name.as_str()),
+            (
+                unit.kind.as_str(),
+                unit.scope.as_deref(),
+                unit.name.as_str(),
+            ),
             &unit.entity_id,
         );
         by_body
@@ -474,7 +460,7 @@ fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
     for unit in units {
         for representation in &mut unit.representations {
             let extracted = matches!(
-                representation.origin,
+                &representation.origin,
                 RepresentationOrigin::Extracted { .. }
             );
             match retention {
@@ -637,7 +623,12 @@ mod tests {
         let stats = index_sources(&db, &settings(), &projects, None).unwrap();
         assert_eq!(stats[0].indexed, 1);
         assert_eq!(stats[0].total_units, 1);
-        assert_eq!(db.list_files(db.get_project("main").unwrap().unwrap().id).unwrap()[0].source_document_id, "src/lib.rs");
+        assert_eq!(
+            db.list_files(db.get_project("main").unwrap().unwrap().id)
+                .unwrap()[0]
+                .source_document_id,
+            "src/lib.rs"
+        );
     }
 
     #[test]
@@ -676,7 +667,10 @@ mod tests {
     #[test]
     fn body_and_name_erased_channels_are_materialized() {
         let mut source = MemorySource::new("memory://representations");
-        source.insert("lib.rs", "fn parse_flags(input: &str) -> usize { input.len() }");
+        source.insert(
+            "lib.rs",
+            "fn parse_flags(input: &str) -> usize { input.len() }",
+        );
         let db = codeindex_sqlite::open_in_memory().unwrap();
         let projects = [SourceProject {
             label: "main".into(),

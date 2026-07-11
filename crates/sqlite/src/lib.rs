@@ -22,6 +22,7 @@ pub use models::{
 
 pub use codeindex_storage as storage;
 
+#[derive(Debug)]
 pub struct Db {
     conn: Connection,
 }
@@ -342,35 +343,28 @@ impl Db {
     }
 
     pub fn list_units_for_file(&self, file_id: FileId) -> Result<Vec<CodeUnit>> {
-        self.list_units_query(
+        let mut stmt = self.conn.prepare(
             "SELECT id, file_id, entity_id, entity_version_id, generation,
                     language_id, kind, name, scope, start_byte, end_byte,
                     start_line, end_line, body_node_count, source_hash, normalized_body_hash
              FROM code_units WHERE file_id = ?1 ORDER BY start_byte",
-            [file_id],
-        )
+        )?;
+        Ok(stmt
+            .query_map([file_id], row_to_unit)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn list_units_for_project(&self, project_id: ProjectId) -> Result<Vec<CodeUnit>> {
-        self.list_units_query(
+        let mut stmt = self.conn.prepare(
             "SELECT u.id, u.file_id, u.entity_id, u.entity_version_id, u.generation,
                     u.language_id, u.kind, u.name, u.scope, u.start_byte, u.end_byte,
                     u.start_line, u.end_line, u.body_node_count, u.source_hash,
                     u.normalized_body_hash
              FROM code_units u JOIN files f ON f.id = u.file_id
              WHERE f.project_id = ?1 ORDER BY u.id",
-            [project_id],
-        )
-    }
-
-    fn list_units_query<const N: usize>(
-        &self,
-        sql: &str,
-        params: [i64; N],
-    ) -> Result<Vec<CodeUnit>> {
-        let mut stmt = self.conn.prepare(sql)?;
+        )?;
         Ok(stmt
-            .query_map(params, row_to_unit)?
+            .query_map([project_id], row_to_unit)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -607,10 +601,7 @@ impl Db {
         Ok(identity.id.clone())
     }
 
-    pub fn get_space(
-        &self,
-        id: &EmbeddingSpaceId,
-    ) -> Result<Option<EmbeddingSpaceRecord>> {
+    pub fn get_space(&self, id: &EmbeddingSpaceId) -> Result<Option<EmbeddingSpaceRecord>> {
         Ok(self
             .conn
             .query_row(
@@ -643,9 +634,9 @@ impl Db {
     // ----- embeddings -----
 
     pub fn embeddable_channels(&self) -> Result<Vec<RepresentationKind>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT kind FROM representations WHERE kind != ?1 ORDER BY kind",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT kind FROM representations WHERE kind != ?1 ORDER BY kind")?;
         Ok(stmt
             .query_map([RepresentationKind::FullSource.as_str()], |row| {
                 Ok(RepresentationKind::from(row.get::<_, String>(0)?.as_str()))
@@ -797,7 +788,10 @@ impl Db {
                 })
                 .optional()?;
             if let Some(location) = location
-                && seen.insert((location.project_label.clone(), location.source_document_id.clone()))
+                && seen.insert((
+                    location.project_label.clone(),
+                    location.source_document_id.clone(),
+                ))
             {
                 locations.push(location);
             }
@@ -827,13 +821,7 @@ impl Db {
         project_scope: &[String],
         config_json: &str,
     ) -> Result<i64> {
-        self.create_analysis_run_inner(
-            analysis_kind,
-            model_id,
-            None,
-            project_scope,
-            config_json,
-        )
+        self.create_analysis_run_inner(analysis_kind, model_id, None, project_scope, config_json)
     }
 
     pub fn create_analysis_run_in_space(
@@ -922,30 +910,33 @@ impl Db {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut unit_rows: Vec<(UnitId, UnitRecord)> = stmt
-            .query_map(params_from_iter(projects.iter().map(|project| project.id)), |row| {
-                Ok((
-                    row.get::<_, UnitId>(0)?,
-                    UnitRecord {
-                        entity_id: EntityId::new(row.get::<_, String>(1)?),
-                        entity_version_id: EntityVersionId::new(row.get::<_, String>(2)?),
-                        generation: row.get::<_, i64>(3)? as u64,
-                        project_label: row.get(4)?,
-                        relative_path: row.get(5)?,
-                        language_id: row.get(6)?,
-                        kind: row.get(7)?,
-                        name: row.get(8)?,
-                        scope: row.get(9)?,
-                        span: codeindex_core::SourceSpan::new(
-                            row.get::<_, i64>(10)? as usize,
-                            row.get::<_, i64>(11)? as usize,
-                            row.get::<_, i64>(12)? as usize,
-                            row.get::<_, i64>(13)? as usize,
-                        ),
-                        body_node_count: row.get::<_, i64>(14)? as usize,
-                        representations: Vec::new(),
-                    },
-                ))
-            })?
+            .query_map(
+                params_from_iter(projects.iter().map(|project| project.id)),
+                |row| {
+                    Ok((
+                        row.get::<_, UnitId>(0)?,
+                        UnitRecord {
+                            entity_id: EntityId::new(row.get::<_, String>(1)?),
+                            entity_version_id: EntityVersionId::new(row.get::<_, String>(2)?),
+                            generation: row.get::<_, i64>(3)? as u64,
+                            project_label: row.get(4)?,
+                            relative_path: row.get(5)?,
+                            language_id: row.get(6)?,
+                            kind: row.get(7)?,
+                            name: row.get(8)?,
+                            scope: row.get(9)?,
+                            span: codeindex_core::SourceSpan::new(
+                                row.get::<_, i64>(10)? as usize,
+                                row.get::<_, i64>(11)? as usize,
+                                row.get::<_, i64>(12)? as usize,
+                                row.get::<_, i64>(13)? as usize,
+                            ),
+                            body_node_count: row.get::<_, i64>(14)? as usize,
+                            representations: Vec::new(),
+                        },
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let unit_index: HashMap<UnitId, usize> = unit_rows
@@ -961,7 +952,8 @@ impl Db {
              WHERE f.project_id IN ({placeholders})"
         );
         let mut repr_stmt = self.conn.prepare(&repr_sql)?;
-        let mut rows = repr_stmt.query(params_from_iter(projects.iter().map(|project| project.id)))?;
+        let mut rows =
+            repr_stmt.query(params_from_iter(projects.iter().map(|project| project.id)))?;
         while let Some(row) = rows.next()? {
             let unit_id: UnitId = row.get(0)?;
             if let Some(&index) = unit_index.get(&unit_id) {
@@ -976,7 +968,8 @@ impl Db {
             }
         }
         for (_, unit) in &mut unit_rows {
-            unit.representations.sort_by(|left, right| left.kind.cmp(&right.kind));
+            unit.representations
+                .sort_by(|left, right| left.kind.cmp(&right.kind));
         }
         let units: Vec<UnitRecord> = unit_rows.into_iter().map(|(_, unit)| unit).collect();
 
