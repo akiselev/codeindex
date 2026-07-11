@@ -21,17 +21,18 @@ by priority.
 
 ## P1 — make the substrate usable on its own
 
-- [ ] **High-level search API.** The end-to-end "embed a sentence → rank → resolve
-      `body_hash` back to unit metadata (path, line range, name, scope), with
-      model-identity verification" flow lives only in decombine
-      (`AnalysisContext`). A standalone consumer must reimplement it. Lift it into
-      `codeindex-query` (or a new `codeindex-search`) so the stated goal — agents
-      querying functionality by sentence — is a library call, not a copy-paste.
-      This is the single most valuable 0.1 addition.
-- [ ] **Workspace integration test.** Per-crate unit tests exist, but nothing in
-      this repo exercises index → embed (hash backend) → query across the seams;
-      that coverage stayed in decombine's golden/integration suite. Add a
-      `tests/` round-trip using `codeindex-embedding::embed::hash`.
+- [x] **High-level search API.** *(done 2026-07-11)* The end-to-end
+      "embed a sentence → verify model identity → rank → resolve `body_hash` back
+      to unit metadata" flow now lives in the new **`codeindex-search`** crate
+      (`SearchIndex::{load, search_text, search_vector, similar_to_unit}`,
+      `resolve_selector`), depending on `sqlite` + `embedding` + `query`.
+      `codeindex-query` stays a pure, embedding-free compute layer. decombine's
+      `AnalysisContext`/`VectorStore`/`query::{search,similar}` are now thin
+      shims over it (presentation-only). Agents query by sentence with one call.
+- [x] **Workspace integration test.** *(done 2026-07-11)*
+      `crates/search/tests/round_trip.rs` walks sqlite → embedding (hash backend)
+      → query → search across the seams: load, `search_text` ranking, the
+      identity-mismatch error, and `similar_to_unit`.
 - [ ] **`examples/`.** Turn the `docs/getting-started.md` snippets into compiled
       examples so the docs cannot rot (`cargo test --examples` in CI).
 
