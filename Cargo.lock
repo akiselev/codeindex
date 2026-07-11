@@ -278,6 +278,8 @@ dependencies = [
  "codeindex-indexer",
  "codeindex-query",
  "codeindex-search",
+ "codeindex-source",
+ "codeindex-source-fs",
  "codeindex-sqlite",
  "codeindex-storage",
  "codeindex-tree-sitter",
@@ -288,6 +290,7 @@ name = "codeindex-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -311,9 +314,14 @@ dependencies = [
  "anyhow",
  "codeindex-core",
  "codeindex-embedding",
+ "codeindex-query",
+ "codeindex-search",
+ "codeindex-source",
+ "codeindex-source-fs",
  "codeindex-sqlite",
  "codeindex-tree-sitter",
  "ignore",
+ "rusqlite",
  "tempfile",
 ]
 
@@ -340,6 +348,19 @@ dependencies = [
  "codeindex-sqlite",
  "codeindex-storage",
  "rayon",
+]
+
+[[package]]
+name = "codeindex-source"
+version = "0.1.0"
+
+[[package]]
+name = "codeindex-source-fs"
+version = "0.1.0"
+dependencies = [
+ "codeindex-source",
+ "ignore",
+ "tempfile",
 ]
 
 [[package]]

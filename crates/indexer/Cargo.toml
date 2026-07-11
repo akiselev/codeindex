@@ -7,13 +7,15 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Incremental filesystem indexing orchestration for codeindex"
+description = "Provider-neutral indexing orchestration for codeindex"
 publish = false
 
 [dependencies]
 anyhow = "1.0.103"
 codeindex-core = { path = "../core" }
 codeindex-embedding = { path = "../embedding", default-features = false }
+codeindex-source = { path = "../source" }
+codeindex-source-fs = { path = "../source-fs" }
 codeindex-sqlite = { path = "../sqlite" }
 codeindex-tree-sitter = { path = "../tree-sitter" }
 ignore = "0.4.27"

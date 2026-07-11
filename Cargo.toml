@@ -7,6 +7,8 @@ members = [
     "crates/indexer",
     "crates/query",
     "crates/search",
+    "crates/source",
+    "crates/source-fs",
     "crates/sqlite",
     "crates/storage",
     "crates/tree-sitter",

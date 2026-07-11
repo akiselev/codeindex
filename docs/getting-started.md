@@ -3,7 +3,7 @@
 This guide covers the current library pipeline:
 
 ```text
-source provider → entities/representations → embedding spaces → snapshot → search
+source workspace → entities/representations → embedding spaces → snapshot → search
 ```
 
 Examples use the facade crate. Enable `fastembed` for local ONNX inference.
@@ -45,7 +45,7 @@ This compiles neither SQLite nor bundled language grammars.
 ## 2. Index ordinary filesystem projects
 
 The common filesystem API remains `indexer::index`. It delegates to the same
-provider-neutral pipeline used by custom sources.
+workspace-neutral pipeline used by custom sources.
 
 ```rust
 use codeindex::{indexer, sqlite, tree_sitter};
@@ -77,19 +77,20 @@ The indexer extracts multiple representations for each entity, including body,
 signature, symbol, documentation, and—where reference extraction is available—
 usage call sites.
 
-## 3. Index a custom source provider
+## 3. Index a custom source workspace
 
-A provider does not need to emulate a filesystem. It exposes stable document
-identities, logical paths, revisions, and UTF-8 content.
+A workspace does not need to emulate a filesystem. It opens coherent snapshots
+with stable document identities, logical paths, revisions, and byte content.
 
 ```rust
 use codeindex::{indexer, sqlite};
 use codeindex::indexer::{
-    IndexSettings, MemorySource, RetentionMode, SourceProject,
+    IndexSettings, MemoryWorkspace, RetentionMode, RevisionVerification,
+    SourceProject,
 };
 
 let db = sqlite::open_in_memory()?;
-let mut source = MemorySource::new("memory://workspace");
+let source = MemoryWorkspace::new("memory://workspace");
 source.insert(
     "src/lib.rs",
     "fn answer() -> i32 { let value = 42; value }",
@@ -100,19 +101,35 @@ let settings = IndexSettings {
     body_node_count_threshold: 1,
     max_body_chars: 10_000,
     retention: RetentionMode::Full,
+    revision_verification: RevisionVerification::Verified,
 };
 let projects = [SourceProject {
     label: "main".into(),
-    provider: &source,
+    workspace: &source,
 }];
 indexer::index_sources(&db, &settings, &projects, None)?;
 ```
 
-Implement `SourceProvider` for database rows, Git objects, object-store keys,
-archives, editor buffers, or generated code. Preserve the same document id
-across a logical move when the provider can do so reliably.
+Implement `SourceWorkspace` and `SourceSnapshot` for database rows, Git objects,
+object-store keys, archives, editor buffers, notebooks, or generated code.
+Preserve the same document id across a logical move when the provider can do so
+reliably.
 
-## 4. Retention and provenance
+### Checkpoints and bounded change feeds
+
+A workspace may expose a checkpoint on each snapshot and advertise
+`change_feed`. After a successful reconciliation, the SQLite backend persists the
+checkpoint for that project. On the next run, the indexer asks the workspace for
+a complete `SourceDelta` bounded by the stored checkpoint and the newly opened
+snapshot checkpoint.
+
+The indexer applies only the coalesced document upserts, moves, and removals in
+that delta. It advances the checkpoint only after every changed document is
+processed successfully. Unsupported or expired checkpoints trigger a full
+snapshot reconciliation; incomplete feeds must return an error rather than a
+partial delta.
+
+## 4. Retention, provenance, and durable recovery
 
 Representations carry provenance:
 
@@ -122,13 +139,20 @@ Representations carry provenance:
 
 Retention modes are provenance-aware:
 
-- `Full` retains all text.
+- `Full` retains all representation text.
 - `Report` may drop extracted embed-only text while retaining display and
   non-recoverable derived/imported text.
-- `Minimal` may drop all recoverable extracted text.
+- `Minimal` may drop all recoverable extracted representation text.
 
-For non-filesystem providers, pass a `SourceProviderCatalog` to explicit-space
-embedding when dropped text must be recovered.
+Whenever a document is read for indexing, the SQLite backend stores its complete
+source bytes in a deduplicated content-addressed cache keyed by the verified
+source hash. Delayed embedding first reconstructs missing representation text
+from that cache, so it does not depend on the original provider, working tree,
+transaction, object version, or snapshot still being available. Provider-backed
+recovery remains an exact-revision fallback when a cache entry is absent.
+
+Source blobs are integrity-checked on insertion and read, and blobs no longer
+referenced by indexed files are pruned with the rest of the index garbage.
 
 ## 5. Embed one explicit space
 
@@ -271,6 +295,6 @@ Supported keys are `project`, `language`, `kind`, `name`, `scope`, `path`, and
 
 ## Schema compatibility
 
-The schema is pre-release. Databases from an incompatible epoch are rejected
-with a delete-and-reindex message. This avoids accepting an old layout and
-failing later with unrelated SQL errors.
+The schema is pre-release. Schema epoch 3 adds persisted source checkpoints and
+the durable content-addressed source cache. Databases from incompatible epochs
+are rejected with a delete-and-reindex message rather than partially migrated.

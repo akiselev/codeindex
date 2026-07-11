@@ -5,12 +5,18 @@ mod scanner;
 pub mod source;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use codeindex_core::{
     EntityId, EntityVersionId, ExtractedEntity, Representation, RepresentationKind,
     RepresentationOrigin,
+};
+use codeindex_source::{
+    DocumentDescriptor, DocumentId, DocumentQuery, LanguageHint, RevisionGuarantee,
+    SnapshotRequest, SourceSnapshot, SourceWorkspace,
 };
 use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
 use codeindex_tree_sitter::normalizer::{normalize_for_hash, sha256_hex};
@@ -22,8 +28,12 @@ pub use embed::{
 };
 pub use scanner::{ScannedFile, scan_files};
 pub use source::{
-    FileSystemSource, MemorySource, SourceDocument, SourceProject, SourceProvider,
-    SourceProviderCatalog, SourceRevision,
+    ContentHash, DocumentIter, DocumentLocation, DocumentMetadata, DocumentVersion,
+    FileSystemSource, FilesystemWorkspace, FilesystemWorkspaceBuilder, MemorySource,
+    MemoryWorkspace, OverlayWorkspace, SnapshotConsistency, SnapshotId, SourceCapabilities,
+    SourceChange, SourceCheckpoint, SourceContent, SourceDelta, SourceDocument, SourceError,
+    SourceErrorKind, SourceKind, SourceProject, SourceProvider, SourceProviderCatalog,
+    SourceRevision, SourceRootId, WorkspaceDescriptor, WorkspaceId, validate_snapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +53,14 @@ impl RetentionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionVerification {
+    /// Trust equal provider revision tokens even when they are metadata hints.
+    Fast,
+    /// Read and hash documents whose provider cannot guarantee content identity.
+    Verified,
+}
+
 /// Filesystem convenience configuration retained for the common case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSpec {
@@ -51,13 +69,14 @@ pub struct ProjectSpec {
     pub exclude: Vec<String>,
 }
 
-/// Provider-independent indexing settings.
+/// Workspace-independent indexing settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSettings {
     pub enabled_languages: Vec<String>,
     pub body_node_count_threshold: usize,
     pub max_body_chars: usize,
     pub retention: RetentionMode,
+    pub revision_verification: RevisionVerification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +95,7 @@ impl IndexOptions {
             body_node_count_threshold: self.body_node_count_threshold,
             max_body_chars: self.max_body_chars,
             retention: self.retention,
+            revision_verification: RevisionVerification::Fast,
         }
     }
 }
@@ -86,7 +106,7 @@ impl IndexOptions {
 pub trait RepresentationEnricher: Send + Sync {
     fn enrich(
         &self,
-        document: &SourceDocument,
+        document: &DocumentDescriptor,
         source: &str,
         entity: &ExtractedEntity,
     ) -> Result<Vec<Representation>>;
@@ -103,13 +123,13 @@ pub struct ProjectStats {
     pub total_units: usize,
 }
 
-/// Index filesystem projects using the default provider implementation.
+/// Index filesystem projects using the default workspace implementation.
 pub fn index(
     db: &Db,
     options: &IndexOptions,
     only_label: Option<&str>,
 ) -> Result<Vec<ProjectStats>> {
-    let sources: Vec<(String, FileSystemSource)> = options
+    let workspaces: Vec<(String, FileSystemSource)> = options
         .projects
         .iter()
         .map(|project| {
@@ -120,17 +140,17 @@ pub fn index(
             )
         })
         .collect();
-    let projects: Vec<SourceProject<'_>> = sources
+    let projects: Vec<SourceProject<'_>> = workspaces
         .iter()
-        .map(|(label, provider)| SourceProject {
+        .map(|(label, workspace)| SourceProject {
             label: label.clone(),
-            provider,
+            workspace,
         })
         .collect();
     index_sources(db, &options.settings(), &projects, only_label)
 }
 
-/// Index arbitrary source providers with no representation enrichers.
+/// Index arbitrary source workspaces with no representation enrichers.
 pub fn index_sources(
     db: &Db,
     settings: &IndexSettings,
@@ -140,7 +160,7 @@ pub fn index_sources(
     index_sources_with_enrichers(db, settings, projects, only_label, &[])
 }
 
-/// Provider-neutral indexing entry point.
+/// Workspace-neutral indexing entry point.
 pub fn index_sources_with_enrichers(
     db: &Db,
     settings: &IndexSettings,
@@ -173,7 +193,13 @@ pub fn index_sources_with_enrichers(
     }
     db.prune_orphan_entities()?;
     db.prune_orphan_embeddings()?;
+    db.prune_orphan_source_blobs()?;
     Ok(stats)
+}
+
+enum RefreshPlan {
+    Full,
+    Delta(BTreeMap<DocumentId, bool>),
 }
 
 fn index_project(
@@ -183,120 +209,383 @@ fn index_project(
     generation: i64,
     enrichers: &[&dyn RepresentationEnricher],
 ) -> Result<ProjectStats> {
-    let project_id = db.upsert_project(&project.label, &project.provider.project_locator())?;
+    let workspace = project.workspace;
+    let descriptor = workspace.descriptor();
+    let project_id = db.upsert_project(&project.label, &descriptor.persisted_locator())?;
     let enabled: HashSet<String> = settings.enabled_languages.iter().cloned().collect();
-    let documents = project.provider.documents(&enabled)?;
-    source::validate_documents(&documents)?;
+    let snapshot = workspace
+        .open_snapshot(&SnapshotRequest::default())
+        .with_context(|| format!("failed to open source snapshot for {}", project.label))?;
+    let plan = refresh_plan(db, workspace, project_id, snapshot.as_ref())?;
     let extraction = ExtractOptions {
         body_node_count_threshold: settings.body_node_count_threshold,
         max_body_chars: settings.max_body_chars,
     };
     let registry = LanguageRegistry::global();
-
     let mut stats = ProjectStats {
         label: project.label.clone(),
         ..ProjectStats::default()
     };
-    let mut seen = HashSet::with_capacity(documents.len());
     let mut any_change = false;
+    let mut refresh_complete = true;
 
-    for document in &documents {
-        seen.insert(document.id.clone());
-        let existing = db.get_file_by_source_id(project_id, &document.id)?;
-        let mtime_ns = document.revision.modified_ns.unwrap_or_default();
-        let size = document.revision.size.unwrap_or_default() as i64;
-
-        if existing.as_ref().is_some_and(|record| {
-            record.source_revision == document.revision.opaque
-                && record.relative_path == document.relative_path
-                && record.language_id == document.language_id
-        }) {
-            stats.skipped += 1;
-            continue;
-        }
-
-        let source = match project.provider.read(document) {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!(
-                    "failed to read {} from project {}: {error}",
-                    document.relative_path, project.label
-                );
-                stats.failed += 1;
-                continue;
+    match plan {
+        RefreshPlan::Full => {
+            let mut document_ids = HashSet::new();
+            let mut seen = HashSet::new();
+            let mut paths = HashSet::new();
+            for document in snapshot.documents(&DocumentQuery::all())? {
+                let document = match document {
+                    Ok(document) => document,
+                    Err(error) => {
+                        eprintln!(
+                            "failed to enumerate source in project {}: {error}",
+                            project.label
+                        );
+                        stats.failed += 1;
+                        refresh_complete = false;
+                        continue;
+                    }
+                };
+                if !document_ids.insert(document.id.clone()) {
+                    anyhow::bail!(
+                        "source workspace {} returned duplicate document id {}",
+                        descriptor.id,
+                        document.id
+                    );
+                }
+                if !paths.insert(document.location.logical_path.clone()) {
+                    anyhow::bail!(
+                        "source workspace {} returned duplicate logical path {:?}",
+                        descriptor.id,
+                        document.location.logical_path
+                    );
+                }
+                seen.insert(document.id.to_string());
+                match index_document(
+                    db,
+                    settings,
+                    project,
+                    project_id,
+                    generation,
+                    enrichers,
+                    snapshot.as_ref(),
+                    &enabled,
+                    registry,
+                    &extraction,
+                    &document,
+                ) {
+                    Ok(outcome) => record_outcome(&mut stats, &mut any_change, outcome),
+                    Err(error) => {
+                        eprintln!(
+                            "failed to index {} in project {}: {error}",
+                            document.location.logical_path, project.label
+                        );
+                        stats.failed += 1;
+                    }
+                }
             }
-        };
-        let source_hash = sha256_hex(&source);
-        if let Some(record) = &existing
-            && record.source_hash == source_hash
-            && record.relative_path == document.relative_path
-            && record.language_id == document.language_id
-        {
-            db.update_file_meta(record.id, &document.revision.opaque, mtime_ns, size)?;
-            stats.skipped += 1;
-            continue;
-        }
-
-        let def = registry
-            .get(&document.language_id)
-            .with_context(|| format!("unknown language {}", document.language_id))?;
-        let mut entities = match extract_units(def, &source, &extraction) {
-            Ok(entities) => entities,
-            Err(error) => {
-                eprintln!("failed to parse {}: {error}", document.relative_path);
-                stats.failed += 1;
-                continue;
+            if refresh_complete {
+                for record in db.list_files(project_id)? {
+                    if !seen.contains(&record.source_document_id) {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                }
             }
-        };
-        for entity in &mut entities {
-            complete_representations(&source, entity);
-            apply_enrichers(document, &source, entity, enrichers)?;
         }
-        let references = extract_references(def, &source).unwrap_or_else(|error| {
-            eprintln!(
-                "failed to extract references from {}: {error}",
-                document.relative_path
-            );
-            Vec::new()
-        });
-
-        let prior = match &existing {
-            Some(record) => db.list_units_for_file(record.id)?,
-            None => Vec::new(),
-        };
-        let mut units = assign_identity(&project.label, &document.id, &prior, entities, generation);
-        apply_retention(&mut units, settings.retention);
-
-        let file_id = db.upsert_file(&NewFile {
-            project_id,
-            source_document_id: document.id.clone(),
-            source_revision: document.revision.opaque.clone(),
-            relative_path: document.relative_path.clone(),
-            language_id: document.language_id.clone(),
-            mtime_ns,
-            size,
-            source_hash,
-        })?;
-        let unit_ids = db.insert_units(file_id, &units)?;
-        stage_references(db, &units, &unit_ids, &references)?;
-        stats.indexed += 1;
-        stats.units += units.len();
-        any_change = true;
-    }
-
-    for record in db.list_files(project_id)? {
-        if !seen.contains(&record.source_document_id) {
-            db.delete_file(record.id)?;
-            stats.removed += 1;
-            any_change = true;
+        RefreshPlan::Delta(changes) => {
+            for (document_id, upsert) in changes {
+                if !upsert {
+                    if let Some(record) =
+                        db.get_file_by_source_id(project_id, document_id.as_str())?
+                    {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                    continue;
+                }
+                let Some(document) = snapshot.document(&document_id)? else {
+                    if let Some(record) =
+                        db.get_file_by_source_id(project_id, document_id.as_str())?
+                    {
+                        db.delete_file(record.id)?;
+                        stats.removed += 1;
+                        any_change = true;
+                    }
+                    continue;
+                };
+                match index_document(
+                    db,
+                    settings,
+                    project,
+                    project_id,
+                    generation,
+                    enrichers,
+                    snapshot.as_ref(),
+                    &enabled,
+                    registry,
+                    &extraction,
+                    &document,
+                ) {
+                    Ok(outcome) => record_outcome(&mut stats, &mut any_change, outcome),
+                    Err(error) => {
+                        eprintln!(
+                            "failed to index {} in project {}: {error}",
+                            document.location.logical_path, project.label
+                        );
+                        stats.failed += 1;
+                    }
+                }
+            }
         }
     }
 
     if any_change {
         resolve_usage(db, project_id, settings.retention)?;
     }
+    if refresh_complete && stats.failed == 0 {
+        if let Some(checkpoint) = snapshot.checkpoint() {
+            db.set_source_checkpoint(
+                project_id,
+                checkpoint.workspace.as_str(),
+                checkpoint.token.as_ref(),
+            )?;
+        } else {
+            db.clear_source_checkpoint(project_id)?;
+        }
+    }
     stats.total_units = db.count_units_for_project(project_id)? as usize;
     Ok(stats)
+}
+
+fn refresh_plan(
+    db: &Db,
+    workspace: &dyn SourceWorkspace,
+    project_id: ProjectId,
+    snapshot: &dyn SourceSnapshot,
+) -> Result<RefreshPlan> {
+    if !workspace.capabilities().change_feed {
+        return Ok(RefreshPlan::Full);
+    }
+    let Some(to) = snapshot.checkpoint() else {
+        return Ok(RefreshPlan::Full);
+    };
+    let Some((workspace_id, token)) = db.get_source_checkpoint(project_id)? else {
+        return Ok(RefreshPlan::Full);
+    };
+    if workspace_id != to.workspace.as_str() {
+        return Ok(RefreshPlan::Full);
+    }
+    let from = SourceCheckpoint {
+        workspace: to.workspace.clone(),
+        token: Arc::from(token),
+    };
+    let query = DocumentQuery::all();
+    let delta = match workspace.changes_between(&from, to, &query) {
+        Ok(Some(delta)) => delta,
+        Ok(None) => return Ok(RefreshPlan::Full),
+        Err(error)
+            if matches!(
+                error.kind(),
+                SourceErrorKind::CheckpointExpired | SourceErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(RefreshPlan::Full);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        delta.from == from && delta.to == *to,
+        "source workspace returned a change range different from the requested checkpoints"
+    );
+    let mut changes = BTreeMap::new();
+    for change in delta.changes {
+        match change? {
+            SourceChange::Upsert(document) => {
+                changes.insert(document.id, true);
+            }
+            SourceChange::Remove(id) => {
+                changes.insert(id, false);
+            }
+            SourceChange::Move { id, .. } => {
+                changes.insert(id, true);
+            }
+        }
+    }
+    Ok(RefreshPlan::Delta(changes))
+}
+
+#[derive(Clone, Copy)]
+enum DocumentOutcome {
+    Skipped,
+    Indexed(usize),
+    Removed,
+}
+
+fn record_outcome(stats: &mut ProjectStats, any_change: &mut bool, outcome: DocumentOutcome) {
+    match outcome {
+        DocumentOutcome::Skipped => stats.skipped += 1,
+        DocumentOutcome::Indexed(units) => {
+            stats.indexed += 1;
+            stats.units += units;
+            *any_change = true;
+        }
+        DocumentOutcome::Removed => {
+            stats.removed += 1;
+            *any_change = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_document(
+    db: &Db,
+    settings: &IndexSettings,
+    project: &SourceProject<'_>,
+    project_id: ProjectId,
+    generation: i64,
+    enrichers: &[&dyn RepresentationEnricher],
+    snapshot: &dyn SourceSnapshot,
+    enabled: &HashSet<String>,
+    registry: &'static LanguageRegistry,
+    extraction: &ExtractOptions,
+    document: &DocumentDescriptor,
+) -> Result<DocumentOutcome> {
+    let source_document_id = document.id.to_string();
+    let relative_path = document.location.logical_path.clone();
+    let existing = db.get_file_by_source_id(project_id, &source_document_id)?;
+    let Some(language_id) = resolve_language(document, enabled, registry) else {
+        if let Some(record) = existing {
+            db.delete_file(record.id)?;
+            return Ok(DocumentOutcome::Removed);
+        }
+        return Ok(DocumentOutcome::Skipped);
+    };
+    let mtime_ns = modified_ns(document.version.modified_at);
+    let size = document.version.size.unwrap_or_default() as i64;
+    let metadata_unchanged = existing.as_ref().is_some_and(|record| {
+        record.source_revision == document.version.token.as_str()
+            && record.relative_path == relative_path
+            && record.language_id == language_id
+    });
+    let revision_is_trusted = document.version.guarantee == RevisionGuarantee::ContentIdentity
+        || settings.revision_verification == RevisionVerification::Fast;
+    if metadata_unchanged && revision_is_trusted {
+        return Ok(DocumentOutcome::Skipped);
+    }
+
+    let content = snapshot.read(document)?;
+    let source = content.utf8()?;
+    let source_hash = sha256_hex(source);
+    db.put_source_blob(
+        &source_hash,
+        source.as_bytes(),
+        content.encoding_hint.as_deref(),
+    )?;
+    if let Some(record) = &existing
+        && record.source_hash == source_hash
+        && record.relative_path == relative_path
+        && record.language_id == language_id
+    {
+        db.update_file_meta(
+            record.id,
+            document.version.token.as_str(),
+            mtime_ns,
+            content.observed_version.size.unwrap_or_default() as i64,
+        )?;
+        return Ok(DocumentOutcome::Skipped);
+    }
+
+    let def = registry
+        .get(&language_id)
+        .with_context(|| format!("unknown language {language_id}"))?;
+    let mut entities = extract_units(def, source, extraction)
+        .with_context(|| format!("failed to parse {relative_path}"))?;
+    for entity in &mut entities {
+        complete_representations(source, entity);
+        apply_enrichers(document, source, entity, enrichers)?;
+    }
+    let references = extract_references(def, source).unwrap_or_else(|error| {
+        eprintln!("failed to extract references from {relative_path}: {error}");
+        Vec::new()
+    });
+    let prior = match &existing {
+        Some(record) => db.list_units_for_file(record.id)?,
+        None => Vec::new(),
+    };
+    let mut units = assign_identity(
+        &project.label,
+        &source_document_id,
+        &prior,
+        entities,
+        generation,
+    );
+    apply_retention(&mut units, settings.retention);
+    let file_id = db.upsert_file(&NewFile {
+        project_id,
+        source_document_id,
+        source_revision: document.version.token.to_string(),
+        relative_path,
+        language_id,
+        mtime_ns,
+        size: content.observed_version.size.unwrap_or(size.max(0) as u64) as i64,
+        source_hash,
+    })?;
+    let unit_ids = db.insert_units(file_id, &units)?;
+    stage_references(db, &units, &unit_ids, &references)?;
+    Ok(DocumentOutcome::Indexed(units.len()))
+}
+
+fn resolve_language(
+    document: &DocumentDescriptor,
+    enabled: &HashSet<String>,
+    registry: &'static LanguageRegistry,
+) -> Option<String> {
+    let hinted = match &document.language_hint {
+        LanguageHint::Known(language) => Some(language.clone()),
+        LanguageHint::FileExtension(extension) => registry
+            .by_extension(&extension.to_ascii_lowercase())
+            .map(|definition| definition.spec.id.clone()),
+        LanguageHint::MediaType(media_type) => media_type
+            .rsplit_once('/')
+            .and_then(|(_, subtype)| registry.by_extension(subtype.trim_start_matches("x-")))
+            .map(|definition| definition.spec.id.clone()),
+        LanguageHint::Shebang(shebang) => language_from_shebang(shebang, registry),
+        LanguageHint::Unknown => None,
+    }
+    .or_else(|| {
+        Path::new(&document.location.logical_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| registry.by_extension(&extension.to_ascii_lowercase()))
+            .map(|definition| definition.spec.id.clone())
+    })?;
+    enabled.contains(&hinted).then_some(hinted)
+}
+
+fn language_from_shebang(shebang: &str, registry: &'static LanguageRegistry) -> Option<String> {
+    let extension = if shebang.contains("python") {
+        "py"
+    } else if shebang.contains("node") || shebang.contains("deno") {
+        "js"
+    } else if shebang.contains("ruby") {
+        "rb"
+    } else {
+        return None;
+    };
+    registry
+        .by_extension(extension)
+        .map(|definition| definition.spec.id.clone())
+}
+
+fn modified_ns(modified_at: Option<SystemTime>) -> i64 {
+    modified_at
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
 }
 
 fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
@@ -307,8 +596,6 @@ fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
             &mut entity.representations,
             Representation::new(RepresentationKind::Body, body, body_hash.clone()),
         );
-        // Logical rename matching must ignore the declaration name. A body hash
-        // is the strongest deterministic frontend signal currently available.
         entity.normalized_body_hash = body_hash;
     }
 
@@ -344,7 +631,7 @@ fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
 }
 
 fn apply_enrichers(
-    document: &SourceDocument,
+    document: &DocumentDescriptor,
     source: &str,
     entity: &mut ExtractedEntity,
     enrichers: &[&dyn RepresentationEnricher],
@@ -471,9 +758,6 @@ fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
                     }
                 }
                 RetentionMode::Minimal => {
-                    // Derived/imported channels cannot be re-created from one
-                    // source document, so retain them. Extracted channels are
-                    // recoverable through the provider catalog.
                     if extracted {
                         representation.content = None;
                     }
@@ -605,12 +889,13 @@ mod tests {
             body_node_count_threshold: 1,
             max_body_chars: 10_000,
             retention: RetentionMode::Full,
+            revision_verification: RevisionVerification::Verified,
         }
     }
 
     #[test]
-    fn indexes_memory_source_without_filesystem_assumptions() {
-        let mut source = MemorySource::new("memory://workspace");
+    fn indexes_memory_workspace_without_filesystem_assumptions() {
+        let source = MemorySource::new("memory://workspace");
         source.insert(
             "src/lib.rs",
             "fn add(a: i32, b: i32) -> i32 { let value = a + b; value }",
@@ -618,7 +903,7 @@ mod tests {
         let db = codeindex_sqlite::open_in_memory().unwrap();
         let projects = [SourceProject {
             label: "main".into(),
-            provider: &source,
+            workspace: &source,
         }];
         let stats = index_sources(&db, &settings(), &projects, None).unwrap();
         assert_eq!(stats[0].indexed, 1);
@@ -633,7 +918,7 @@ mod tests {
 
     #[test]
     fn rename_preserves_entity_identity_through_body_channel() {
-        let mut source = MemorySource::new("memory://rename");
+        let source = MemorySource::new("memory://rename");
         source.insert(
             "lib.rs",
             "fn alpha(a: i32, b: i32) -> i32 { let sum = a + b; sum * 2 }",
@@ -641,7 +926,7 @@ mod tests {
         let db = codeindex_sqlite::open_in_memory().unwrap();
         let projects = [SourceProject {
             label: "main".into(),
-            provider: &source,
+            workspace: &source,
         }];
         index_sources(&db, &settings(), &projects, None).unwrap();
         let project_id = db.get_project("main").unwrap().unwrap().id;
@@ -653,10 +938,6 @@ mod tests {
             "lib.rs",
             "fn beta(a: i32, b: i32) -> i32 { let sum = a + b; sum * 2 }",
         );
-        let projects = [SourceProject {
-            label: "main".into(),
-            provider: &source,
-        }];
         index_sources(&db, &settings(), &projects, None).unwrap();
         let after = db.list_units_for_project(project_id).unwrap()[0]
             .entity_id
@@ -665,8 +946,70 @@ mod tests {
     }
 
     #[test]
+    fn memory_change_feed_only_reconciles_changed_documents() {
+        let source = MemorySource::new("memory://changes");
+        let alpha = source.insert("alpha.rs", "fn alpha() -> i32 { 1 }");
+        let beta = source.insert("beta.rs", "fn beta() -> i32 { 2 }");
+        source.insert("stable.rs", "fn stable() -> i32 { 3 }");
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            workspace: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+
+        source.insert_with_id(
+            alpha,
+            "alpha.rs",
+            "fn alpha() -> i32 { 10 }",
+            LanguageHint::Unknown,
+        );
+        source.remove(&beta);
+        source.insert("gamma.rs", "fn gamma() -> i32 { 4 }");
+        let stats = index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(stats[0].indexed, 2);
+        assert_eq!(stats[0].removed, 1);
+        assert_eq!(stats[0].skipped, 0);
+        assert_eq!(stats[0].total_units, 3);
+    }
+
+    #[test]
+    fn minimal_retention_recovers_from_durable_source_cache() {
+        use codeindex_embedding::config::{
+            EmbeddingConfig, EmbeddingRunConfig, SourceRecoveryConfig,
+        };
+        use codeindex_embedding::embed::hash::HashEmbedder;
+
+        let source = MemorySource::new("memory://cache");
+        let id = source.insert(
+            "lib.rs",
+            "fn cached(input: &str) -> usize { let value = input.len(); value }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let mut cache_settings = settings();
+        cache_settings.retention = RetentionMode::Minimal;
+        let projects = [SourceProject {
+            label: "main".into(),
+            workspace: &source,
+        }];
+        index_sources(&db, &cache_settings, &projects, None).unwrap();
+        source.remove(&id);
+
+        let config = EmbeddingRunConfig {
+            embedding: EmbeddingConfig::default(),
+            source_recovery: SourceRecoveryConfig {
+                body_node_count_threshold: 1,
+            },
+        };
+        let mut embedder = HashEmbedder::new(32);
+        let stats = embed_pending(&db, &mut embedder, &config).unwrap();
+        assert!(stats.embedded > 0);
+        assert_eq!(stats.unresolved, 0);
+    }
+
+    #[test]
     fn body_and_name_erased_channels_are_materialized() {
-        let mut source = MemorySource::new("memory://representations");
+        let source = MemorySource::new("memory://representations");
         source.insert(
             "lib.rs",
             "fn parse_flags(input: &str) -> usize { input.len() }",
@@ -674,7 +1017,7 @@ mod tests {
         let db = codeindex_sqlite::open_in_memory().unwrap();
         let projects = [SourceProject {
             label: "main".into(),
-            provider: &source,
+            workspace: &source,
         }];
         index_sources(&db, &settings(), &projects, None).unwrap();
         let snapshot = db.snapshot(&[]).unwrap();

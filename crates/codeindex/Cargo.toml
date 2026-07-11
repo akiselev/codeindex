@@ -16,6 +16,8 @@ codeindex-embedding = { path = "../embedding", default-features = false }
 codeindex-indexer = { path = "../indexer" }
 codeindex-query = { path = "../query" }
 codeindex-search = { path = "../search" }
+codeindex-source = { path = "../source" }
+codeindex-source-fs = { path = "../source-fs" }
 codeindex-sqlite = { path = "../sqlite" }
 codeindex-storage = { path = "../storage" }
 codeindex-tree-sitter = { path = "../tree-sitter" }

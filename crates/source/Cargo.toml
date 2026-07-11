@@ -1,0 +1,13 @@
+[package]
+name = "codeindex-source"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Source workspace and snapshot abstractions for codeindex"
+publish = false
+
+[dependencies]
