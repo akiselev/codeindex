@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use codeindex_source::{
     DocumentDescriptor, DocumentId, DocumentIter, DocumentLocation, DocumentMetadata,
@@ -150,8 +150,8 @@ impl SourceSnapshot for FilesystemSnapshot {
         Ok(Box::new(
             self.documents
                 .values()
+                .filter(move |&document| query.matches(document))
                 .cloned()
-                .filter(move |document| query.matches(document))
                 .map(Ok),
         ))
     }

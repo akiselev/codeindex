@@ -76,19 +76,14 @@ pub enum SnapshotConsistency {
     Immutable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum LanguageHint {
     Known(String),
     FileExtension(String),
     MediaType(String),
     Shebang(String),
+    #[default]
     Unknown,
-}
-
-impl Default for LanguageHint {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -158,15 +153,9 @@ pub struct SourceCheckpoint {
     pub token: Arc<[u8]>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SnapshotRequest {
     pub checkpoint: Option<SourceCheckpoint>,
-}
-
-impl Default for SnapshotRequest {
-    fn default() -> Self {
-        Self { checkpoint: None }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
