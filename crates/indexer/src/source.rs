@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codeindex_source::{
-    DocumentId, RevisionToken, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,
+    DocumentId, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,
 };
 
 pub use codeindex_source::{
@@ -63,7 +63,8 @@ impl<'a> SourceProviderCatalog<'a> {
         &self,
         project_label: &str,
         document_id: &str,
-        revision: &str,
+        _relative_path: &str,
+        _language_id: &str,
     ) -> Result<Option<String>> {
         let Some(entry) = self.providers.get(project_label) else {
             return Ok(None);
@@ -74,10 +75,11 @@ impl<'a> SourceProviderCatalog<'a> {
             }
             CatalogEntry::Snapshot(snapshot) => snapshot.clone(),
         };
-        let content = match snapshot.read_by_id(
-            &DocumentId::new(document_id),
-            &RevisionToken::new(revision),
-        ) {
+        let id = DocumentId::new(document_id);
+        let Some(document) = snapshot.document(&id)? else {
+            return Ok(None);
+        };
+        let content = match snapshot.read(&document) {
             Ok(content) => content,
             Err(error)
                 if matches!(
