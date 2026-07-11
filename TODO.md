@@ -13,8 +13,14 @@ implementation logic or depending on application-specific modules.
 - [x] Add `Body`, name-erased body, signature, documentation, symbol, Usage, and
       custom/generated representation paths.
 - [x] Persist representation provenance.
-- [x] Add provider-neutral indexing with filesystem and memory implementations.
-- [x] Separate stable source document identity from logical path and revision.
+- [x] Add dependency-light source workspace and immutable snapshot contracts.
+- [x] Separate stable workspace/document/root identity from logical paths and
+      physical locators.
+- [x] Add streamed enumeration, direct/batched reads, structured errors,
+      capability declarations, checkpoints, revision guarantees, and consistency
+      levels.
+- [x] Add filesystem, memory, and editor-overlay workspace implementations.
+- [x] Move language resolution out of source providers and into the indexer.
 - [x] Add named embedding spaces with different models/dimensions in one corpus.
 - [x] Add explicit-space search and reciprocal-rank fusion.
 - [x] Filter storage-neutral snapshots to selected-project vectors and validate
@@ -25,24 +31,29 @@ implementation logic or depending on application-specific modules.
 
 ## P0 — release blockers
 
-- [ ] **Publish scope.** Decide which of the facade and eight component crates are
+- [ ] **Publish scope.** Decide which of the facade and component crates are
       public, reserve names, and remove `publish = false` where appropriate.
-- [ ] **Compiled examples.** Convert source-provider, explicit-space, fusion, and
+- [ ] **Compiled examples.** Convert source-workspace, explicit-space, fusion, and
       ordinary filesystem quickstarts into `examples/` compiled by CI.
 - [ ] **Public API audit.** Review ownership, error types, naming, and future
-      extensibility of `SourceProvider`, `IndexSnapshot`, representation
-      enrichment, and embedding-space APIs before external adoption.
-- [ ] **Downstream migration.** Update `decombine` to the explicit space APIs and
-      typed entity ids, then use it as the first compatibility proof.
+      extensibility of `SourceWorkspace`, `SourceSnapshot`, `IndexSnapshot`,
+      representation enrichment, and embedding-space APIs before external
+      adoption.
+- [ ] **Downstream migration.** Update `decombine` to the workspace and explicit
+      space APIs and typed entity ids, then use it as the first compatibility
+      proof.
 
 ## P1 — documentation and quality
 
 - [ ] **Rustdoc coverage.** Document every public item and enable
       `#![deny(missing_docs)]` crate by crate.
-- [ ] **Getting-started rewrite.** Replace the pre-space workflow and document
+- [ ] **Getting-started rewrite.** Compile the workspace quickstart and document
       delete/reindex behavior for schema epoch 2.
 - [ ] **CHANGELOG and compatibility policy.** State schema, snapshot, and public
       Rust API guarantees for 0.x releases.
+- [ ] **Source conformance expansion.** Turn `validate_snapshot` into a reusable
+      test harness covering stale revisions, change feeds, batch alignment,
+      redacted locators, overlays, and provider capability claims.
 - [ ] **Real backend smoke test.** Add a scheduled or manually triggered test that
       downloads a small model and executes inference, rather than compile-only
       checking fastembed.
@@ -53,11 +64,16 @@ implementation logic or depending on application-specific modules.
       parser-neutral relation model carrying provenance and resolution quality.
 - [ ] **Language reference coverage.** Populate and test `references.scm` for
       bundled languages beyond Rust.
-- [ ] **Cross-document entity moves.** Preserve logical identity across provider
+- [ ] **Cross-document entity moves.** Preserve logical identity across workspace
       document moves only when matching is unique and evidence is explicit.
-- [ ] **Source-provider ergonomics.** Add maintained Git-tree and editor-overlay
-      providers; optimize provider catalogs so source recovery does not need full
-      enumeration on every lookup.
+- [ ] **Maintained remote providers.** Add Git-tree and editor protocol adapters,
+      then evaluate an `object_store`-backed implementation with conditional and
+      versioned reads.
+- [ ] **Incremental source refresh.** Consume complete provider change feeds and
+      checkpoints, falling back to full enumeration after overflow or expiry.
+- [ ] **Exact delayed recovery.** Persist enough snapshot/revision provenance or a
+      content-addressed source cache to guarantee reconstruction under report and
+      minimal retention.
 - [ ] **Write-side store seam.** Introduce one only when a second persistence
       backend needs to reuse incremental indexing and embedding projection.
 - [ ] **Streaming search.** Add a streaming snapshot/index interface when measured
