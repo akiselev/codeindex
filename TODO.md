@@ -21,11 +21,16 @@ implementation logic or depending on application-specific modules.
       levels.
 - [x] Add filesystem, memory, and editor-overlay workspace implementations.
 - [x] Move language resolution out of source providers and into the indexer.
+- [x] Persist workspace checkpoints and consume complete bounded change feeds,
+      with full-reconciliation fallback after unsupported or expired checkpoints.
+- [x] Persist deduplicated source blobs by content hash and use them for exact
+      delayed representation recovery when the original snapshot is unavailable.
 - [x] Add named embedding spaces with different models/dimensions in one corpus.
 - [x] Add explicit-space search and reciprocal-rank fusion.
 - [x] Filter storage-neutral snapshots to selected-project vectors and validate
       snapshots on load.
-- [x] Reject the incompatible previous pre-release schema epoch.
+- [x] Reject incompatible previous pre-release schema epochs; epoch 3 includes
+      source checkpoints and the durable source cache.
 - [x] CI: rustfmt, Clippy with warnings denied, workspace tests, and fastembed
       feature compile check.
 
@@ -48,7 +53,7 @@ implementation logic or depending on application-specific modules.
 - [ ] **Rustdoc coverage.** Document every public item and enable
       `#![deny(missing_docs)]` crate by crate.
 - [ ] **Getting-started rewrite.** Compile the workspace quickstart and document
-      delete/reindex behavior for schema epoch 2.
+      delete/reindex behavior for schema epoch 3.
 - [ ] **CHANGELOG and compatibility policy.** State schema, snapshot, and public
       Rust API guarantees for 0.x releases.
 - [ ] **Source conformance expansion.** Turn `validate_snapshot` into a reusable
@@ -69,9 +74,6 @@ implementation logic or depending on application-specific modules.
 - [ ] **Maintained remote providers.** Add Git-tree and editor protocol adapters,
       then evaluate an `object_store`-backed implementation with conditional and
       versioned reads.
-- [ ] **Source-provider ergonomics.** Add a maintained Git-tree provider. Editor
-       overlays, direct source lookup, bounded checkpoint feeds, and durable
-       content-addressed recovery are implemented.
 - [ ] **Write-side store seam.** Introduce one only when a second persistence
       backend needs to reuse incremental indexing and embedding projection.
 - [ ] **Streaming search.** Add a streaming snapshot/index interface when measured
