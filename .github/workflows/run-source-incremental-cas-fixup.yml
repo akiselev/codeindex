@@ -1,0 +1,48 @@
+name: Run source incremental and CAS fixup
+
+on:
+  push:
+    branches:
+      - agent/source-workspace-abstraction
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/source-workspace-abstraction
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Extract and run implementation patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('.github/workflows/source-incremental-cas-fixup.yml').read_text()
+          start_marker = "          cat > /tmp/patch.py <<'PY'\n"
+          end_marker = "\n          PY\n"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          Path('/tmp/patch.py').write_text(textwrap.dedent(workflow[start:end]))
+          PY
+          python /tmp/patch.py
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo check -p codeindex --features fastembed
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock README.md TODO.md crates
+          git commit -m "consume source deltas and cache source content"
+          git push origin HEAD:agent/source-workspace-abstraction
