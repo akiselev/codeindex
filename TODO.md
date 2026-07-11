@@ -70,8 +70,8 @@ implementation logic or depending on application-specific modules.
       then evaluate an `object_store`-backed implementation with conditional and
       versioned reads.
 - [ ] **Source-provider ergonomics.** Add maintained Git-tree and editor-overlay
-      providers; optimize provider catalogs so source recovery does not need full
-      enumeration on every lookup.
+       providers; optimize provider catalogs so source recovery does not need full
+       enumeration on every lookup.
 - [ ] **Write-side store seam.** Introduce one only when a second persistence
       backend needs to reuse incremental indexing and embedding projection.
 - [ ] **Streaming search.** Add a streaming snapshot/index interface when measured
