@@ -3,7 +3,7 @@
 This guide covers the current library pipeline:
 
 ```text
-source workspace → immutable snapshot → entities/representations → embedding spaces → index snapshot → search
+source workspace → entities/representations → embedding spaces → snapshot → search
 ```
 
 Examples use the facade crate. Enable `fastembed` for local ONNX inference.
@@ -44,9 +44,8 @@ This compiles neither SQLite nor bundled language grammars.
 
 ## 2. Index ordinary filesystem projects
 
-The common filesystem API remains `indexer::index`. It builds a
-`FilesystemWorkspace`, opens one validated snapshot per indexing run, and then
-delegates to the same pipeline used by custom sources.
+The common filesystem API remains `indexer::index`. It delegates to the same
+workspace-neutral pipeline used by custom sources.
 
 ```rust
 use codeindex::{indexer, sqlite, tree_sitter};
@@ -74,15 +73,14 @@ for project in stats {
 }
 ```
 
-The filesystem convenience API uses `RevisionVerification::Fast`, preserving
-cheap metadata-based incremental scans. Build `IndexSettings` directly when
-weak revisions must be read and hashed before they are trusted.
+The indexer extracts multiple representations for each entity, including body,
+signature, symbol, documentation, and—where reference extraction is available—
+usage call sites.
 
 ## 3. Index a custom source workspace
 
-A workspace does not emulate a filesystem. It opens a snapshot containing stable
-document identities, logical paths, revision metadata, language hints, and
-revision-checked content reads.
+A workspace does not need to emulate a filesystem. It opens coherent snapshots
+with stable document identities, logical paths, revisions, and byte content.
 
 ```rust
 use codeindex::{indexer, sqlite};
@@ -112,35 +110,26 @@ let projects = [SourceProject {
 indexer::index_sources(&db, &settings, &projects, None)?;
 ```
 
-Implement `codeindex::source::SourceWorkspace` and
-`codeindex::source::SourceSnapshot` for database transactions, Git commits,
-object-store versions, archives, notebooks, editor buffers, or generated code.
-Preserve the same `DocumentId` across a logical move when the provider can do so
+Implement `SourceWorkspace` and `SourceSnapshot` for database rows, Git objects,
+object-store keys, archives, editor buffers, notebooks, or generated code.
+Preserve the same document id across a logical move when the provider can do so
 reliably.
 
-A `SourceSnapshot` exposes streamed enumeration and direct reads. Providers may
-override batch reads, direct lookup, checkpoints, and change feeds. The indexer
-resolves final languages from `LanguageHint`, so providers can supply a known
-language, extension, media type, shebang, or no hint.
+### Checkpoints and bounded change feeds
 
-## 4. Snapshot consistency and revisions
+A workspace may expose a checkpoint on each snapshot and advertise
+`change_feed`. After a successful reconciliation, the SQLite backend persists the
+checkpoint for that project. On the next run, the indexer asks the workspace for
+a complete `SourceDelta` bounded by the stored checkpoint and the newly opened
+snapshot checkpoint.
 
-`SnapshotConsistency` describes the guarantees a provider offers:
+The indexer applies only the coalesced document upserts, moves, and removals in
+that delta. It advances the checkpoint only after every changed document is
+processed successfully. Unsupported or expired checkpoints trigger a full
+snapshot reconciliation; incomplete feeds must return an error rather than a
+partial delta.
 
-- `Immutable`: Git commits, immutable archives, or pinned object versions;
-- `Transactional`: a repeatable-read database transaction or provider snapshot;
-- `Validated`: a live source whose reads are checked against enumerated revisions;
-- `BestEffort`: a live view that can report stale reads.
-
-`RevisionGuarantee::ContentIdentity` means equal tokens guarantee equal bytes.
-`RevisionGuarantee::MetadataHint` means the token is only a cheap change hint.
-`RevisionVerification::Verified` hashes weak revisions, while `Fast` trusts them.
-
-`OverlayWorkspace` composes a higher-priority workspace over a base workspace.
-The primary intended use is unsaved editor buffers over a filesystem or Git
-snapshot.
-
-## 5. Retention and source recovery
+## 4. Retention, provenance, and durable recovery
 
 Representations carry provenance:
 
@@ -150,17 +139,22 @@ Representations carry provenance:
 
 Retention modes are provenance-aware:
 
-- `Full` retains all text.
+- `Full` retains all representation text.
 - `Report` may drop extracted embed-only text while retaining display and
   non-recoverable derived/imported text.
-- `Minimal` may drop all recoverable extracted text.
+- `Minimal` may drop all recoverable extracted representation text.
 
-For non-filesystem workspaces, pass a `SourceProviderCatalog` to explicit-space
-embedding when dropped text must be recovered. Registering the exact snapshot
-with `insert_snapshot` prevents recovery from drifting to a newer live workspace
-while that snapshot remains available.
+Whenever a document is read for indexing, the SQLite backend stores its complete
+source bytes in a deduplicated content-addressed cache keyed by the verified
+source hash. Delayed embedding first reconstructs missing representation text
+from that cache, so it does not depend on the original provider, working tree,
+transaction, object version, or snapshot still being available. Provider-backed
+recovery remains an exact-revision fallback when a cache entry is absent.
 
-## 6. Embed one explicit space
+Source blobs are integrity-checked on insertion and read, and blobs no longer
+referenced by indexed files are pruned with the rest of the index garbage.
+
+## 5. Embed one explicit space
 
 An embedding space binds a channel to an exact model identity. Spaces are
 independent: a code model can embed implementations while a text model embeds
@@ -201,21 +195,38 @@ println!("embedded {} representations", stats.embedded);
 ```
 
 Reusing the id `docs` with a different channel, model identity, or input
-transform is rejected. `embed_pending` is a convenience operation that creates
-one `default/<channel>` space per present channel.
+transform is rejected.
 
-## 7. Load and search a storage-neutral index
+`embed_pending` is a convenience operation that uses one embedder for every
+present channel, creating spaces named `default/<channel>`.
+
+## 6. Load a storage-neutral search index
 
 SQLite exports the public `IndexSnapshot`; another backend can construct the
 same type directly.
 
 ```rust
-use codeindex::core::EmbeddingSpaceId;
-use codeindex::query::WhereFilter;
 use codeindex::search::SearchIndex;
 
-let snapshot = db.snapshot(&[])?;
+let snapshot = db.snapshot(&[])?; // empty project list = all projects
 let index = SearchIndex::from_snapshot(snapshot)?;
+
+for space in index.embedded_spaces() {
+    println!("{}: {} via {}", space.id, space.channel, space.model.model);
+}
+```
+
+Snapshot loading validates dimensions, duplicate ids/hashes, and finite vector
+values rather than trusting external stores.
+
+## 7. Search an explicit space
+
+The query embedder must exactly match the selected space's model identity.
+
+```rust
+use codeindex::core::EmbeddingSpaceId;
+use codeindex::query::WhereFilter;
+
 let results = index.search_text(
     embedder.as_mut(),
     "parse command line flags",
@@ -230,14 +241,40 @@ for hit in results.hits {
 }
 ```
 
-Snapshot loading validates dimensions, duplicate ids and hashes, and finite
-vector values rather than trusting external stores.
+Use `similar_to_unit` for query-by-example retrieval in one space.
 
 ## 8. Fuse multiple spaces
 
 Do not add cosine scores from different models. Embed each query with the
 corresponding model, normalize according to that space, then fuse ranked lists
-with weighted reciprocal rank through `SearchIndex::search_vectors_fused`.
+with weighted reciprocal rank:
+
+```rust
+use codeindex::core::EmbeddingSpaceId;
+use codeindex::query::WhereFilter;
+use codeindex::search::SpaceVectorQuery;
+
+let code_id = EmbeddingSpaceId::new("code");
+let docs_id = EmbeddingSpaceId::new("docs");
+let fused = index.search_vectors_fused(
+    &[
+        SpaceVectorQuery {
+            space_id: &code_id,
+            vector: &code_query_vector,
+            weight: 1.0,
+        },
+        SpaceVectorQuery {
+            space_id: &docs_id,
+            vector: &docs_query_vector,
+            weight: 0.8,
+        },
+    ],
+    &WhereFilter::default(),
+    20,
+    60,
+)?;
+```
+
 Each fused hit preserves its rank, raw score, weight-derived contribution, and
 space id for explanation.
 
@@ -258,6 +295,6 @@ Supported keys are `project`, `language`, `kind`, `name`, `scope`, `path`, and
 
 ## Schema compatibility
 
-The schema is pre-release. Databases from an incompatible epoch are rejected
-with a delete-and-reindex message. This avoids accepting an old layout and
-failing later with unrelated SQL errors.
+The schema is pre-release. Schema epoch 3 adds persisted source checkpoints and
+the durable content-addressed source cache. Databases from incompatible epochs
+are rejected with a delete-and-reindex message rather than partially migrated.
