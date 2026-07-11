@@ -58,6 +58,32 @@ jobs:
           Path('/tmp/patch.py').write_text(script)
           PY
             python /tmp/patch.py
+            python - <<'PY'
+          from pathlib import Path
+
+          source = Path('crates/indexer/src/source.rs')
+          text = source.read_text()
+          text = text.replace(
+              '    SourceContent, SourceError, SourceKind, SourceRootId, WorkspaceDescriptor, WorkspaceId,\n',
+              '    SourceChange, SourceContent, SourceDelta, SourceError, SourceErrorKind, SourceKind,\n    SourceRootId, WorkspaceDescriptor, WorkspaceId,\n',
+              1,
+          )
+          source.write_text(text)
+
+          lib = Path('crates/indexer/src/lib.rs')
+          text = lib.read_text()
+          text = text.replace(
+              '    SnapshotRequest, SourceChange, SourceCheckpoint, SourceErrorKind, SourceSnapshot,\n    SourceWorkspace,\n',
+              '    SnapshotRequest, SourceSnapshot, SourceWorkspace,\n',
+              1,
+          )
+          text = text.replace(
+              '    let delta = match workspace.changes_between(&from, to, &DocumentQuery::all()) {',
+              '    let query = DocumentQuery::all();\n    let delta = match workspace.changes_between(&from, to, &query) {',
+              1,
+          )
+          lib.write_text(text)
+          PY
             grep -q 'SCHEMA_VERSION: i64 = 3' crates/sqlite/src/migrations.rs
             cargo fmt --all
             cargo clippy --workspace --all-targets -- -D warnings
