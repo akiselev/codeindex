@@ -1,80 +1,115 @@
 # Roadmap — codeindex toward 1.0
 
-`codeindex` starts life as the reusable engine behind
-[decombine](../decombine2). The path to 1.0 is about turning that engine into a
-substrate two first-class consumers can stand on — an **agent-facing query CLI**
-and a **Python binding for embedding experiments** — and then hardening the
-public API enough to publish and support it.
+`codeindex` is the reusable library engine behind `decombine` and future tools.
+The first architectural milestones establish a provider-neutral, multi-view,
+multi-model code index. Product surfaces such as `codeindex-cli`, IDE plugins,
+daemons, and bindings remain separate consumers that prove the public library
+boundaries.
 
-1.0 means: stable public APIs under semver, published to crates.io, with the CLI
-and Python surfaces built *on the libraries* (proving the boundaries hold), and a
-schema that supports multi-channel retrieval rather than a single body vector.
+## Completed foundation
 
-## Milestones
+### M1 — Standalone search API
 
-### M1 — Standalone search API (foundation)
-Lift the embed → rank → resolve-to-unit flow (today only in decombine's
-`AnalysisContext`) into the library, with model-identity verification and the
-`unit:<id>` selectors. Everything below depends on this being a library call.
-*Exit:* a consumer can answer "where is the code that does X?" in a handful of
-lines, no decombine code copied.
+Complete. `codeindex-search` loads a storage-neutral `IndexSnapshot`, validates
+it, verifies model identities, resolves stable unit selectors, and exposes text,
+vector, and unit-similarity search without depending on `decombine` or SQLite.
 
-### M2 — `codeindex` CLI
-A binary with `index`, `embed`, `query`, `search`, and `capabilities`
-subcommands emitting stable JSON envelopes for agents. Generalize decombine's
-`query` command family (`docs/query-interface.md` in that repo) into a
-project-agnostic tool. This is the "agents find functionality before it becomes
-a dedupe problem" use case.
-*Exit:* `codeindex search "retry with backoff" --where language=rust` returns
-ranked units as JSON.
+### M4 — Multi-representation, entity versions, and embedding spaces
+
+Complete at the 0.1 foundation level:
+
+- logical `EntityId` and exact `EntityVersionId`;
+- `FullSource`, `Implementation`, `Body`, `BodyWithoutDeclaredName`, `Signature`,
+  `Symbol`, `Documentation`, and derived `Usage` representations;
+- explicit representation provenance and an enrichment hook for generated or
+  imported channels;
+- provider-neutral source documents with stable identities and revisions;
+- named embedding spaces binding a channel to an exact model identity;
+- different models and dimensions in one corpus;
+- explicit-space search and reciprocal-rank fusion across spaces;
+- storage-neutral multi-space snapshots.
+
+Current identity tracking is conservative and within one stable source document.
+Cross-document move tracking remains a later extension.
+
+## Remaining milestones
+
+### M2 — `codeindex-cli`
+
+Build a separate CLI consumer with `index`, `embed`, `query`, `search`,
+`similar`, `capabilities`, and model/source diagnostics. Machine output should
+use stable, versioned JSON envelopes. The CLI must contain presentation and
+orchestration only; indexing, embedding-space management, and search remain
+library calls.
+
+*Exit:* `codeindex search "retry with backoff" --space code --where language=rust`
+returns ranked units as JSON.
 
 ### M3 — Python bindings
-PyO3 + maturin wheels over `codeindex-embedding` (embed arbitrary text, inspect
-vectors, token stats) and the M1 search API. The embedding crate was
-deliberately kept free of SQLite and the grammars for exactly this — a notebook
-user should `pip install` and embed without compiling a C SQLite or twelve
-parsers.
-*Exit:* `import codeindex; codeindex.embed([...])` works in a notebook; a
-published wheel for Linux/macOS.
 
-### M4 — Multi-representation & entity versions
-Wire the dormant `codeindex-core` vocabulary: multiple `RepresentationKind`
-channels (`Signature`, `Documentation`, `Symbol`, `Usage`), and
-`EntityId`/`EntityVersionId` identity that tracks an entity across index
-generations. Requires a `codeindex-sqlite` schema migration (kept intentionally
-separate from the extraction). Unlocks channel-specific retrieval — search
-signatures vs bodies vs docstrings — and change-tracking over time.
-*Exit:* a query can target a channel; re-indexing a renamed function preserves
-its logical identity.
+PyO3 + maturin wheels over the storage/parser-free embedding crate and the
+snapshot/search API. Notebook users should be able to embed arbitrary text,
+inspect spaces, run retrieval experiments, and load serialized snapshots without
+compiling bundled SQLite or all language grammars.
 
-### M5 — Publish & stabilize
-Semver-audit and freeze the public APIs, achieve rustdoc coverage
-(`deny(missing_docs)`), write a CHANGELOG, and publish the crates to crates.io.
-Establish a deprecation policy for the pre-1.0 churn.
-*Exit:* `cargo add codeindex` from crates.io; 1.0.0 tagged.
+*Exit:* published Linux/macOS wheels and a notebook example using two spaces.
 
-### M6 — Platform & accelerator matrix
+### M5 — Public API stabilization and publication
+
+- decide crate publication scope and reserve names;
+- compile and test examples;
+- semver-audit public types and error contracts;
+- complete rustdoc and enable `deny(missing_docs)`;
+- add a changelog and deprecation policy;
+- publish supported crates to crates.io.
+
+*Exit:* `cargo add codeindex` from crates.io with a documented support policy.
+
+### M6 — Platform and accelerator matrix
+
 CI-tested embedding on Linux/CUDA, macOS/CoreML, and Windows/DirectML, plus
-per-platform managed-model distribution (including the fp16 variant) with
-hash verification. Track and close the macOS/Windows gaps carried over from
-decombine.
-*Exit:* documented, tested support tier per OS/accelerator.
+managed per-platform model artifacts and provider drift gates.
 
-## Supporting tracks (continuous)
+*Exit:* documented support tier and reproducibility results per provider.
 
-- **Retrieval quality & benchmarks.** Bring an eval harness into the repo (the
-  calibration/OSS-eval work currently lives in `decombine/runs`) so model and
-  threshold changes are measured against the substrate directly, not only
-  through decombine.
-- **Language coverage.** More bundled grammars, and a path for consumers to
-  register non-bundled grammars at runtime rather than only the compiled-in set.
-- **Serving.** A long-running index/query daemon (and/or an MCP server) so agents
-  query a live, incrementally-updated index without reloading — the natural home
-  once M1/M2 exist.
+### M7 — Relations and context planning
 
-## Non-goals (for now)
+Generalize the current raw call-site/Usage prototype into parser-neutral,
+provenance-carrying relations. Add resolved compiler/LSP/SCIP adapters where
+available, then build token-budgeted context-pack planning over semantic seeds,
+relations, tests, examples, and diversity constraints.
 
-- Reimplementing decombine's duplication/comparison analyzers here — those stay
-  application-level; codeindex provides the index, embeddings, and ranking they
-  build on.
-- A hosted/remote embedding service — codeindex is local-first by design.
+*Exit:* a consumer can request an implementation/debug/review context pack
+without implementing graph expansion or token selection itself.
+
+### M8 — Write-side storage abstraction and large-corpus serving
+
+The read side already accepts any store through `IndexSnapshot`. Introduce a
+write-side persistence interface only when a second backend needs to reuse the
+incremental indexer and embedding projection. Add streaming snapshots or indexed
+serving when measured corpora no longer fit the in-memory search model.
+
+*Exit:* a non-SQLite backend reuses indexing and embedding without application
+code depending on `codeindex-sqlite`.
+
+## Continuous tracks
+
+- **Retrieval evaluation.** Move model, channel, fusion, and provider-drift
+  benchmarks into this repository. Evaluate use cases independently rather than
+  assuming one universal similarity threshold.
+- **Language coverage.** Populate call/reference extraction for languages beyond
+  Rust and support runtime-registered grammars when packaging and trust concerns
+  are resolved.
+- **Source providers.** Add maintained Git revision, editor overlay, archive, and
+  structured-import adapters as real consumers demand them.
+- **Serving.** A daemon and/or MCP server can maintain a live index once the CLI
+  contract and invalidation model are stable.
+
+## Non-goals
+
+- Duplicate, comparison, concern, security, or migration conclusions. Those are
+  application-level interpretations; `codeindex` returns structured semantic
+  evidence.
+- A mandatory hosted embedding service. The project remains local-first while
+  allowing consumers to implement other deterministic embedding backends.
+- ANN by default before exact-search benchmarks demonstrate a concrete limit.
