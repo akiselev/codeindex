@@ -1,116 +1,162 @@
 # codeindex
 
-A reusable Rust substrate for **code intelligence over local embeddings**:
-parse source with Tree-sitter, project functions/methods/types into a compact
-per-entity representation, embed them with a local ONNX model, store everything
-in incremental SQLite, and rank by semantic similarity — all offline, no network
-at query time.
+A reusable Rust substrate for semantic code intelligence. `codeindex` accepts
+source from arbitrary providers, extracts parser-neutral entities and multiple
+textual representations, projects those representations into independently
+modelled embedding spaces, persists them incrementally, and exposes structured
+search primitives. Local ONNX inference is supported, but consumers can provide
+any deterministic embedder.
 
-`codeindex` is the engine extracted from [decombine](../decombine2) (a non-exact
-duplication detector). It is split into small crates so you can take only what
-you need: a notebook binding that just wants to embed strings pulls in neither
-SQLite nor the grammars, while a full indexing CLI takes the whole stack.
+`codeindex` is the engine extracted from `decombine`. It is a library workspace;
+a future `codeindex-cli`, IDE integrations, agents, bindings, daemons, and
+analysis applications are separate consumers.
 
 ## Crates
 
-| Crate | Responsibility | Heavy deps |
-|-------|----------------|-----------|
-| `codeindex-core` | Parser/storage-neutral vocabulary: `LanguageId`, `EntityKind`, `SourceSpan`, `RepresentationKind`, `ExtractedEntity`, `ModelIdentity`. | none |
-| `codeindex-tree-sitter` | Bundled grammars (12 languages), declarative language specs + adapters, normalization, and extraction into `ExtractedEntity`. | tree-sitter grammars |
-| `codeindex-sqlite` | Incremental schema, migrations, model identities, vector blobs, and the persistence API. Owns the `ExtractedEntity → NewCodeUnit` projection. | bundled SQLite |
-| `codeindex-indexer` | Filesystem scan → change detection → extract → retention → transactional store. Also the workflow that **embeds a stored corpus** (resumable projection, source recovery, token reports). | SQLite + grammars |
-| `codeindex-embedding` | Local model execution (fastembed/ONNX), provider diagnostics, batch packing, normalization, token stats. **No storage or parser deps** — safe for a lean binding. | fastembed/ort (feature-gated) |
-| `codeindex-query` | Stable `unit:` selectors, `--where` metadata filtering, identity diffing, deterministic vector ranking. | none |
-| `codeindex` | A thin facade re-exporting all of the above under `core`, `tree_sitter`, `sqlite`, `indexer`, `embedding`, `query`. | — |
+| Crate | Responsibility | Heavy dependencies |
+|---|---|---|
+| `codeindex-core` | Application-neutral entity, representation, provenance, model, and embedding-space vocabulary. | none |
+| `codeindex-tree-sitter` | Bundled grammars, declarative language definitions, entity extraction, normalization, and call-site capture. | Tree-sitter grammars |
+| `codeindex-storage` | Serializable `IndexSnapshot` contract between persistence backends and search. | none |
+| `codeindex-sqlite` | Default incremental store, schema, entity versions, representations, embedding spaces, vectors, and snapshot export. | bundled SQLite |
+| `codeindex-indexer` | Provider-neutral incremental indexing, representation enrichment, Usage synthesis, source recovery, and resumable embedding projection. | SQLite + grammars |
+| `codeindex-embedding` | Storage/parser-free `Embedder` trait, local ONNX backends, model management, batching, normalization, and token statistics. | fastembed/ort when enabled |
+| `codeindex-query` | Stable selectors, metadata filtering, model identity diagnostics, and deterministic ranking kernels. | none |
+| `codeindex-search` | Validated snapshot loading, per-space search, similarity search, and reciprocal-rank fusion across spaces. | none beyond embedding/query primitives |
+| `codeindex` | Thin facade re-exporting the eight component crates. | selected features |
 
-### Dependency graph
+The major dependency boundaries are deliberate:
 
-```
-codeindex-core  (leaf: pure vocabulary, incl. ModelIdentity)
-  ├── codeindex-tree-sitter   (+ grammars)
-  ├── codeindex-sqlite        (+ bundled SQLite; From<ExtractedEntity>)
-  └── codeindex-embedding     (+ fastembed, feature-gated)   ← storage/parser-free
-        └── codeindex-indexer (core + sqlite + tree-sitter + embedding)
-codeindex-query (→ sqlite)
-codeindex       (facade → all)
-```
+```text
+codeindex-core
+  ├── codeindex-tree-sitter
+  ├── codeindex-storage
+  └── codeindex-embedding
 
-The single deliberate rule: **`codeindex-embedding` never depends on SQLite or
-the grammars.** The pure primitives (the `Embedder` trait, batch packer,
-normalization, token stats) live there; anything that needs a stored corpus
-lives in `codeindex-indexer`.
-
-## Quickstart
-
-Add the facade (path or git dependency) and enable a backend feature:
-
-```toml
-[dependencies]
-codeindex = { git = "https://…/codeindex", features = ["fastembed"] }
-# or, locally:
-# codeindex = { path = "../codeindex/crates/codeindex", features = ["fastembed"] }
+codeindex-query ───────────────→ codeindex-core
+codeindex-sqlite ──────────────→ codeindex-core + codeindex-storage
+codeindex-search ──────────────→ core + storage + embedding + query
+codeindex-indexer ─────────────→ core + tree-sitter + sqlite + embedding
 ```
 
-### Just embed text (lean path — no SQLite, no grammars)
+`codeindex-search` never touches SQLite. Any backend that can construct an
+`IndexSnapshot` can use the complete search layer. `codeindex-embedding` never
+pulls in SQLite or language grammars.
 
-Depend only on `codeindex-embedding` with the `fastembed` feature:
+## Source providers
+
+The compatibility `index()` function still indexes ordinary filesystem
+projects. The underlying operation is `index_sources()`, which accepts any
+`SourceProvider`:
 
 ```rust
-use codeindex_embedding::{config::EmbeddingConfig, embedder_from_config};
+use codeindex::indexer::{
+    IndexSettings, MemorySource, RetentionMode, SourceProject, index_sources,
+};
+use codeindex::sqlite;
 
-let cfg = EmbeddingConfig { model: "BGESmallENV15".into(), ..Default::default() };
-let mut embedder = embedder_from_config(&cfg)?;          // downloads the model on first use
-let vectors: Vec<Vec<f32>> = embedder.embed(&["fn parse(&self) {}".to_string()])?;
-```
+let db = sqlite::open_in_memory()?;
+let mut source = MemorySource::new("memory://workspace");
+source.insert(
+    "src/lib.rs",
+    "fn answer() -> i32 { 42 }",
+);
 
-### Index a project and embed the corpus
-
-```rust
-use codeindex::{indexer, sqlite, tree_sitter};
-use codeindex::indexer::{IndexOptions, ProjectSpec, RetentionMode};
-
-let db = sqlite::open_or_create(std::path::Path::new("index.db"))?;
-
-let options = IndexOptions {
-    projects: vec![ProjectSpec {
-        label: "main".into(),
-        source_dir: "./src".into(),
-        exclude: vec![],
-    }],
-    enabled_languages: tree_sitter::BUNDLED_LANGUAGE_IDS.iter().map(|s| s.to_string()).collect(),
-    body_node_count_threshold: 10,
+let settings = IndexSettings {
+    enabled_languages: vec!["rust".into()],
+    body_node_count_threshold: 1,
     max_body_chars: 10_000,
     retention: RetentionMode::Full,
 };
-indexer::index(&db, &options, None)?;   // incremental: unchanged files are skipped
+index_sources(
+    &db,
+    &settings,
+    &[SourceProject {
+        label: "main".into(),
+        provider: &source,
+    }],
+    None,
+)?;
 ```
 
-Embedding the stored bodies (resumable; re-run to pick up new units) is the
-`codeindex-indexer::embed_pending` half — see
-[`docs/getting-started.md`](docs/getting-started.md) for the full flow including
-`codeindex-query` ranking.
+Providers expose stable document identities, logical paths, opaque revisions,
+and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
+and editor-overlay providers can reuse the same indexing pipeline.
 
-## Features
+## Representations
 
-`codeindex-embedding` (and, transitively, the `codeindex` facade) gate the
-model runtime behind cargo features so a build that only parses/stores never
-compiles ONNX:
+Each entity can carry multiple independently versioned representation channels:
 
-- `fastembed` — the local ONNX backend (fastembed). Required to run any model.
-- `accel` and `cuda` / `directml` / `coreml` / `openvino` — hardware execution
-  providers on top of `fastembed`.
-- `load-dynamic` — link ONNX Runtime dynamically.
+- `FullSource`
+- `Implementation`
+- `Body`
+- `BodyWithoutDeclaredName`
+- `Signature`
+- `Symbol`
+- `Documentation`
+- `Usage`
+- `GeneratedDescription`
+- consumer-defined custom channels
 
-With no features, the crates parse, store, and rank pre-computed vectors, but
-cannot produce embeddings.
+Representations include provenance. Deterministic frontend channels are marked
+`Extracted`; corpus-derived channels such as `Usage` are `Derived`; external or
+model-generated channels are `Imported`. Consumers can register
+`RepresentationEnricher` implementations before retention is applied.
+
+## Embedding spaces
+
+An embedding space binds one representation channel to one exact model identity
+and input transform. A corpus can therefore use a code model for implementations
+and a text model for documentation or generated descriptions:
+
+```rust
+use codeindex::core::{EmbeddingSpaceIdentity, RepresentationKind};
+use codeindex::indexer::embed_space_pending;
+
+let code_space = EmbeddingSpaceIdentity::new(
+    "code",
+    RepresentationKind::Implementation,
+    code_embedder.identity().clone(),
+);
+embed_space_pending(&db, &mut code_embedder, &run_config, &code_space)?;
+
+let docs_space = EmbeddingSpaceIdentity::new(
+    "docs",
+    RepresentationKind::Documentation,
+    text_embedder.identity().clone(),
+);
+embed_space_pending(&db, &mut text_embedder, &run_config, &docs_space)?;
+```
+
+`embed_pending()` remains a convenience operation. It creates one
+`default/<channel>` space per embeddable channel using the same embedder.
+
+Search selects an explicit space. For multi-model retrieval,
+`SearchIndex::search_vectors_fused` combines independently ranked result lists
+with weighted reciprocal rank; raw cosine values from incompatible models are
+not averaged.
+
+## Local model backend
+
+Enable `fastembed` to run supported local ONNX models. Accelerator features are
+available for CUDA, DirectML, CoreML, and OpenVINO.
+
+```toml
+[dependencies]
+codeindex = { git = "https://github.com/akiselev/codeindex", features = ["fastembed"] }
+```
+
+A build without embedding backend features can still extract, persist, load,
+and rank externally computed vectors.
 
 ## Building
 
 ```sh
-cargo build --workspace                       # parse/store/rank; no model runtime
-cargo build -p codeindex-embedding --features fastembed   # with the ONNX backend
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo check -p codeindex --features fastembed
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the design rationale and
-[`docs/getting-started.md`](docs/getting-started.md) for a complete example.
+The database schema is pre-release. Incompatible schema epochs are rejected with
+an explicit delete-and-reindex error rather than migrated.
