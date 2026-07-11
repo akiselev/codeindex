@@ -19,4 +19,7 @@ codeindex-tree-sitter = { path = "../tree-sitter" }
 ignore = "0.4.27"
 
 [dev-dependencies]
+codeindex-query = { path = "../query" }
+codeindex-search = { path = "../search" }
+rusqlite = "0.40.1"
 tempfile = "3.27.0"

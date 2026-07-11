@@ -1,14 +1,15 @@
-//! End-to-end round trip across the crate seams: index metadata in SQLite,
-//! embed bodies with the offline hash backend, store the vectors, then load a
-//! `SearchIndex` and exercise the search operations. This is the workspace
-//! integration test that no per-crate unit test covers — it walks
-//! sqlite → embedding → query → search together.
+//! End-to-end round trip across the crate seams: store units + representations
+//! in SQLite, embed one channel with the offline hash backend, export a
+//! storage-neutral snapshot, load a `SearchIndex` from it, and exercise the
+//! channel-aware search operations. Walks sqlite → storage → embedding →
+//! query → search together.
 
+use codeindex_core::RepresentationKind;
 use codeindex_embedding::embed::hash::HashEmbedder;
 use codeindex_embedding::{Embedder, normalize_in_place};
 use codeindex_query::WhereFilter;
 use codeindex_search::{SearchIndex, resolve_selector};
-use codeindex_sqlite::{NewCodeUnit, NewFile, open_in_memory};
+use codeindex_sqlite::{NewCodeUnit, NewFile, NewRepresentation, open_in_memory};
 
 const DIMS: usize = 64;
 
@@ -20,7 +21,11 @@ const BODIES: &[(&str, &str)] = &[
 ];
 
 fn unit(name: &str, body: &str, start: usize) -> NewCodeUnit {
+    let body_hash = format!("body-{name}");
     NewCodeUnit {
+        entity_id: format!("ent-{name}"),
+        entity_version_id: format!("ver-{name}"),
+        generation: 1,
         language_id: "rust".into(),
         kind: "function".into(),
         name: name.into(),
@@ -31,14 +36,24 @@ fn unit(name: &str, body: &str, start: usize) -> NewCodeUnit {
         end_line: start + 1,
         body_node_count: 10,
         source_hash: format!("src-{name}"),
-        normalized_body_hash: format!("body-{name}"),
-        display_source: Some(body.to_owned()),
-        embedding_text: Some(body.to_owned()),
+        normalized_body_hash: body_hash.clone(),
+        representations: vec![
+            NewRepresentation {
+                kind: RepresentationKind::FullSource,
+                content_hash: format!("src-{name}"),
+                content: Some(body.to_owned()),
+            },
+            NewRepresentation {
+                kind: RepresentationKind::Implementation,
+                content_hash: body_hash,
+                content: Some(body.to_owned()),
+            },
+        ],
     }
 }
 
 /// Build an in-memory index: one project, one file, the three bodies embedded
-/// with the hash backend and stored under its model identity.
+/// on the Implementation channel with the hash backend.
 fn build_index() -> (SearchIndex, HashEmbedder) {
     let db = open_in_memory().unwrap();
     let project_id = db.upsert_project("main", "/src").unwrap();
@@ -63,22 +78,33 @@ fn build_index() -> (SearchIndex, HashEmbedder) {
     let model_id = db.find_or_create_model(embedder.identity()).unwrap();
     let bodies: Vec<String> = BODIES.iter().map(|(_, body)| (*body).to_owned()).collect();
     let mut vectors = embedder.embed(&bodies).unwrap();
-    for ((_, _), vector) in BODIES.iter().zip(vectors.iter_mut()) {
+    for vector in vectors.iter_mut() {
         normalize_in_place(vector);
     }
     for ((name, _), vector) in BODIES.iter().zip(vectors.iter()) {
-        db.insert_embedding(model_id, &format!("body-{name}"), vector)
-            .unwrap();
+        db.insert_embedding(
+            model_id,
+            &RepresentationKind::Implementation,
+            &format!("body-{name}"),
+            vector,
+        )
+        .unwrap();
     }
 
-    (SearchIndex::load(&db, &[]).unwrap(), embedder)
+    let snapshot = db.snapshot(&[]).unwrap();
+    (SearchIndex::from_snapshot(snapshot), embedder)
+}
+
+fn impl_channel() -> RepresentationKind {
+    RepresentationKind::Implementation
 }
 
 #[test]
 fn load_populates_units_and_vectors() {
     let (index, _) = build_index();
     assert_eq!(index.units.len(), 3);
-    assert_eq!(index.vectors.len(), 3, "every body was embedded");
+    let store = index.channels.get(&impl_channel()).unwrap();
+    assert_eq!(store.len(), 3, "every body was embedded");
     assert_eq!(index.identity.dimensions, DIMS);
 }
 
@@ -87,28 +113,42 @@ fn search_text_ranks_by_shared_vocabulary() {
     let (index, mut embedder) = build_index();
     let filter = WhereFilter::default();
     let results = index
-        .search_text(&mut embedder, "parse command line flags", &filter, 10)
+        .search_text(
+            &mut embedder,
+            "parse command line flags",
+            &impl_channel(),
+            &filter,
+            10,
+        )
         .unwrap();
     assert_eq!(results.matched, 3, "all embedded units are candidates");
     let top = &index.units[results.hits[0].index];
     assert_eq!(top.name, "parse_flags", "shared tokens rank highest");
-    // Scores are sorted descending.
     assert!(results.hits[0].score >= results.hits[1].score);
 }
 
 #[test]
 fn search_text_rejects_mismatched_model_identity() {
     let (index, _) = build_index();
-    // A different dimensionality is a different model identity.
     let mut other = HashEmbedder::new(DIMS * 2);
     let err = index
-        .search_text(&mut other, "anything", &WhereFilter::default(), 10)
+        .search_text(&mut other, "anything", &impl_channel(), &WhereFilter::default(), 10)
         .unwrap_err()
         .to_string();
     assert!(
         err.contains("same model identity") && err.contains("dimensions"),
         "identity mismatch should be reported with the differing field: {err}"
     );
+}
+
+#[test]
+fn search_missing_channel_errors() {
+    let (index, _) = build_index();
+    let err = index
+        .search_vector(&[0.0; DIMS], &RepresentationKind::Signature, &WhereFilter::default(), 10)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no embeddings"), "unhelpful error: {err}");
 }
 
 #[test]
@@ -120,14 +160,13 @@ fn similar_to_unit_excludes_query_and_honors_threshold() {
         .position(|u| u.name == "parse_flags")
         .unwrap();
     let all = index
-        .similar_to_unit(query_index, &WhereFilter::default(), 10, -1.0)
+        .similar_to_unit(query_index, &impl_channel(), &WhereFilter::default(), 10, -1.0)
         .unwrap();
     assert_eq!(all.matched, 2, "the query unit itself is excluded");
     assert!(all.hits.iter().all(|h| h.index != query_index));
 
-    // A threshold above every off-diagonal score keeps nothing.
     let none = index
-        .similar_to_unit(query_index, &WhereFilter::default(), 10, 1.5)
+        .similar_to_unit(query_index, &impl_channel(), &WhereFilter::default(), 10, 1.5)
         .unwrap();
     assert_eq!(none.matched, 0);
 }
