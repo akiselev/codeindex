@@ -37,10 +37,23 @@ pub struct NewFile {
     pub source_hash: String,
 }
 
+/// One representation channel to persist for a unit. `content` is `None` when
+/// retention drops the text (it can be recovered from source); the
+/// `content_hash` is always present and is the embedding lookup key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRepresentation {
+    pub kind: RepresentationKind,
+    pub content_hash: String,
+    pub content: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeUnit {
     pub id: UnitId,
     pub file_id: FileId,
+    pub entity_id: String,
+    pub entity_version_id: String,
+    pub generation: i64,
     pub language_id: String,
     pub kind: String,
     pub name: String,
@@ -52,13 +65,16 @@ pub struct CodeUnit {
     pub body_node_count: usize,
     pub source_hash: String,
     pub normalized_body_hash: String,
-    pub display_source: Option<String>,
-    pub embedding_text: Option<String>,
 }
 
-/// A new code unit before it has an id.
-#[derive(Debug, Clone, PartialEq)]
+/// A new code unit before it has an id. Identity (`entity_id`,
+/// `entity_version_id`, `generation`) is assigned by the indexer; the parser
+/// frontend only supplies the location/representation payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCodeUnit {
+    pub entity_id: String,
+    pub entity_version_id: String,
+    pub generation: i64,
     pub language_id: String,
     pub kind: String,
     pub name: String,
@@ -70,24 +86,33 @@ pub struct NewCodeUnit {
     pub body_node_count: usize,
     pub source_hash: String,
     pub normalized_body_hash: String,
-    pub display_source: Option<String>,
-    pub embedding_text: Option<String>,
+    pub representations: Vec<NewRepresentation>,
 }
 
-/// Project a parser-neutral entity onto the current persistence row. This is
-/// the single place the representation channels map onto the compatible
-/// schema's `display_source`/`embedding_text` columns, shared by every
-/// frontend consumer (the indexer, the embedding source-recovery path, and the
-/// decombine adapter) so the mapping can only ever change in one place.
-impl From<ExtractedEntity> for NewCodeUnit {
-    fn from(entity: ExtractedEntity) -> Self {
-        let display_source = entity
-            .representation_text(&RepresentationKind::FullSource)
-            .map(str::to_owned);
-        let embedding_text = entity
-            .representation_text(&RepresentationKind::Implementation)
-            .map(str::to_owned);
+impl NewCodeUnit {
+    /// Project a parser-neutral entity onto a persistence row, given the
+    /// identity the indexer assigned it. This is the single place the
+    /// representation channels the frontend emitted map onto storage — every
+    /// channel is carried, not a fixed two.
+    pub fn from_entity(
+        entity: ExtractedEntity,
+        entity_id: impl Into<String>,
+        entity_version_id: impl Into<String>,
+        generation: i64,
+    ) -> Self {
+        let representations = entity
+            .representations
+            .into_iter()
+            .map(|repr| NewRepresentation {
+                kind: repr.kind,
+                content_hash: repr.content_hash,
+                content: Some(repr.content),
+            })
+            .collect();
         NewCodeUnit {
+            entity_id: entity_id.into(),
+            entity_version_id: entity_version_id.into(),
+            generation,
             language_id: entity.language.into_inner(),
             kind: entity.kind.as_str().to_owned(),
             name: entity.name,
@@ -99,9 +124,16 @@ impl From<ExtractedEntity> for NewCodeUnit {
             body_node_count: entity.body_node_count,
             source_hash: entity.source_hash,
             normalized_body_hash: entity.normalized_body_hash,
-            display_source,
-            embedding_text,
+            representations,
         }
+    }
+
+    /// The content hash for a channel, if this unit carries that channel.
+    pub fn content_hash(&self, kind: &RepresentationKind) -> Option<&str> {
+        self.representations
+            .iter()
+            .find(|r| &r.kind == kind)
+            .map(|r| r.content_hash.as_str())
     }
 }
 

@@ -323,6 +323,10 @@ pub struct LanguageDef {
     pub spec: LanguageSpec,
     pub language: Language,
     pub query: Query,
+    /// Optional reference/call-site query for the Usage channel. Captures a
+    /// `@ref.callee` node per call site. `None`/empty when a language has no
+    /// reference support yet (its units still index; Usage stays empty).
+    pub references: Option<Query>,
     pub adapter: Option<&'static dyn LanguageAdapter>,
 }
 
@@ -332,12 +336,19 @@ macro_rules! bundled {
             $id,
             include_str!(concat!("../assets/languages/", $id, ".toml")),
             include_str!(concat!("../assets/languages/", $id, "/units.scm")),
+            include_str!(concat!("../assets/languages/", $id, "/references.scm")),
             Language::new($lang),
         )
     };
 }
 
-fn bundled_languages() -> Vec<(&'static str, &'static str, &'static str, Language)> {
+fn bundled_languages() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Language,
+)> {
     vec![
         bundled!("c", tree_sitter_c::LANGUAGE),
         bundled!("cpp", tree_sitter_cpp::LANGUAGE),
@@ -361,12 +372,17 @@ pub struct LanguageRegistry {
 impl LanguageRegistry {
     fn load() -> Result<Self> {
         let mut languages = BTreeMap::new();
-        for (id, spec_toml, query_src, language) in bundled_languages() {
+        for (id, spec_toml, query_src, references_src, language) in bundled_languages() {
             let spec: LanguageSpec = toml::from_str(spec_toml)
                 .with_context(|| format!("parsing language spec for {id}"))?;
             anyhow::ensure!(spec.id == id, "language spec id mismatch for {id}");
             let query = Query::new(&language, query_src)
                 .with_context(|| format!("compiling units.scm for {id}"))?;
+            let references = {
+                let query = Query::new(&language, references_src)
+                    .with_context(|| format!("compiling references.scm for {id}"))?;
+                (query.pattern_count() > 0).then_some(query)
+            };
             let adapter = spec
                 .adapter
                 .as_deref()
@@ -379,6 +395,7 @@ impl LanguageRegistry {
                     spec,
                     language,
                     query,
+                    references,
                     adapter,
                 },
             );

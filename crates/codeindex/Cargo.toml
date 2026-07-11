@@ -17,6 +17,7 @@ codeindex-indexer = { path = "../indexer" }
 codeindex-query = { path = "../query" }
 codeindex-search = { path = "../search" }
 codeindex-sqlite = { path = "../sqlite" }
+codeindex-storage = { path = "../storage" }
 codeindex-tree-sitter = { path = "../tree-sitter" }
 
 [features]

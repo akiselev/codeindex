@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use codeindex_sqlite::ModelIdentity;
+use codeindex_core::ModelIdentity;
 use globset::{GlobBuilder, GlobMatcher};
 use sha2::{Digest, Sha256};
 

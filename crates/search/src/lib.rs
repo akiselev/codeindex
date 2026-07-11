@@ -2,42 +2,46 @@
 
 //! The end-to-end semantic search service over a code index.
 //!
-//! The reusable crates below this one provide the *pieces* — SQLite storage
-//! ([`codeindex_sqlite`]), embedding backends ([`codeindex_embedding`]), and
-//! the ranking/filtering primitives ([`codeindex_query`]). This crate owns the
-//! *operation* a consumer actually wants:
+//! This crate owns the *operation* a consumer wants:
 //!
 //! > natural-language sentence → embed with the corpus's model → verify model
-//! > compatibility → retrieve candidate vectors → rank/filter → resolve back to
-//! > code-unit metadata → structured results
+//! > compatibility → retrieve candidate vectors for a channel → rank/filter →
+//! > resolve back to code-unit metadata → structured results
 //!
-//! A [`SearchIndex`] is the loaded corpus (projects, units, the single
-//! embedding model's identity, and its dense vectors). [`SearchIndex::search_text`]
-//! is the headline call; [`SearchIndex::search_vector`] and
-//! [`SearchIndex::similar_to_unit`] cover the pre-embedded and unit-to-unit
-//! cases. Presentation (JSON envelopes, text formatting) is left to the caller.
+//! It loads exclusively from a storage-neutral [`codeindex_storage::IndexSnapshot`]
+//! ([`SearchIndex::from_snapshot`]); it never touches SQLite or any other store
+//! directly. Any backend that can produce an `IndexSnapshot` — SQLite via
+//! `Db::snapshot`, or any other database by deserializing its rows into the
+//! public snapshot type — can be searched.
+//!
+//! Every representation channel (`Implementation`, `Signature`, `Documentation`,
+//! `Symbol`, `Usage`, …) is embedded and searched independently: a query
+//! targets one channel. Presentation (JSON envelopes, text formatting) is left
+//! to the caller.
 
 pub mod vector_store;
 
 use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, bail};
+use codeindex_core::{ModelIdentity, RepresentationKind};
 use codeindex_embedding::{Embedder, normalize_in_place};
 use codeindex_query::{UnitView, WhereFilter, identity_diff, rank_candidates, unit_id};
-use codeindex_sqlite::{Db, ModelIdentity, Project, UnitId, blob_to_vector};
-use rusqlite::params_from_iter;
+use codeindex_storage::{IndexSnapshot, ProjectRecord, RepresentationRef};
 
 pub use vector_store::{ScoredPair, VectorStore, dot};
 
-/// Re-exported so consumers can name the DB handle the service loads from
-/// without depending on `codeindex-sqlite` directly.
-pub use codeindex_sqlite as sqlite;
+/// Re-export the snapshot types so consumers can name what the service loads
+/// from without depending on `codeindex-storage` directly.
+pub use codeindex_storage as storage;
 
 /// A code unit joined with its file and project — the metadata a search result
-/// resolves back to.
+/// resolves back to. Built from a [`codeindex_storage::UnitRecord`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeUnitRef {
-    pub id: UnitId,
+    pub entity_id: String,
+    pub entity_version_id: String,
+    pub generation: u64,
     pub project_label: String,
     pub relative_path: String,
     pub language_id: String,
@@ -49,14 +53,28 @@ pub struct CodeUnitRef {
     pub start_line: usize,
     pub end_line: usize,
     pub body_node_count: usize,
+    /// The `Implementation` channel content hash — the stable body identity used
+    /// by [`unit_id`] and rename detection.
     pub normalized_body_hash: String,
+    /// `FullSource` content, when retention kept it.
     pub display_source: Option<String>,
+    /// Every representation channel of this unit (used to look up its vector in
+    /// a given channel by content hash).
+    pub representations: Vec<RepresentationRef>,
 }
 
 impl CodeUnitRef {
     /// `label:path` display location.
     pub fn location(&self) -> String {
         format!("{}:{}", self.project_label, self.relative_path)
+    }
+
+    /// The content hash for a channel, if this unit carries it.
+    pub fn content_hash(&self, kind: &RepresentationKind) -> Option<&str> {
+        self.representations
+            .iter()
+            .find(|r| &r.kind == kind)
+            .map(|r| r.content_hash.as_str())
     }
 }
 
@@ -107,137 +125,105 @@ pub struct SearchHit {
 }
 
 /// The outcome of a search: the hits returned (already truncated to the
-/// caller's limit) plus how many candidates matched before truncation, so
-/// callers can render "N of M" / `has_more`.
+/// caller's limit) plus how many candidates matched before truncation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     pub matched: usize,
     pub hits: Vec<SearchHit>,
 }
 
-/// The loaded corpus: selected projects, their code units, the single
-/// embedding model's identity, and its normalized vectors.
+/// The loaded corpus: projects, their code units, the single embedding model's
+/// identity, and one [`VectorStore`] per embedded representation channel.
 pub struct SearchIndex {
-    pub model_id: i64,
     pub identity: ModelIdentity,
-    pub projects: Vec<Project>,
+    pub projects: Vec<ProjectRecord>,
     /// Sorted by (project label, path, start byte) for determinism.
     pub units: Vec<CodeUnitRef>,
-    pub vectors: VectorStore,
-}
-
-/// Load selected projects (empty = all) and their code units without touching
-/// embeddings. Used by metadata-only consumers (unit listing, inspection);
-/// [`SearchIndex::load`] builds on it.
-pub fn load_projects_and_units(
-    db: &Db,
-    project_labels: &[String],
-) -> Result<(Vec<Project>, Vec<CodeUnitRef>)> {
-    let all_projects = db.list_projects()?;
-    let projects: Vec<Project> = if project_labels.is_empty() {
-        all_projects
-    } else {
-        let mut selected = Vec::new();
-        for label in project_labels {
-            let project = all_projects
-                .iter()
-                .find(|p| &p.label == label)
-                .with_context(|| format!("project {label:?} is not indexed"))?;
-            selected.push(project.clone());
-        }
-        selected
-    };
-    if projects.is_empty() {
-        bail!("no indexed projects; index a project first");
-    }
-
-    // Load units for the selected projects.
-    let placeholders = projects.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT u.id, p.label, f.relative_path, u.language_id, u.kind, u.name, u.scope,
-                    u.start_byte, u.end_byte, u.start_line, u.end_line,
-                    u.body_node_count, u.normalized_body_hash, u.display_source
-             FROM code_units u
-             JOIN files f ON f.id = u.file_id
-             JOIN projects p ON p.id = f.project_id
-             WHERE p.id IN ({placeholders})
-             ORDER BY p.label, f.relative_path, u.start_byte, u.end_byte"
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let units: Vec<CodeUnitRef> = stmt
-        .query_map(params_from_iter(projects.iter().map(|p| p.id)), |row| {
-            Ok(CodeUnitRef {
-                id: row.get(0)?,
-                project_label: row.get(1)?,
-                relative_path: row.get(2)?,
-                language_id: row.get(3)?,
-                kind: row.get(4)?,
-                name: row.get(5)?,
-                scope: row.get(6)?,
-                start_byte: row.get::<_, i64>(7)? as usize,
-                end_byte: row.get::<_, i64>(8)? as usize,
-                start_line: row.get::<_, i64>(9)? as usize,
-                end_line: row.get::<_, i64>(10)? as usize,
-                body_node_count: row.get::<_, i64>(11)? as usize,
-                normalized_body_hash: row.get(12)?,
-                display_source: row.get(13)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok((projects, units))
-}
-
-/// Projects + units without the vector store — for metadata-only operations
-/// (listing, inspection) that never rank. A thin named wrapper over
-/// [`load_projects_and_units`].
-pub fn load_metadata(
-    db: &Db,
-    project_labels: &[String],
-) -> Result<(Vec<Project>, Vec<CodeUnitRef>)> {
-    load_projects_and_units(db, project_labels)
+    /// One vector store per channel, each aligned with `units`.
+    pub channels: HashMap<RepresentationKind, VectorStore>,
 }
 
 impl SearchIndex {
-    /// Load the corpus for the given project labels (empty = all), including
-    /// the single embedding model and its vectors.
-    pub fn load(db: &Db, project_labels: &[String]) -> Result<SearchIndex> {
-        let (projects, units) = load_projects_and_units(db, project_labels)?;
+    /// Build the search index from a storage-neutral snapshot. This is the only
+    /// entry point: SQLite and every other backend feed search through here.
+    pub fn from_snapshot(snapshot: IndexSnapshot) -> SearchIndex {
+        let identity = snapshot.model;
+        let projects = snapshot.projects;
+        let units: Vec<CodeUnitRef> = snapshot
+            .units
+            .into_iter()
+            .map(|unit| {
+                let normalized_body_hash = unit
+                    .content_hash(&RepresentationKind::Implementation)
+                    .unwrap_or_default()
+                    .to_string();
+                let display_source = unit
+                    .content(&RepresentationKind::FullSource)
+                    .map(str::to_owned);
+                CodeUnitRef {
+                    entity_id: unit.entity_id,
+                    entity_version_id: unit.entity_version_id,
+                    generation: unit.generation,
+                    project_label: unit.project_label,
+                    relative_path: unit.relative_path,
+                    language_id: unit.language_id,
+                    kind: unit.kind,
+                    name: unit.name,
+                    scope: unit.scope,
+                    start_byte: unit.span.start_byte,
+                    end_byte: unit.span.end_byte,
+                    start_line: unit.span.start_line,
+                    end_line: unit.span.end_line,
+                    body_node_count: unit.body_node_count,
+                    normalized_body_hash,
+                    display_source,
+                    representations: unit.representations,
+                }
+            })
+            .collect();
 
-        // The search model: exactly one embedding model may exist per database
-        // (enforced by the embed pipeline's immutable settings).
-        let models = db.list_models()?;
-        let model = match models.as_slice() {
-            [] => bail!("no embeddings found; embed the corpus first"),
-            [model] => model.clone(),
-            _ => bail!("database contains multiple embedding models; this is unsupported"),
-        };
-
-        // Load this model's embeddings once, then assign per unit by hash.
-        let mut by_hash: HashMap<String, Vec<f32>> = HashMap::new();
-        let mut stmt = db.conn().prepare(
-            "SELECT normalized_body_hash, vector_blob FROM embeddings WHERE model_id = ?1",
-        )?;
-        let rows = stmt.query_map([model.id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for row in rows {
-            let (hash, blob) = row?;
-            by_hash.insert(hash, blob_to_vector(&blob));
+        // Build one vector store per channel, aligning each unit to its vector
+        // in that channel by content hash.
+        let mut channels = HashMap::new();
+        for channel in &snapshot.channels {
+            let by_hash = channel.by_hash();
+            let vectors: Vec<Option<Vec<f32>>> = units
+                .iter()
+                .map(|unit| {
+                    unit.content_hash(&channel.channel)
+                        .and_then(|hash| by_hash.get(hash))
+                        .map(|vector| vector.to_vec())
+                })
+                .collect();
+            channels.insert(
+                channel.channel.clone(),
+                VectorStore::from_unit_vectors(channel.dimensions, vectors),
+            );
         }
 
-        let vectors = units
-            .iter()
-            .map(|unit| by_hash.get(&unit.normalized_body_hash).cloned())
-            .collect();
-        let vectors = VectorStore::from_unit_vectors(model.identity.dimensions, vectors);
-
-        Ok(SearchIndex {
-            model_id: model.id,
-            identity: model.identity,
+        SearchIndex {
+            identity,
             projects,
             units,
-            vectors,
+            channels,
+        }
+    }
+
+    fn channel_store(&self, channel: &RepresentationKind) -> Result<&VectorStore> {
+        self.channels.get(channel).with_context(|| {
+            format!(
+                "channel {channel} has no embeddings in this index; embedded channels: {}",
+                self.embedded_channels()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         })
+    }
+
+    /// The channels that carry vectors in this index.
+    pub fn embedded_channels(&self) -> impl Iterator<Item = &RepresentationKind> {
+        self.channels.keys()
     }
 
     /// Unit indices belonging to one project label.
@@ -251,13 +237,13 @@ impl SearchIndex {
     }
 
     /// Embed `text` with `embedder`, verify it matches the corpus's model, then
-    /// rank every embedded unit passing `filter`. This is the full
-    /// sentence → results path: identity verification and query normalization
-    /// happen here so no consumer has to reimplement them.
+    /// rank every unit embedded in `channel` that passes `filter`. This is the
+    /// full sentence → results path.
     pub fn search_text(
         &self,
         embedder: &mut dyn Embedder,
         text: &str,
+        channel: &RepresentationKind,
         filter: &WhereFilter,
         limit: usize,
     ) -> Result<SearchResults> {
@@ -272,55 +258,54 @@ impl SearchIndex {
         let mut vectors = embedder.embed(std::slice::from_ref(&text.to_owned()))?;
         let mut query_vector = vectors.pop().context("embedder returned no vector")?;
         normalize_in_place(&mut query_vector);
-        Ok(self.search_vector(&query_vector, filter, limit))
+        self.search_vector(&query_vector, channel, filter, limit)
     }
 
-    /// Rank every embedded unit passing `filter` against an already-normalized
-    /// query vector. The embed-free core that [`Self::search_text`] delegates
-    /// to; also usable directly by a consumer that owns its own vector.
+    /// Rank every unit embedded in `channel` that passes `filter` against an
+    /// already-normalized query vector.
     pub fn search_vector(
         &self,
         query: &[f32],
+        channel: &RepresentationKind,
         filter: &WhereFilter,
         limit: usize,
-    ) -> SearchResults {
+    ) -> Result<SearchResults> {
+        let store = self.channel_store(channel)?;
         let candidates = (0..self.units.len()).filter_map(|index| {
             if !filter.matches(&self.units[index]) {
                 return None;
             }
-            let row = self.vectors.row_for_unit(index)?;
-            Some((index, self.vectors.vector(row)))
+            let row = store.row_for_unit(index)?;
+            Some((index, store.vector(row)))
         });
-        self.finish(rank_candidates(query, candidates, -1.0), limit)
+        Ok(self.finish(rank_candidates(query, candidates, -1.0), limit))
     }
 
-    /// The top units most similar to `query_index`, excluding the query unit
-    /// itself and keeping only hits at or above `threshold`. Errors if the
-    /// query unit has no stored embedding.
+    /// The top units most similar to `query_index` in `channel`, excluding the
+    /// query unit and keeping only hits at or above `threshold`.
     pub fn similar_to_unit(
         &self,
         query_index: usize,
+        channel: &RepresentationKind,
         filter: &WhereFilter,
         limit: usize,
         threshold: f32,
     ) -> Result<SearchResults> {
-        let query_row = self
-            .vectors
+        let store = self.channel_store(channel)?;
+        let query_row = store
             .row_for_unit(query_index)
-            .context("query unit has no stored embedding")?;
-        let query_vector = self.vectors.vector(query_row).to_vec();
+            .context("query unit has no stored embedding in this channel")?;
+        let query_vector = store.vector(query_row).to_vec();
         let candidates = (0..self.units.len()).filter_map(|index| {
             if index == query_index || !filter.matches(&self.units[index]) {
                 return None;
             }
-            let row = self.vectors.row_for_unit(index)?;
-            Some((index, self.vectors.vector(row)))
+            let row = store.row_for_unit(index)?;
+            Some((index, store.vector(row)))
         });
         Ok(self.finish(rank_candidates(&query_vector, candidates, threshold), limit))
     }
 
-    /// Convert ranked candidates into results: record the pre-truncation match
-    /// count, then keep the top `limit`.
     fn finish(&self, scored: Vec<codeindex_query::ScoredIndex>, limit: usize) -> SearchResults {
         let matched = scored.len();
         let hits = scored

@@ -5,7 +5,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Language identifier independent of any parser implementation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LanguageId(String);
 
 impl LanguageId {
@@ -44,7 +45,8 @@ impl fmt::Display for LanguageId {
 ///
 /// Frontends produce `ExtractedEntity` values before repository-qualified
 /// identity is available; the persistence layer assigns this identity later.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EntityId(String);
 
 impl EntityId {
@@ -58,7 +60,8 @@ impl EntityId {
 }
 
 /// Exact identity for one indexed version of a logical entity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EntityVersionId(String);
 
 impl EntityVersionId {
@@ -146,7 +149,7 @@ impl From<String> for EntityKind {
 }
 
 /// Half-open source range plus one-based human line numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -168,6 +171,11 @@ impl SourceSpan {
 }
 
 /// A reproducible textual projection of a source entity.
+///
+/// The `as_str`/`From<&str>` pair is the canonical persisted and serialized
+/// form (a stable snake-case token), so this enum can be a database TEXT key
+/// and a JSON field without two encodings drifting apart. Unknown tokens round
+/// trip losslessly through [`RepresentationKind::Custom`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum RepresentationKind {
@@ -181,6 +189,66 @@ pub enum RepresentationKind {
     Usage,
     GeneratedDescription,
     Custom(String),
+}
+
+impl RepresentationKind {
+    /// The canonical persisted/serialized token for this channel.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::FullSource => "full_source",
+            Self::Implementation => "implementation",
+            Self::Body => "body",
+            Self::BodyWithoutDeclaredName => "body_without_declared_name",
+            Self::Signature => "signature",
+            Self::Symbol => "symbol",
+            Self::Documentation => "documentation",
+            Self::Usage => "usage",
+            Self::GeneratedDescription => "generated_description",
+            Self::Custom(value) => value,
+        }
+    }
+}
+
+impl From<&str> for RepresentationKind {
+    fn from(value: &str) -> Self {
+        match value {
+            "full_source" => Self::FullSource,
+            "implementation" => Self::Implementation,
+            "body" => Self::Body,
+            "body_without_declared_name" => Self::BodyWithoutDeclaredName,
+            "signature" => Self::Signature,
+            "symbol" => Self::Symbol,
+            "documentation" => Self::Documentation,
+            "usage" => Self::Usage,
+            "generated_description" => Self::GeneratedDescription,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for RepresentationKind {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl fmt::Display for RepresentationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for RepresentationKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RepresentationKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = String::deserialize(deserializer)?;
+        Ok(Self::from(token.as_str()))
+    }
 }
 
 /// Text and identity for one representation channel.

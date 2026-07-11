@@ -109,6 +109,69 @@ pub fn extract_units(
     Ok(units)
 }
 
+/// One raw call site captured from a source file, before cross-corpus
+/// resolution. `start_byte` attributes it to the enclosing unit (the unit whose
+/// span contains it); `callee_symbol` is the raw callee expression text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawReference {
+    pub callee_symbol: String,
+    pub call_snippet: String,
+    pub start_byte: usize,
+    pub start_line: usize,
+}
+
+/// Capture every call site in `source` using the language's `references.scm`.
+/// Returns an empty vector for languages without a reference query. The caller
+/// attributes each reference to a unit by span containment and resolves the
+/// symbol against the corpus (see the indexer's Usage pass).
+pub fn extract_references(def: &LanguageDef, source: &str) -> Result<Vec<RawReference>> {
+    let Some(query) = def.references.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&def.language)
+        .with_context(|| format!("loading grammar for {}", def.spec.id))?;
+    let tree = parser
+        .parse(source, None)
+        .with_context(|| format!("parsing {} source", def.spec.id))?;
+
+    let callee_idx = query
+        .capture_names()
+        .iter()
+        .position(|n| *n == "ref.callee")
+        .map(|i| i as u32);
+
+    let mut references = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            if Some(capture.index) != callee_idx {
+                continue;
+            }
+            let node = capture.node;
+            let symbol = source[node.byte_range()].split_whitespace().collect();
+            let line = node.start_position().row;
+            let snippet = source
+                .lines()
+                .nth(line)
+                .map(|l| l.trim())
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect();
+            references.push(RawReference {
+                callee_symbol: symbol,
+                call_snippet: snippet,
+                start_byte: node.start_byte(),
+                start_line: line + 1,
+            });
+        }
+    }
+    Ok(references)
+}
+
 fn capture_index(def: &LanguageDef, name: &str) -> Option<u32> {
     def.query
         .capture_names()
@@ -162,25 +225,104 @@ fn build_unit(
     ));
     let source_hash = sha256_hex(display_source);
     let normalized_body_hash = sha256_hex(&normalized);
+    let name = pending.name.unwrap_or_else(|| "<anonymous>".to_string());
+
+    let mut representations = vec![
+        Representation::new(
+            RepresentationKind::FullSource,
+            display_source,
+            source_hash.clone(),
+        ),
+        Representation::new(
+            RepresentationKind::Implementation,
+            embedding_text,
+            normalized_body_hash.clone(),
+        ),
+    ];
+
+    // Signature: the declaration up to the body — for a function, everything
+    // before the `{ ... }` block (params, return type, generics). Empty when
+    // there is no distinct body node (e.g. a bare closure body).
+    if let Some(body) = pending.body
+        && body.start_byte() > start_byte
+    {
+        let signature = source[start_byte..body.start_byte()].trim();
+        if !signature.is_empty() {
+            representations.push(Representation::new(
+                RepresentationKind::Signature,
+                signature,
+                sha256_hex(signature),
+            ));
+        }
+    }
+
+    // Documentation: the contiguous run of comment-node siblings immediately
+    // preceding the unit (doc comments in most languages sit right above the
+    // declaration). Stored raw — markers carry meaning for embedding.
+    if let Some(doc) = leading_documentation(def, source, node)
+        && !doc.is_empty()
+    {
+        representations.push(Representation::new(
+            RepresentationKind::Documentation,
+            doc.clone(),
+            sha256_hex(&doc),
+        ));
+    }
+
+    // Symbol: the qualified name, a short high-signal channel for
+    // name-oriented retrieval.
+    let symbol = match &scope {
+        Some(scope) => format!("{scope}.{name}"),
+        None => name.clone(),
+    };
+    representations.push(Representation::new(
+        RepresentationKind::Symbol,
+        symbol.clone(),
+        sha256_hex(&symbol),
+    ));
+
     Some(ExtractedEntity {
         language: LanguageId::from(def.spec.id.clone()),
         kind: EntityKind::from(pending.kind),
-        name: pending.name.unwrap_or_else(|| "<anonymous>".to_string()),
+        name,
         scope,
         span,
         body_span,
         body_node_count,
-        source_hash: source_hash.clone(),
-        normalized_body_hash: normalized_body_hash.clone(),
-        representations: vec![
-            Representation::new(RepresentationKind::FullSource, display_source, source_hash),
-            Representation::new(
-                RepresentationKind::Implementation,
-                embedding_text,
-                normalized_body_hash,
-            ),
-        ],
+        source_hash,
+        normalized_body_hash,
+        representations,
     })
+}
+
+/// The contiguous block of comment-node siblings directly above `node`, joined
+/// top-to-bottom. Used as the `Documentation` channel.
+fn leading_documentation(def: &LanguageDef, source: &str, node: Node<'_>) -> Option<String> {
+    let comment_kinds = &def.spec.comment_nodes;
+    if comment_kinds.is_empty() {
+        return None;
+    }
+    let mut comments: Vec<Range<usize>> = Vec::new();
+    let mut sibling = node.prev_sibling();
+    while let Some(current) = sibling {
+        if comment_kinds.iter().any(|kind| kind == current.kind()) {
+            comments.push(current.byte_range());
+            sibling = current.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    if comments.is_empty() {
+        return None;
+    }
+    comments.reverse();
+    let text = comments
+        .into_iter()
+        .map(|range| source[range].trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn count_named_nodes(node: Node<'_>) -> usize {

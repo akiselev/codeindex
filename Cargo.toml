@@ -8,6 +8,7 @@ members = [
     "crates/query",
     "crates/search",
     "crates/sqlite",
+    "crates/storage",
     "crates/tree-sitter",
 ]
 
