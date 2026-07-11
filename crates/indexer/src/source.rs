@@ -6,6 +6,7 @@ use codeindex_source::{
     DocumentId, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,
 };
 
+pub use codeindex_source::SourceWorkspace as SourceProvider;
 pub use codeindex_source::{
     ContentHash, DocumentDescriptor, DocumentIter, DocumentLocation, DocumentMetadata,
     DocumentQuery, DocumentVersion, LanguageHint, MemoryWorkspace, OverlayWorkspace,
@@ -13,7 +14,6 @@ pub use codeindex_source::{
     SourceContent, SourceError, SourceKind, SourceRootId, WorkspaceDescriptor, WorkspaceId,
     validate_snapshot,
 };
-pub use codeindex_source::SourceWorkspace as SourceProvider;
 pub use codeindex_source_fs::{FilesystemWorkspace, FilesystemWorkspaceBuilder};
 
 pub type FileSystemSource = FilesystemWorkspace;
@@ -41,11 +41,7 @@ impl<'a> SourceProviderCatalog<'a> {
         Self::default()
     }
 
-    pub fn insert(
-        &mut self,
-        project_label: impl Into<String>,
-        workspace: &'a dyn SourceWorkspace,
-    ) {
+    pub fn insert(&mut self, project_label: impl Into<String>, workspace: &'a dyn SourceWorkspace) {
         self.providers
             .insert(project_label.into(), CatalogEntry::Workspace(workspace));
     }
