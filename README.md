@@ -119,9 +119,12 @@ which is the intended shape for unsaved editor buffers over filesystem or Git
 content. Database, object-store, Git-tree, archive, and notebook integrations can
 implement the dependency-light `codeindex-source` traits directly.
 
-Providers expose stable document identities, logical paths, opaque revisions,
-and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
-and editor-overlay providers can reuse the same indexing pipeline.
+Workspaces expose stable document identities, logical paths, revisions, coherent
+snapshots, and optional bounded change feeds. The indexer persists provider
+checkpoints and consumes complete deltas when available, falling back to a full
+reconciliation when a checkpoint expires. Indexed source is retained in a
+deduplicated content-addressed cache so minimal/report representations can be
+reconstructed after the original snapshot disappears.
 
 ## Representations
 

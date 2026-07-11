@@ -228,6 +228,7 @@ pub enum SourceErrorKind {
     Unavailable,
     InvalidData,
     Unsupported,
+    CheckpointExpired,
     Other,
 }
 
@@ -299,6 +300,12 @@ pub type DocumentIter<'a> =
     Box<dyn Iterator<Item = Result<DocumentDescriptor, SourceError>> + Send + 'a>;
 pub type ChangeIter<'a> = Box<dyn Iterator<Item = Result<SourceChange, SourceError>> + Send + 'a>;
 
+pub struct SourceDelta<'a> {
+    pub from: SourceCheckpoint,
+    pub to: SourceCheckpoint,
+    pub changes: ChangeIter<'a>,
+}
+
 pub trait SourceSnapshot: Send + Sync {
     fn id(&self) -> &SnapshotId;
 
@@ -368,11 +375,15 @@ pub trait SourceWorkspace: Send + Sync {
         request: &SnapshotRequest,
     ) -> Result<Arc<dyn SourceSnapshot>, SourceError>;
 
-    fn changes_since<'a>(
+    /// Return a complete change sequence bounded by two checkpoints.
+    /// Implementations must return every change in `(from, to]`, or report that
+    /// the checkpoint expired so the caller can perform a full reconciliation.
+    fn changes_between<'a>(
         &'a self,
-        _checkpoint: &'a SourceCheckpoint,
+        _from: &'a SourceCheckpoint,
+        _to: &'a SourceCheckpoint,
         _query: &'a DocumentQuery,
-    ) -> Result<Option<ChangeIter<'a>>, SourceError> {
+    ) -> Result<Option<SourceDelta<'a>>, SourceError> {
         Ok(None)
     }
 }
@@ -387,6 +398,7 @@ struct MemoryWorkspaceInner {
     root: SourceRootId,
     sequence: AtomicU64,
     documents: RwLock<BTreeMap<DocumentId, MemoryDocument>>,
+    changes: RwLock<Vec<(u64, SourceChange)>>,
 }
 
 #[derive(Clone)]
@@ -409,6 +421,7 @@ impl MemoryWorkspace {
                 root: SourceRootId::new("root"),
                 sequence: AtomicU64::new(0),
                 documents: RwLock::new(BTreeMap::new()),
+                changes: RwLock::new(Vec::new()),
             }),
         }
     }
@@ -471,17 +484,38 @@ impl MemoryWorkspace {
             .documents
             .write()
             .expect("memory workspace lock poisoned")
-            .insert(id.clone(), MemoryDocument { descriptor, bytes });
+            .insert(
+                id.clone(),
+                MemoryDocument {
+                    descriptor: descriptor.clone(),
+                    bytes,
+                },
+            );
+        self.inner
+            .changes
+            .write()
+            .expect("memory workspace change log lock poisoned")
+            .push((sequence, SourceChange::Upsert(descriptor)));
         id
     }
 
     pub fn remove(&self, id: &DocumentId) -> bool {
-        self.inner
+        let removed = self
+            .inner
             .documents
             .write()
             .expect("memory workspace lock poisoned")
             .remove(id)
-            .is_some()
+            .is_some();
+        if removed {
+            let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            self.inner
+                .changes
+                .write()
+                .expect("memory workspace change log lock poisoned")
+                .push((sequence, SourceChange::Remove(id.clone())));
+        }
+        removed
     }
 
     pub fn move_document(
@@ -498,6 +532,22 @@ impl MemoryWorkspace {
         document.descriptor.location.logical_path = logical_path.into();
         let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         document.descriptor.version.token = RevisionToken::new(format!("memory:{sequence}"));
+        let change = SourceChange::Move {
+            id: id.clone(),
+            new_location: document.descriptor.location.clone(),
+            version: document.descriptor.version.clone(),
+        };
+        drop(documents);
+        self.inner
+            .changes
+            .write()
+            .map_err(|_| {
+                SourceError::new(
+                    SourceErrorKind::Other,
+                    "memory workspace change log lock poisoned",
+                )
+            })?
+            .push((sequence, change));
         Ok(())
     }
 }
@@ -512,7 +562,7 @@ impl SourceWorkspace for MemoryWorkspace {
             streaming_enumeration: true,
             batch_read: true,
             exact_revision_reads: true,
-            change_feed: false,
+            change_feed: true,
         }
     }
 
@@ -540,6 +590,63 @@ impl SourceWorkspace for MemoryWorkspace {
             checkpoint,
         }))
     }
+
+    fn changes_between<'a>(
+        &'a self,
+        from: &'a SourceCheckpoint,
+        to: &'a SourceCheckpoint,
+        query: &'a DocumentQuery,
+    ) -> Result<Option<SourceDelta<'a>>, SourceError> {
+        let from_sequence = checkpoint_sequence(from, &self.inner.descriptor.id)?;
+        let to_sequence = checkpoint_sequence(to, &self.inner.descriptor.id)?;
+        let current = self.inner.sequence.load(Ordering::SeqCst);
+        if from_sequence > to_sequence || to_sequence > current {
+            return Err(SourceError::new(
+                SourceErrorKind::CheckpointExpired,
+                format!(
+                    "memory checkpoint range {from_sequence}..={to_sequence} is unavailable at {current}"
+                ),
+            ));
+        }
+        let changes = self
+            .inner
+            .changes
+            .read()
+            .map_err(|_| {
+                SourceError::new(
+                    SourceErrorKind::Other,
+                    "memory workspace change log lock poisoned",
+                )
+            })?
+            .iter()
+            .filter(|(sequence, _)| *sequence > from_sequence && *sequence <= to_sequence)
+            .filter_map(|(_, change)| match change {
+                SourceChange::Upsert(document) if !query.matches(document) => None,
+                _ => Some(Ok(change.clone())),
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(SourceDelta {
+            from: from.clone(),
+            to: to.clone(),
+            changes: Box::new(changes.into_iter()),
+        }))
+    }
+}
+
+fn checkpoint_sequence(
+    checkpoint: &SourceCheckpoint,
+    workspace: &WorkspaceId,
+) -> Result<u64, SourceError> {
+    if &checkpoint.workspace != workspace {
+        return Err(SourceError::invalid(format!(
+            "checkpoint belongs to workspace {}, expected {workspace}",
+            checkpoint.workspace
+        )));
+    }
+    let bytes: [u8; 8] = checkpoint.token.as_ref().try_into().map_err(|_| {
+        SourceError::invalid("memory workspace checkpoint must contain an eight-byte sequence")
+    })?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 struct MemorySnapshot {

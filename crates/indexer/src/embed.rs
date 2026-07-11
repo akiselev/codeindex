@@ -311,18 +311,26 @@ fn recover_channel_texts(
     let registry = LanguageRegistry::global();
     let mut recovered = HashMap::new();
     for location in locations {
-        let source = if let Some(catalog) = sources {
-            catalog.read(
-                &location.project_label,
-                &location.source_document_id,
-                &location.relative_path,
-                &location.language_id,
-            )?
-        } else {
-            let path = std::path::Path::new(&location.source_dir).join(&location.relative_path);
-            std::fs::read_to_string(path).ok()
-        };
+        let source =
+            if let Some(blob) = db.get_source_blob(&location.source_hash)? {
+                Some(String::from_utf8(blob.content).with_context(|| {
+                    format!("cached source {} is not UTF-8", location.source_hash)
+                })?)
+            } else if let Some(catalog) = sources {
+                catalog.read(
+                    &location.project_label,
+                    &location.source_document_id,
+                    &location.source_revision,
+                )?
+            } else {
+                None
+            };
         let Some(source) = source else { continue };
+        anyhow::ensure!(
+            codeindex_tree_sitter::normalizer::sha256_hex(&source) == location.source_hash,
+            "source cache hash mismatch for {}",
+            location.source_document_id
+        );
         let def = registry
             .get(&location.language_id)
             .with_context(|| format!("unknown language {}", location.language_id))?;

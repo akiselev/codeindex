@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-/// Schema epoch. Version 1 was the pre-space M4 prototype; it is intentionally
-/// rejected rather than migrated because the project remains pre-release.
-pub const SCHEMA_VERSION: i64 = 2;
+/// Schema epoch. Earlier pre-release layouts are intentionally rejected rather
+/// than migrated. Version 3 adds provider checkpoints and durable source blobs.
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE metadata(
@@ -25,6 +25,13 @@ CREATE TABLE projects(
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE project_source_checkpoints(
+  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  checkpoint BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE files(
   id INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -39,6 +46,14 @@ CREATE TABLE files(
   UNIQUE (project_id, relative_path)
 );
 CREATE INDEX idx_files_source_hash ON files(source_hash);
+
+CREATE TABLE source_blobs(
+  source_hash TEXT PRIMARY KEY,
+  content BLOB NOT NULL,
+  encoding_hint TEXT,
+  size INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 
 CREATE TABLE entities(
   entity_id        TEXT PRIMARY KEY,

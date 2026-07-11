@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codeindex_source::{
-    DocumentId, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,
+    DocumentId, RevisionToken, SnapshotRequest, SourceSnapshot, SourceWorkspace,
 };
 
 pub use codeindex_source::SourceWorkspace as SourceProvider;
 pub use codeindex_source::{
     ContentHash, DocumentDescriptor, DocumentIter, DocumentLocation, DocumentMetadata,
     DocumentQuery, DocumentVersion, LanguageHint, MemoryWorkspace, OverlayWorkspace,
-    RevisionGuarantee, SnapshotConsistency, SnapshotId, SourceCapabilities, SourceCheckpoint,
-    SourceContent, SourceError, SourceKind, SourceRootId, WorkspaceDescriptor, WorkspaceId,
-    validate_snapshot,
+    RevisionGuarantee, SnapshotConsistency, SnapshotId, SourceCapabilities, SourceChange,
+    SourceCheckpoint, SourceContent, SourceDelta, SourceError, SourceErrorKind, SourceKind,
+    SourceRootId, WorkspaceDescriptor, WorkspaceId, validate_snapshot,
 };
 pub use codeindex_source_fs::{FilesystemWorkspace, FilesystemWorkspaceBuilder};
 
@@ -59,8 +59,7 @@ impl<'a> SourceProviderCatalog<'a> {
         &self,
         project_label: &str,
         document_id: &str,
-        _relative_path: &str,
-        _language_id: &str,
+        revision: &str,
     ) -> Result<Option<String>> {
         let Some(entry) = self.providers.get(project_label) else {
             return Ok(None);
@@ -72,10 +71,7 @@ impl<'a> SourceProviderCatalog<'a> {
             CatalogEntry::Snapshot(snapshot) => snapshot.clone(),
         };
         let id = DocumentId::new(document_id);
-        let Some(document) = snapshot.document(&id)? else {
-            return Ok(None);
-        };
-        let content = match snapshot.read(&document) {
+        let content = match snapshot.read_by_id(&id, &RevisionToken::new(revision)) {
             Ok(content) => content,
             Err(error)
                 if matches!(

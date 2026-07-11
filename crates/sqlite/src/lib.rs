@@ -33,8 +33,16 @@ pub struct HashLocation {
     pub project_label: String,
     pub source_dir: String,
     pub source_document_id: String,
+    pub source_revision: String,
+    pub source_hash: String,
     pub relative_path: String,
     pub language_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBlob {
+    pub content: Vec<u8>,
+    pub encoding_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +176,50 @@ impl Db {
             > 0)
     }
 
+    // ----- provider checkpoints -----
+
+    pub fn get_source_checkpoint(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT workspace_id, checkpoint FROM project_source_checkpoints \
+                 WHERE project_id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_source_checkpoint(
+        &self,
+        project_id: ProjectId,
+        workspace_id: &str,
+        checkpoint: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO project_source_checkpoints(
+                 project_id, workspace_id, checkpoint, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(project_id) DO UPDATE SET
+                 workspace_id = excluded.workspace_id,
+                 checkpoint = excluded.checkpoint,
+                 updated_at = excluded.updated_at",
+            params![project_id, workspace_id, checkpoint],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_source_checkpoint(&self, project_id: ProjectId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM project_source_checkpoints WHERE project_id = ?1",
+            [project_id],
+        )?;
+        Ok(())
+    }
+
     // ----- source documents -----
 
     pub fn get_file(
@@ -274,6 +326,56 @@ impl Db {
         self.conn
             .execute("DELETE FROM files WHERE id = ?1", [file_id])?;
         Ok(())
+    }
+
+    // ----- durable source cache -----
+
+    pub fn put_source_blob(
+        &self,
+        source_hash: &str,
+        content: &[u8],
+        encoding_hint: Option<&str>,
+    ) -> Result<()> {
+        if let Some(existing) = self.get_source_blob(source_hash)? {
+            anyhow::ensure!(
+                existing.content == content,
+                "source hash collision or corrupt source blob for {source_hash}"
+            );
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO source_blobs(
+                 source_hash, content, encoding_hint, size, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![source_hash, content, encoding_hint, content.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_source_blob(&self, source_hash: &str) -> Result<Option<SourceBlob>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content, encoding_hint FROM source_blobs WHERE source_hash = ?1",
+                [source_hash],
+                |row| {
+                    Ok(SourceBlob {
+                        content: row.get(0)?,
+                        encoding_hint: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn prune_orphan_source_blobs(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM source_blobs
+             WHERE NOT EXISTS (
+               SELECT 1 FROM files f WHERE f.source_hash = source_blobs.source_hash
+             )",
+            [],
+        )?)
     }
 
     // ----- units and representations -----
@@ -766,7 +868,8 @@ impl Db {
         hashes: &[String],
     ) -> Result<Vec<HashLocation>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT p.label, p.source_dir, f.source_document_id, f.relative_path, f.language_id
+            "SELECT p.label, p.source_dir, f.source_document_id, f.source_revision,
+                    f.source_hash, f.relative_path, f.language_id
              FROM representations r
              JOIN code_units u ON u.id = r.unit_id
              JOIN files f ON f.id = u.file_id
@@ -782,8 +885,10 @@ impl Db {
                         project_label: row.get(0)?,
                         source_dir: row.get(1)?,
                         source_document_id: row.get(2)?,
-                        relative_path: row.get(3)?,
-                        language_id: row.get(4)?,
+                        source_revision: row.get(3)?,
+                        source_hash: row.get(4)?,
+                        relative_path: row.get(5)?,
+                        language_id: row.get(6)?,
                     })
                 })
                 .optional()?;
