@@ -64,6 +64,11 @@ jobs:
           source = Path('crates/indexer/src/source.rs')
           text = source.read_text()
           text = text.replace(
+              '    DocumentId, RevisionToken, SnapshotRequest, SourceErrorKind, SourceSnapshot, SourceWorkspace,\n',
+              '    DocumentId, RevisionToken, SnapshotRequest, SourceSnapshot, SourceWorkspace,\n',
+              1,
+          )
+          text = text.replace(
               '    SourceContent, SourceError, SourceKind, SourceRootId, WorkspaceDescriptor, WorkspaceId,\n',
               '    SourceChange, SourceContent, SourceDelta, SourceError, SourceErrorKind, SourceKind,\n    SourceRootId, WorkspaceDescriptor, WorkspaceId,\n',
               1,
