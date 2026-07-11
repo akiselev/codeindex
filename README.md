@@ -1,7 +1,7 @@
 # codeindex
 
 A reusable Rust substrate for semantic code intelligence. `codeindex` accepts
-source from arbitrary providers, extracts parser-neutral entities and multiple
+source from arbitrary workspaces, extracts parser-neutral entities and multiple
 textual representations, projects those representations into independently
 modelled embedding spaces, persists them incrementally, and exposes structured
 search primitives. Local ONNX inference is supported, but consumers can provide
@@ -16,18 +16,23 @@ analysis applications are separate consumers.
 | Crate | Responsibility | Heavy dependencies |
 |---|---|---|
 | `codeindex-core` | Application-neutral entity, representation, provenance, model, and embedding-space vocabulary. | none |
+| `codeindex-source` | Typed workspace, snapshot, document, revision, checkpoint, capability, content, error, memory, and overlay contracts. | none |
+| `codeindex-source-fs` | Default filesystem workspace with ignore rules and revision-validated snapshot reads. | `ignore` |
 | `codeindex-tree-sitter` | Bundled grammars, declarative language definitions, entity extraction, normalization, and call-site capture. | Tree-sitter grammars |
 | `codeindex-storage` | Serializable `IndexSnapshot` contract between persistence backends and search. | none |
 | `codeindex-sqlite` | Default incremental store, schema, entity versions, representations, embedding spaces, vectors, and snapshot export. | bundled SQLite |
-| `codeindex-indexer` | Provider-neutral incremental indexing, representation enrichment, Usage synthesis, source recovery, and resumable embedding projection. | SQLite + grammars |
+| `codeindex-indexer` | Workspace-neutral incremental indexing, language resolution, representation enrichment, Usage synthesis, source recovery, and resumable embedding projection. | SQLite + grammars |
 | `codeindex-embedding` | Storage/parser-free `Embedder` trait, local ONNX backends, model management, batching, normalization, and token statistics. | fastembed/ort when enabled |
 | `codeindex-query` | Stable selectors, metadata filtering, model identity diagnostics, and deterministic ranking kernels. | none |
 | `codeindex-search` | Validated snapshot loading, per-space search, similarity search, and reciprocal-rank fusion across spaces. | none beyond embedding/query primitives |
-| `codeindex` | Thin facade re-exporting the eight component crates. | selected features |
+| `codeindex` | Thin facade re-exporting the component crates. | selected features |
 
 The major dependency boundaries are deliberate:
 
 ```text
+codeindex-source ──────────────→ std only
+  └── codeindex-source-fs      → ignore
+
 codeindex-core
   ├── codeindex-tree-sitter
   ├── codeindex-storage
@@ -36,27 +41,29 @@ codeindex-core
 codeindex-query ───────────────→ codeindex-core
 codeindex-sqlite ──────────────→ codeindex-core + codeindex-storage
 codeindex-search ──────────────→ core + storage + embedding + query
-codeindex-indexer ─────────────→ core + tree-sitter + sqlite + embedding
+codeindex-indexer ─────────────→ source + source-fs + core + tree-sitter + sqlite + embedding
 ```
 
 `codeindex-search` never touches SQLite. Any backend that can construct an
 `IndexSnapshot` can use the complete search layer. `codeindex-embedding` never
-pulls in SQLite or language grammars.
+pulls in SQLite or language grammars. Implementing a custom source workspace does
+not require either dependency.
 
-## Source providers
+## Source workspaces
 
 The compatibility `index()` function still indexes ordinary filesystem
 projects. The underlying operation is `index_sources()`, which accepts any
-`SourceProvider`:
+`SourceWorkspace` through a `SourceProject`:
 
 ```rust
 use codeindex::indexer::{
-    IndexSettings, MemorySource, RetentionMode, SourceProject, index_sources,
+    IndexSettings, MemoryWorkspace, RetentionMode, RevisionVerification,
+    SourceProject, index_sources,
 };
 use codeindex::sqlite;
 
 let db = sqlite::open_in_memory()?;
-let mut source = MemorySource::new("memory://workspace");
+let source = MemoryWorkspace::new("memory://workspace");
 source.insert(
     "src/lib.rs",
     "fn answer() -> i32 { 42 }",
@@ -67,21 +74,50 @@ let settings = IndexSettings {
     body_node_count_threshold: 1,
     max_body_chars: 10_000,
     retention: RetentionMode::Full,
+    revision_verification: RevisionVerification::Verified,
 };
 index_sources(
     &db,
     &settings,
     &[SourceProject {
         label: "main".into(),
-        provider: &source,
+        workspace: &source,
     }],
     None,
 )?;
 ```
 
-Providers expose stable document identities, logical paths, opaque revisions,
-and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
-and editor-overlay providers can reuse the same indexing pipeline.
+A workspace opens a `SourceSnapshot`. One indexing run enumerates and reads only
+through that snapshot, so a database transaction, Git commit, object-store
+version, archive, editor buffer set, or validated filesystem view can provide a
+coherent corpus. Snapshots expose:
+
+- stable `WorkspaceId`, `SnapshotId`, `DocumentId`, and `SourceRootId` values;
+- logical paths separate from provider identity and physical location;
+- strong content revisions or explicitly weak metadata hints;
+- streamed, fallible document enumeration;
+- direct and batched reads with observed revision metadata;
+- structured, retry-aware source errors;
+- optional checkpoints and change feeds;
+- declared consistency and capability levels.
+
+Language resolution belongs to the indexer. Providers return a `LanguageHint`
+such as a known language, file extension, media type, shebang, or unknown value.
+This supports extensionless database rows, virtual documents, notebooks, and
+future non-Tree-sitter frontends without coupling providers to the grammar
+registry.
+
+`RevisionVerification::Fast` trusts equal provider revision tokens. This is the
+default used by the filesystem convenience API. `RevisionVerification::Verified`
+reads and hashes documents when a provider marks its revision as a metadata hint.
+Strong revisions such as Git blob IDs, immutable row versions, and versioned
+object IDs are always eligible for a cheap skip.
+
+`MemoryWorkspace` creates immutable snapshots for tests, generated sources, and
+in-memory corpora. `OverlayWorkspace` composes an overlay over a base workspace,
+which is the intended shape for unsaved editor buffers over filesystem or Git
+content. Database, object-store, Git-tree, archive, and notebook integrations can
+implement the dependency-light `codeindex-source` traits directly.
 
 ## Representations
 
