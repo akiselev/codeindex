@@ -2,6 +2,7 @@ use codeindex_core::{
     EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, ExtractedEntity,
     RepresentationKind, RepresentationOrigin,
 };
+use serde::{Deserialize, Serialize};
 
 pub use codeindex_core::ModelIdentity;
 
@@ -18,6 +19,7 @@ pub struct Project {
     /// compatibility; values such as `memory://project` are valid.
     pub source_dir: String,
     pub role: Option<String>,
+    pub last_index_run_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +36,7 @@ pub struct FileRecord {
 }
 
 /// A new source document row before it has an id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewFile {
     pub project_id: ProjectId,
     pub source_document_id: String,
@@ -47,7 +49,7 @@ pub struct NewFile {
 }
 
 /// One representation channel to persist for a unit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewRepresentation {
     pub kind: RepresentationKind,
     pub content_hash: String,
@@ -76,7 +78,7 @@ pub struct CodeUnit {
 }
 
 /// A new code unit before it has an id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewCodeUnit {
     pub entity_id: EntityId,
     pub entity_version_id: EntityVersionId,
@@ -93,6 +95,27 @@ pub struct NewCodeUnit {
     pub source_hash: String,
     pub normalized_body_hash: String,
     pub representations: Vec<NewRepresentation>,
+}
+
+/// A reference captured while a document is staged. `caller_unit_ordinal`
+/// addresses the document payload rather than a not-yet-created live row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedReference {
+    pub caller_unit_ordinal: usize,
+    pub callee_symbol: String,
+    pub call_snippet: String,
+    pub start_line: i64,
+}
+
+/// Versioned, self-contained payload for one prospective live document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedDocumentPayload {
+    pub payload_schema_version: i64,
+    pub file: NewFile,
+    pub units: Vec<NewCodeUnit>,
+    pub references: Vec<StagedReference>,
+    pub input_fingerprint: String,
+    pub source_hash: String,
 }
 
 impl NewCodeUnit {

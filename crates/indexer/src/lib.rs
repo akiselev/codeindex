@@ -1,32 +1,42 @@
 #![forbid(unsafe_code)]
 
 mod embed;
+mod run;
 mod scanner;
 pub mod source;
+mod stage;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use codeindex_core::{
     EntityId, EntityVersionId, ExtractedEntity, Representation, RepresentationKind,
     RepresentationOrigin,
 };
-use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit, NewFile, NewReference, ProjectId};
+use codeindex_sqlite::{CodeUnit, Db, NewCodeUnit};
 use codeindex_tree_sitter::normalizer::{normalize_for_hash, sha256_hex};
-use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_references, extract_units};
 
+pub use codeindex_sqlite::index_publish::{IndexReport, ProjectIndexReport, PublishStep};
+pub use codeindex_sqlite::index_runs::{IndexRunPhase, IndexRunState, IndexRunStatus};
 pub use embed::{
     EmbedProgress, EmbedStats, LanguageTokens, embed_pending, embed_pending_with_progress,
     embed_space_pending, embed_space_pending_with_progress, find_or_create_model_id, token_report,
 };
+pub use run::{
+    CancellationToken, DocumentCheckpointStep, IndexOutcome, IndexPausedError, IndexProgress,
+    IndexRunBuilder, IndexRunFailure, RefreshMode, RefreshPolicy, ResumePolicy, RetryBackoff,
+    RetryPolicy, RevisionTrust,
+};
 pub use scanner::{ScannedFile, scan_files};
+use serde::{Deserialize, Serialize};
 pub use source::{
-    FileSystemSource, MemorySource, SourceDocument, SourceProject, SourceProvider,
-    SourceProviderCatalog, SourceRevision,
+    FileSystemSource, MemorySource, RevisionSemantics, SourceDocument, SourceProject,
+    SourceProvider, SourceProviderCatalog, SourceRevision, StableRead,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetentionMode {
     Full,
     Report,
@@ -52,7 +62,7 @@ pub struct ProjectSpec {
 }
 
 /// Provider-independent indexing settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSettings {
     pub enabled_languages: Vec<String>,
     pub body_node_count_threshold: usize,
@@ -84,12 +94,23 @@ impl IndexOptions {
 /// descriptions. Producers run after deterministic frontend representations are
 /// complete and before retention is applied.
 pub trait RepresentationEnricher: Send + Sync {
+    /// Stable producer/config identity used to decide whether staged work is
+    /// safe to reuse across process invocations.
+    fn identity(&self) -> EnricherIdentity;
+
     fn enrich(
         &self,
         document: &SourceDocument,
         source: &str,
         entity: &ExtractedEntity,
     ) -> Result<Vec<Representation>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnricherIdentity {
+    pub producer: String,
+    pub version: String,
+    pub config_fingerprint: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -148,158 +169,41 @@ pub fn index_sources_with_enrichers(
     only_label: Option<&str>,
     enrichers: &[&dyn RepresentationEnricher],
 ) -> Result<Vec<ProjectStats>> {
-    db.check_or_set_immutable(
-        "index.body_node_count_threshold",
-        &settings.body_node_count_threshold.to_string(),
-    )?;
-    db.check_or_set_immutable("index.retention", settings.retention.as_str())?;
-    db.check_or_set_immutable(
-        "embedding.max_body_chars",
-        &settings.max_body_chars.to_string(),
-    )?;
-
-    let generation = db.bump_generation()?;
-    let mut stats = Vec::new();
-    for project in projects {
-        if only_label.is_some_and(|label| project.label != label) {
-            continue;
-        }
-        stats.push(index_project(db, settings, project, generation, enrichers)?);
-    }
+    let selected: Vec<SourceProject<'_>> = projects
+        .iter()
+        .filter(|project| only_label.is_none_or(|label| project.label == label))
+        .map(|project| SourceProject {
+            label: project.label.clone(),
+            provider: project.provider,
+        })
+        .collect();
     if let Some(label) = only_label
-        && stats.is_empty()
+        && selected.is_empty()
     {
         anyhow::bail!("no configured project labeled {label:?}");
     }
-    db.prune_orphan_entities()?;
-    db.prune_orphan_embeddings()?;
-    Ok(stats)
+    let outcome = IndexRunBuilder::new(db, settings, &selected)
+        .with_enrichers(enrichers)
+        .run()?;
+    match outcome {
+        IndexOutcome::Committed(report) => Ok(report
+            .projects
+            .into_iter()
+            .map(|project| ProjectStats {
+                label: project.label,
+                indexed: project.indexed,
+                skipped: project.skipped,
+                removed: project.removed,
+                failed: 0,
+                units: project.units,
+                total_units: project.total_units,
+            })
+            .collect()),
+        IndexOutcome::Paused(status) => Err(IndexPausedError(status).into()),
+    }
 }
 
-fn index_project(
-    db: &Db,
-    settings: &IndexSettings,
-    project: &SourceProject<'_>,
-    generation: i64,
-    enrichers: &[&dyn RepresentationEnricher],
-) -> Result<ProjectStats> {
-    let project_id = db.upsert_project(&project.label, &project.provider.project_locator())?;
-    let enabled: HashSet<String> = settings.enabled_languages.iter().cloned().collect();
-    let documents = project.provider.documents(&enabled)?;
-    source::validate_documents(&documents)?;
-    let extraction = ExtractOptions {
-        body_node_count_threshold: settings.body_node_count_threshold,
-        max_body_chars: settings.max_body_chars,
-    };
-    let registry = LanguageRegistry::global();
-
-    let mut stats = ProjectStats {
-        label: project.label.clone(),
-        ..ProjectStats::default()
-    };
-    let mut seen = HashSet::with_capacity(documents.len());
-    let mut any_change = false;
-
-    for document in &documents {
-        seen.insert(document.id.clone());
-        let existing = db.get_file_by_source_id(project_id, &document.id)?;
-        let mtime_ns = document.revision.modified_ns.unwrap_or_default();
-        let size = document.revision.size.unwrap_or_default() as i64;
-
-        if existing.as_ref().is_some_and(|record| {
-            record.source_revision == document.revision.opaque
-                && record.relative_path == document.relative_path
-                && record.language_id == document.language_id
-        }) {
-            stats.skipped += 1;
-            continue;
-        }
-
-        let source = match project.provider.read(document) {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!(
-                    "failed to read {} from project {}: {error}",
-                    document.relative_path, project.label
-                );
-                stats.failed += 1;
-                continue;
-            }
-        };
-        let source_hash = sha256_hex(&source);
-        if let Some(record) = &existing
-            && record.source_hash == source_hash
-            && record.relative_path == document.relative_path
-            && record.language_id == document.language_id
-        {
-            db.update_file_meta(record.id, &document.revision.opaque, mtime_ns, size)?;
-            stats.skipped += 1;
-            continue;
-        }
-
-        let def = registry
-            .get(&document.language_id)
-            .with_context(|| format!("unknown language {}", document.language_id))?;
-        let mut entities = match extract_units(def, &source, &extraction) {
-            Ok(entities) => entities,
-            Err(error) => {
-                eprintln!("failed to parse {}: {error}", document.relative_path);
-                stats.failed += 1;
-                continue;
-            }
-        };
-        for entity in &mut entities {
-            complete_representations(&source, entity);
-            apply_enrichers(document, &source, entity, enrichers)?;
-        }
-        let references = extract_references(def, &source).unwrap_or_else(|error| {
-            eprintln!(
-                "failed to extract references from {}: {error}",
-                document.relative_path
-            );
-            Vec::new()
-        });
-
-        let prior = match &existing {
-            Some(record) => db.list_units_for_file(record.id)?,
-            None => Vec::new(),
-        };
-        let mut units = assign_identity(&project.label, &document.id, &prior, entities, generation);
-        apply_retention(&mut units, settings.retention);
-
-        let file_id = db.upsert_file(&NewFile {
-            project_id,
-            source_document_id: document.id.clone(),
-            source_revision: document.revision.opaque.clone(),
-            relative_path: document.relative_path.clone(),
-            language_id: document.language_id.clone(),
-            mtime_ns,
-            size,
-            source_hash,
-        })?;
-        let unit_ids = db.insert_units(file_id, &units)?;
-        stage_references(db, &units, &unit_ids, &references)?;
-        stats.indexed += 1;
-        stats.units += units.len();
-        any_change = true;
-    }
-
-    for record in db.list_files(project_id)? {
-        if !seen.contains(&record.source_document_id) {
-            db.delete_file(record.id)?;
-            stats.removed += 1;
-            any_change = true;
-        }
-    }
-
-    if any_change {
-        resolve_usage(db, project_id, settings.retention)?;
-    }
-    stats.total_units = db.count_units_for_project(project_id)? as usize;
-    Ok(stats)
-}
-
-fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
+pub(crate) fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
     if let Some(body_span) = entity.body_span {
         let body = source[body_span.start_byte..body_span.end_byte].to_string();
         let body_hash = sha256_hex(&normalize_for_hash(&body));
@@ -343,7 +247,7 @@ fn complete_representations(source: &str, entity: &mut ExtractedEntity) {
     }
 }
 
-fn apply_enrichers(
+pub(crate) fn apply_enrichers(
     document: &SourceDocument,
     source: &str,
     entity: &mut ExtractedEntity,
@@ -371,7 +275,7 @@ fn upsert_representation(representations: &mut Vec<Representation>, replacement:
 /// Assign logical identity by exact symbol first, then by a unique identical
 /// body. Ambiguous duplicate bodies deliberately mint new ids rather than
 /// guessing which historical entity survived.
-fn assign_identity(
+pub(crate) fn assign_identity(
     project_label: &str,
     source_document_id: &str,
     prior: &[CodeUnit],
@@ -456,7 +360,7 @@ fn mint_entity_id(
     EntityId::new(format!("ent:{}", &sha256_hex(&ingredients)[..16]))
 }
 
-fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
+pub(crate) fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
     for unit in units {
         for representation in &mut unit.representations {
             let extracted = matches!(
@@ -481,118 +385,6 @@ fn apply_retention(units: &mut [NewCodeUnit], retention: RetentionMode) {
             }
         }
     }
-}
-
-fn stage_references(
-    db: &Db,
-    units: &[NewCodeUnit],
-    unit_ids: &[i64],
-    references: &[codeindex_tree_sitter::RawReference],
-) -> Result<()> {
-    if references.is_empty() {
-        return Ok(());
-    }
-    let mut staged = Vec::new();
-    for reference in references {
-        let mut best: Option<usize> = None;
-        for (index, unit) in units.iter().enumerate() {
-            if unit.start_byte <= reference.start_byte && reference.start_byte < unit.end_byte {
-                match best {
-                    Some(previous) if units[previous].start_byte >= unit.start_byte => {}
-                    _ => best = Some(index),
-                }
-            }
-        }
-        let Some(index) = best else { continue };
-        staged.push(NewReference {
-            caller_unit_id: unit_ids[index],
-            callee_symbol: reference.callee_symbol.clone(),
-            call_snippet: reference.call_snippet.clone(),
-            start_line: reference.start_line as i64,
-        });
-    }
-    db.insert_references(&staged)
-}
-
-fn resolve_usage(db: &Db, project_id: ProjectId, _retention: RetentionMode) -> Result<()> {
-    db.clear_channel_for_project(project_id, &RepresentationKind::Usage)?;
-    let units = db.list_units_for_project(project_id)?;
-    if units.is_empty() {
-        return Ok(());
-    }
-    let mut definitions: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut qualified: HashMap<i64, String> = HashMap::new();
-    for unit in &units {
-        if let Some(name) = symbol_name(&unit.name) {
-            definitions.entry(name).or_default().push(unit.id);
-        }
-        qualified.insert(
-            unit.id,
-            match &unit.scope {
-                Some(scope) => format!("{scope}.{}", unit.name),
-                None => unit.name.clone(),
-            },
-        );
-    }
-
-    let references = db.references_for_project(project_id)?;
-    let mut usages: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-    for (caller_id, _, _, callee_symbol, snippet, _) in references {
-        let Some(name) = symbol_name(&callee_symbol) else {
-            continue;
-        };
-        let Some(callee_ids) = definitions.get(&name) else {
-            continue;
-        };
-        let caller = qualified
-            .get(&caller_id)
-            .cloned()
-            .unwrap_or_else(|| "?".to_string());
-        for &callee_id in callee_ids {
-            if callee_id != caller_id {
-                usages
-                    .entry(callee_id)
-                    .or_default()
-                    .insert(format!("{caller}: {snippet}"));
-            }
-        }
-    }
-
-    let origin = RepresentationOrigin::Derived {
-        producer: "codeindex-usage".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    for (unit_id, lines) in usages {
-        let text = lines.into_iter().collect::<Vec<_>>().join("\n");
-        db.set_representation_with_origin(
-            unit_id,
-            &RepresentationKind::Usage,
-            &sha256_hex(&text),
-            Some(&text),
-            &origin,
-        )?;
-    }
-    Ok(())
-}
-
-fn symbol_name(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('!');
-    let mut without_generics = String::with_capacity(trimmed.len());
-    let mut depth = 0usize;
-    for character in trimmed.chars() {
-        match character {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => without_generics.push(character),
-            _ => {}
-        }
-    }
-    let segment = without_generics
-        .rsplit(['.', ':'])
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    (!segment.is_empty() && segment != "<anonymous>").then(|| segment.to_string())
 }
 
 #[cfg(test)]

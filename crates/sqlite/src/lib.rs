@@ -1,3 +1,5 @@
+pub mod index_publish;
+pub mod index_runs;
 pub mod migrations;
 pub mod models;
 
@@ -16,8 +18,8 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 pub use models::{
     CodeUnit, EmbeddingModelRecord, EmbeddingSpaceRecord, FileId, FileRecord, ModelId,
-    ModelIdentity, NewCodeUnit, NewFile, NewRepresentation, Project, ProjectId, UnitId,
-    blob_to_vector, vector_to_blob,
+    ModelIdentity, NewCodeUnit, NewFile, NewRepresentation, Project, ProjectId,
+    StagedDocumentPayload, StagedReference, UnitId, blob_to_vector, vector_to_blob,
 };
 
 pub use codeindex_storage as storage;
@@ -115,12 +117,6 @@ impl Db {
             .unwrap_or(0))
     }
 
-    pub fn bump_generation(&self) -> Result<i64> {
-        let next = self.current_generation()? + 1;
-        self.set_setting("index.generation", &next.to_string())?;
-        Ok(next)
-    }
-
     // ----- projects -----
 
     pub fn upsert_project(&self, label: &str, source_dir: &str) -> Result<ProjectId> {
@@ -145,7 +141,8 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, label, source_dir, role FROM projects WHERE label = ?1",
+                "SELECT id, label, source_dir, role, last_index_run_id
+                 FROM projects WHERE label = ?1",
                 [label],
                 row_to_project,
             )
@@ -153,9 +150,10 @@ impl Db {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, label, source_dir, role FROM projects ORDER BY label")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, source_dir, role, last_index_run_id
+                 FROM projects ORDER BY label",
+        )?;
         Ok(stmt
             .query_map([], row_to_project)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -666,7 +664,12 @@ impl Db {
             .sqrt();
         self.conn.execute(
             "INSERT OR IGNORE INTO embeddings(space_id, content_hash, vector_blob, norm, created_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+             SELECT ?1, ?2, ?3, ?4, datetime('now')
+             WHERE EXISTS (
+               SELECT 1 FROM embedding_spaces s
+               JOIN representations r ON r.kind = s.channel
+               WHERE s.space_id = ?1 AND r.content_hash = ?2
+             )",
             params![space_id.as_str(), content_hash, vector_to_blob(vector), norm],
         )?;
         Ok(())
@@ -879,6 +882,23 @@ impl Db {
         project_labels: &[String],
         space_ids: &[EmbeddingSpaceId],
     ) -> Result<IndexSnapshot> {
+        // A deferred read transaction pins one SQLite snapshot across project,
+        // unit, representation, space, and vector queries. Publication may
+        // commit concurrently, but this export is entirely old or entirely new.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let snapshot = self.snapshot_with_spaces_in_transaction(project_labels, space_ids)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    fn snapshot_with_spaces_in_transaction(
+        &self,
+        project_labels: &[String],
+        space_ids: &[EmbeddingSpaceId],
+    ) -> Result<IndexSnapshot> {
         let all_projects = self.list_projects()?;
         let projects: Vec<Project> = if project_labels.is_empty() {
             all_projects
@@ -1023,12 +1043,14 @@ impl Db {
         }
 
         Ok(IndexSnapshot {
+            published_generation: self.current_generation()? as u64,
             projects: projects
                 .into_iter()
                 .map(|project| ProjectRecord {
                     label: project.label,
                     source_dir: project.source_dir,
                     role: project.role,
+                    last_index_run_id: project.last_index_run_id.map(|id| id as u64),
                 })
                 .collect(),
             units,
@@ -1043,6 +1065,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         label: row.get(1)?,
         source_dir: row.get(2)?,
         role: row.get(3)?,
+        last_index_run_id: row.get(4)?,
     })
 }
 
@@ -1178,5 +1201,67 @@ mod tests {
         conn.pragma_update(None, "user_version", 1).unwrap();
         let error = Db::from_connection(conn).unwrap_err().to_string();
         assert!(error.contains("schema version 1"));
+    }
+
+    #[test]
+    fn stale_embedding_insert_cannot_reintroduce_an_orphan_vector() {
+        let db = open_in_memory().unwrap();
+        let space = EmbeddingSpaceIdentity::new(
+            "code",
+            RepresentationKind::Implementation,
+            model("code", 2),
+        );
+        db.find_or_create_space(&space).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO projects(label, source_dir, created_at)
+                 VALUES ('main', 'memory://main', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let project_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO files(project_id, source_document_id, source_revision,
+                   relative_path, language_id, mtime_ns, size, source_hash)
+                 VALUES (?1, 'lib', 'r1', 'lib.rs', 'rust', 0, 1, 'source')",
+                [project_id],
+            )
+            .unwrap();
+        let file_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO entities(entity_id, project_id, kind, first_generation, last_generation)
+                 VALUES ('entity', ?1, 'function', 1, 1)",
+                [project_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO code_units(
+                   file_id, entity_id, entity_version_id, generation, language_id, kind,
+                   name, start_byte, end_byte, start_line, end_line, body_node_count,
+                   source_hash, normalized_body_hash)
+                 VALUES (?1, 'entity', 'version', 1, 'rust', 'function', 'f',
+                         0, 1, 1, 1, 1, 'source', 'body')",
+                [file_id],
+            )
+            .unwrap();
+        let unit_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO representations(unit_id, kind, content_hash, content, origin_json)
+                 VALUES (?1, 'implementation', 'content', 'x', '{}')",
+                [unit_id],
+            )
+            .unwrap();
+        // Simulate an embedder that discovered `content` immediately before a
+        // publication or GC removed the last representation using that hash.
+        db.conn
+            .execute("DELETE FROM representations WHERE unit_id = ?1", [unit_id])
+            .unwrap();
+        db.insert_embedding(&space.id, "content", &[1.0, 0.0])
+            .unwrap();
+        assert_eq!(db.count_embeddings(&space.id).unwrap(), 0);
     }
 }

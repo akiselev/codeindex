@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/codeindex",
+    "crates/cli",
     "crates/core",
     "crates/embedding",
     "crates/indexer",

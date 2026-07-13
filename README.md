@@ -7,9 +7,10 @@ modelled embedding spaces, persists them incrementally, and exposes structured
 search primitives. Local ONNX inference is supported, but consumers can provide
 any deterministic embedder.
 
-`codeindex` is the engine extracted from `decombine`. It is a library workspace;
-a future `codeindex-cli`, IDE integrations, agents, bindings, daemons, and
-analysis applications are separate consumers.
+`codeindex` is the engine extracted from `decombine`. The workspace is primarily
+a reusable library substrate. Its small `codeindex-cli` binary is the first
+consumer and intentionally delegates indexing state, refresh, resume, and
+publication to the library.
 
 ## Crates
 
@@ -24,6 +25,7 @@ analysis applications are separate consumers.
 | `codeindex-query` | Stable selectors, metadata filtering, model identity diagnostics, and deterministic ranking kernels. | none |
 | `codeindex-search` | Validated snapshot loading, per-space search, similarity search, and reciprocal-rank fusion across spaces. | none beyond embedding/query primitives |
 | `codeindex` | Thin facade re-exporting the eight component crates. | selected features |
+| `codeindex-cli` | Thin atomic index/resume/status/abandon command-line consumer. | SQLite + grammars |
 
 The major dependency boundaries are deliberate:
 
@@ -82,6 +84,17 @@ index_sources(
 Providers expose stable document identities, logical paths, opaque revisions,
 and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
 and editor-overlay providers can reuse the same indexing pipeline.
+
+Indexing is atomic for the complete selected project scope. Extraction and
+enrichment are checkpointed in a durable operational journal while queries keep
+seeing the prior generation. A no-change refresh barrier then publishes every
+selected project in one SQLite transaction. Interrupted runs automatically
+reuse compatible staged documents; advisory provider revisions are verified by
+content hash unless the caller explicitly opts into metadata trust.
+
+The compatibility functions above use `IndexRunBuilder` with automatic resume,
+refresh, and retry defaults. Applications that need cancellation, progress,
+explicit run selection, or restart behavior can use the builder directly.
 
 ## Representations
 
@@ -156,7 +169,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check -p codeindex --features fastembed
+cargo run -p codeindex-cli -- --help
 ```
 
-The database schema is pre-release. Incompatible schema epochs are rejected with
+The current database schema is epoch 3. It is pre-release; incompatible epochs are rejected with
 an explicit delete-and-reindex error rather than migrated.

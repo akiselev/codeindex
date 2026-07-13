@@ -20,6 +20,11 @@ implementation logic or depending on application-specific modules.
 - [x] Filter storage-neutral snapshots to selected-project vectors and validate
       snapshots on load.
 - [x] Reject the incompatible previous pre-release schema epoch.
+- [x] Add atomic multi-project publication, durable document checkpoints,
+      automatic source convergence, cancellation/resume, and transactional
+      snapshots.
+- [x] Add a thin CLI for index/resume/restart/status/abandon with versioned JSON
+      progress and result envelopes.
 - [x] CI: rustfmt, Clippy with warnings denied, workspace tests, and fastembed
       feature compile check.
 
@@ -40,7 +45,7 @@ implementation logic or depending on application-specific modules.
 - [ ] **Rustdoc coverage.** Document every public item and enable
       `#![deny(missing_docs)]` crate by crate.
 - [ ] **Getting-started rewrite.** Replace the pre-space workflow and document
-      delete/reindex behavior for schema epoch 2.
+      delete/reindex behavior for schema epoch 3.
 - [ ] **CHANGELOG and compatibility policy.** State schema, snapshot, and public
       Rust API guarantees for 0.x releases.
 - [ ] **Real backend smoke test.** Add a scheduled or manually triggered test that

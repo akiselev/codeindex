@@ -77,6 +77,41 @@ The indexer extracts multiple representations for each entity, including body,
 signature, symbol, documentation, and—where reference extraction is available—
 usage call sites.
 
+The call returns only after one atomic publication of every selected project.
+During extraction, queries continue to see the previous committed generation.
+If the process is interrupted, rerunning the same configuration automatically
+resumes compatible document checkpoints and refreshes changed files.
+
+For explicit progress and cancellation, use the builder:
+
+```rust
+use codeindex::indexer::{
+    CancellationToken, FileSystemSource, IndexOutcome, IndexRunBuilder,
+    SourceProject,
+};
+
+let cancellation = CancellationToken::new();
+let source = FileSystemSource::new("./src");
+let projects = [SourceProject {
+    label: "main".into(),
+    provider: &source,
+}];
+let settings = options.settings();
+let outcome = IndexRunBuilder::new(&db, &settings, &projects)
+    .with_cancellation(cancellation.clone())
+    .on_progress(&|event| eprintln!("{event:?}"))
+    .run()?;
+
+match outcome {
+    IndexOutcome::Committed(report) => println!("generation {}", report.generation),
+    IndexOutcome::Paused(status) => println!("resume run {}", status.run_id),
+}
+```
+
+`ResumePolicy::Auto` and content verification for advisory revisions are the
+defaults. `ResumePolicy::Run(id)`, `ResumePolicy::New`, and
+`RevisionTrust::TrustAdvisory` are explicit lower-level controls.
+
 ## 3. Index a custom source provider
 
 A provider does not need to emulate a filesystem. It exposes stable document
@@ -254,7 +289,26 @@ let fused = index.search_vectors_fused(
 Each fused hit preserves its rank, raw score, weight-derived contribution, and
 space id for explanation.
 
-## 9. Metadata filtering
+## 9. Command-line atomic indexing
+
+The CLI is a thin consumer of `IndexRunBuilder`:
+
+```sh
+cargo run -p codeindex-cli -- index \
+  --db ./codeindex.db \
+  --project main=./src \
+  --language rust
+
+cargo run -p codeindex-cli -- status --db ./codeindex.db
+```
+
+Use `--resume RUN_ID` to select a compatible run, `--restart` to supersede
+overlapping unfinished work, and the `abandon` or `supersede` subcommands for
+explicit lifecycle control. `--json` emits versioned JSON progress and result
+envelopes. SIGINT and SIGTERM take the graceful cancellation path and SIGINT
+returns exit code 130.
+
+## 10. Metadata filtering
 
 `WhereFilter` is independent of storage and embedding space:
 
@@ -271,6 +325,6 @@ Supported keys are `project`, `language`, `kind`, `name`, `scope`, `path`, and
 
 ## Schema compatibility
 
-The schema is pre-release. Databases from an incompatible epoch are rejected
+The schema is pre-release at epoch 3. Databases from an incompatible epoch are rejected
 with a delete-and-reindex message. This avoids accepting an old layout and
 failing later with unrelated SQL errors.

@@ -47,6 +47,13 @@ The default incremental store. It persists:
 - vectors keyed by `(space_id, content_hash)`;
 - staged call references and analysis provenance.
 
+It also owns the operational index-run journal. `index_runs`,
+`index_run_projects`, and `index_run_documents` are durable progress state and
+are never joined by search reads. Versioned per-document JSON payloads are the
+boundary between resumable processing and live publication. One
+`BEGIN IMMEDIATE` transaction validates the journal, applies delete-first live
+merges, rebuilds Usage, advances the generation, and marks the run committed.
+
 The schema is pre-release. Incompatible epochs are rejected and require a
 reindex rather than being silently accepted or partially migrated.
 
@@ -64,9 +71,15 @@ The indexer:
 4. completes `Body` and `BodyWithoutDeclaredName` channels;
 5. runs optional `RepresentationEnricher` implementations;
 6. carries logical entity identity across unambiguous edits and renames;
-7. persists units and representations;
-8. resolves call sites into the derived `Usage` channel;
-9. projects representation content into explicit embedding spaces.
+7. checkpoints a versioned document payload without mutating live tables;
+8. repeats a full manifest refresh until a barrier observes no changes;
+9. atomically publishes the complete selected scope and derives `Usage`;
+10. projects representation content into explicit embedding spaces separately.
+
+`IndexRunBuilder` defaults to compatible auto-resume and automatic convergence.
+Its cancellation token produces a durable paused outcome, and explicit policies
+select a run or supersede overlapping unfinished work. Provider/read/document
+errors prevent publication rather than being counted as partial success.
 
 `SourceProviderCatalog` supplies the same source abstraction during embedding
 text recovery under lean retention.
@@ -202,14 +215,20 @@ or input transform.
 SourceProvider
     │ enumerate/read
     ▼
-SourceDocument
+SourceDocument observations
+    │ stable read + content verification
+    ▼
+durable manifest
     │ Tree-sitter frontend + adapters
     ▼
 ExtractedEntity
     │ representation completion + enrichers + identity assignment
     ▼
-entities / code_units / representations
-    │ call-site resolution
+versioned staged document JSON
+    │ no-change refresh barrier
+    ▼
+one SQLite publish transaction
+    │ entities / code_units / representations + call-site resolution
     ├──────────────► Usage representation
     │
     │ embed_space_pending(space identity, embedder)
@@ -230,7 +249,14 @@ per-space search / similarity / rank fusion
 - **Stable semantic keys.** Model identities and embedding-space identities are
   persisted contracts, not display labels.
 - **Incremental by provider revision and content.** Equal revisions avoid reads;
-  changed revisions are verified with source hashes.
+  only for authoritative providers. Advisory revisions are verified with source
+  hashes by default.
+- **Atomic publication.** Processing never mutates search-visible tables; all
+  selected projects publish together or the prior generation remains intact.
+- **Durable resume.** At most the currently computed document is lost. Ready
+  payloads survive interruption and are selectively invalidated on refresh.
+- **Consistent reads.** Snapshot export pins one SQLite read transaction and
+  carries the published generation plus each project's last run identity.
 - **Content-addressed representations.** Embeddings survive reindexing whenever
   a representation's content hash remains present.
 - **Storage-neutral search.** Search validates public snapshot data and returns

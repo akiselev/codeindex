@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use codeindex_tree_sitter::LanguageRegistry;
+use serde::{Deserialize, Serialize};
 
 use crate::scanner::scan_files;
 
 /// Provider-defined revision metadata used for cheap change detection before
 /// source content is read and hashed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRevision {
     /// Opaque provider revision token. Equal tokens mean equal content only when
     /// the provider documents that guarantee; the indexer still hashes content
@@ -30,7 +32,7 @@ impl SourceRevision {
 }
 
 /// Metadata for one logical source document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDocument {
     /// Stable provider-local identity. It need not equal the display path.
     pub id: String,
@@ -41,6 +43,25 @@ pub struct SourceDocument {
     pub revision: SourceRevision,
 }
 
+/// Whether equality of provider revisions proves equality of source bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionSemantics {
+    Authoritative,
+    Advisory,
+}
+
+/// Result of a stable read. Mutable providers can ask the runner to refresh the
+/// manifest instead of turning an ordinary concurrent save into an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StableRead {
+    Content {
+        source: String,
+        revision: SourceRevision,
+    },
+    Changed,
+}
+
 /// Arbitrary source of source code. Implementations can read a filesystem,
 /// database, object store, Git tree, archive, editor overlay, or generated
 /// in-memory corpus.
@@ -49,11 +70,31 @@ pub trait SourceProvider: Send + Sync {
     /// default source recovery. It is not required to be a path.
     fn project_locator(&self) -> String;
 
+    /// Stable identity of this provider implementation/configuration. The
+    /// locator is a conservative default; providers with behavior-affecting
+    /// configuration should override it.
+    fn provider_fingerprint(&self) -> String {
+        self.project_locator()
+    }
+
+    fn revision_semantics(&self) -> RevisionSemantics {
+        RevisionSemantics::Advisory
+    }
+
     /// Enumerate enabled source documents in deterministic path order.
     fn documents(&self, enabled_languages: &HashSet<String>) -> Result<Vec<SourceDocument>>;
 
     /// Read one enumerated document as UTF-8 source.
     fn read(&self, document: &SourceDocument) -> Result<String>;
+
+    /// Read one observation. Providers that can change between enumeration and
+    /// read should return `Changed` when they detect that race.
+    fn stable_read(&self, document: &SourceDocument) -> Result<StableRead> {
+        Ok(StableRead::Content {
+            source: self.read(document)?,
+            revision: document.revision.clone(),
+        })
+    }
 }
 
 /// A labelled provider passed to [`crate::index_sources`].
@@ -145,6 +186,10 @@ impl SourceProvider for FileSystemSource {
         self.root.to_string_lossy().into_owned()
     }
 
+    fn provider_fingerprint(&self) -> String {
+        format!("{}\0{}", self.project_locator(), self.exclude.join("\0"))
+    }
+
     fn documents(&self, enabled_languages: &HashSet<String>) -> Result<Vec<SourceDocument>> {
         scan_files(&self.root, &self.exclude, enabled_languages)?
             .into_iter()
@@ -180,6 +225,37 @@ impl SourceProvider for FileSystemSource {
             )
         })
     }
+
+    fn stable_read(&self, document: &SourceDocument) -> Result<StableRead> {
+        let path = self.root.join(&document.relative_path);
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StableRead::Changed);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open {}", path.display()));
+            }
+        };
+        let before = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let mut source = String::new();
+        file.read_to_string(&mut source)
+            .with_context(|| format!("failed to read {} as UTF-8", path.display()))?;
+        let after = file
+            .metadata()
+            .with_context(|| format!("failed to restat {}", path.display()))?;
+        let before_revision = filesystem_revision(&before);
+        let after_revision = filesystem_revision(&after);
+        if before_revision != document.revision || before_revision != after_revision {
+            return Ok(StableRead::Changed);
+        }
+        Ok(StableRead::Content {
+            source,
+            revision: after_revision,
+        })
+    }
 }
 
 /// Small public provider useful for tests, generated sources, and editor
@@ -210,6 +286,10 @@ impl MemorySource {
 impl SourceProvider for MemorySource {
     fn project_locator(&self) -> String {
         self.locator.clone()
+    }
+
+    fn revision_semantics(&self) -> RevisionSemantics {
+        RevisionSemantics::Authoritative
     }
 
     fn documents(&self, enabled_languages: &HashSet<String>) -> Result<Vec<SourceDocument>> {
@@ -247,6 +327,20 @@ impl SourceProvider for MemorySource {
             .cloned()
             .or_else(|| self.documents.get(&document.relative_path).cloned())
             .with_context(|| format!("memory source has no document {:?}", document.id))
+    }
+}
+
+fn filesystem_revision(metadata: &std::fs::Metadata) -> SourceRevision {
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64);
+    let size = metadata.len();
+    SourceRevision {
+        opaque: format!("{}:{size}", modified_ns.unwrap_or_default()),
+        modified_ns,
+        size: Some(size),
     }
 }
 

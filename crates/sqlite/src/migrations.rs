@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-/// Schema epoch. Version 1 was the pre-space M4 prototype; it is intentionally
-/// rejected rather than migrated because the project remains pre-release.
-pub const SCHEMA_VERSION: i64 = 2;
+/// Schema epoch. Older pre-release prototypes are intentionally rejected rather
+/// than migrated.
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE metadata(
@@ -17,12 +17,81 @@ CREATE TABLE settings(
   value TEXT NOT NULL
 );
 
+-- Operational indexing state. These rows are durable progress, but are never
+-- joined by search or snapshot reads.
+CREATE TABLE index_runs(
+  id INTEGER PRIMARY KEY,
+  base_generation INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN
+    ('planning','running','ready','committed','paused','failed','superseded','abandoned')),
+  phase TEXT NOT NULL CHECK(phase IN
+    ('planning','refreshing','processing','ready','committed','paused','failed')),
+  pause_reason TEXT,
+  scope_json TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  config_fingerprint TEXT NOT NULL,
+  payload_schema_version INTEGER NOT NULL,
+  refresh_round INTEGER NOT NULL DEFAULT 0,
+  owner_token TEXT,
+  heartbeat_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  committed_at TEXT,
+  last_error_json TEXT,
+  stats_json TEXT NOT NULL
+);
+CREATE INDEX idx_index_runs_status_config
+  ON index_runs(status, config_fingerprint, id DESC);
+
+CREATE TABLE index_run_projects(
+  run_id INTEGER NOT NULL REFERENCES index_runs(id) ON DELETE CASCADE,
+  project_label TEXT NOT NULL,
+  provider_locator TEXT NOT NULL,
+  provider_fingerprint TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL DEFAULT '',
+  last_refresh_at TEXT,
+  stats_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY(run_id, project_label)
+);
+
+CREATE TABLE index_run_documents(
+  run_id INTEGER NOT NULL REFERENCES index_runs(id) ON DELETE CASCADE,
+  project_label TEXT NOT NULL,
+  source_document_id TEXT NOT NULL,
+  relative_path TEXT,
+  language_id TEXT,
+  source_revision_json TEXT,
+  observed_source_hash TEXT,
+  action TEXT NOT NULL CHECK(action IN ('unchanged','metadata','upsert','delete')),
+  state TEXT NOT NULL CHECK(state IN ('pending','processing','ready','error')),
+  input_fingerprint TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  reused INTEGER NOT NULL DEFAULT 0,
+  payload_schema_version INTEGER,
+  payload_json TEXT,
+  error_json TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(run_id, project_label, source_document_id),
+  FOREIGN KEY(run_id, project_label)
+    REFERENCES index_run_projects(run_id, project_label) ON DELETE CASCADE,
+  CHECK(
+    (action = 'upsert' AND state = 'ready' AND payload_json IS NOT NULL
+      AND payload_schema_version IS NOT NULL)
+    OR (action = 'delete' AND state = 'ready' AND payload_json IS NULL)
+    OR (action IN ('unchanged','metadata') AND state = 'ready' AND payload_json IS NULL)
+    OR (state IN ('pending','processing','error') AND payload_json IS NULL)
+  )
+);
+CREATE INDEX idx_index_run_documents_state
+  ON index_run_documents(run_id, state, project_label, source_document_id);
+
 CREATE TABLE projects(
   id INTEGER PRIMARY KEY,
   label TEXT NOT NULL UNIQUE,
   source_dir TEXT NOT NULL,
   role TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  last_index_run_id INTEGER REFERENCES index_runs(id)
 );
 
 CREATE TABLE files(
@@ -167,12 +236,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
              reindex."
         );
     }
-    conn.execute_batch(&format!("BEGIN;\n{SCHEMA}\nCOMMIT;"))
-        .context("applying initial schema")?;
-    conn.execute(
-        "INSERT INTO metadata(id, schema_version, created_at) VALUES (1, ?1, datetime('now'))",
-        [SCHEMA_VERSION],
-    )?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    conn.execute_batch(&format!(
+        "BEGIN;\n{SCHEMA}\n\
+         INSERT INTO metadata(id, schema_version, created_at) \
+         VALUES (1, {SCHEMA_VERSION}, datetime('now'));\n\
+         PRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+    ))
+    .context("applying initial schema")?;
     Ok(())
 }

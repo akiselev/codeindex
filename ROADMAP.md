@@ -32,11 +32,20 @@ Complete at the 0.1 foundation level:
 Current identity tracking is conservative and within one stable source document.
 Cross-document move tracking remains a later extension.
 
+### Atomic resumable indexing foundation
+
+Complete. Index processing now checkpoints a durable, refreshable manifest and
+versioned document payloads without touching live corpus tables. Compatible
+runs resume automatically, mutable sources converge through a no-change barrier,
+selected projects publish in one transaction, and snapshots use one read
+transaction. The initial CLI exposes this indexing/status lifecycle as a thin
+library consumer.
+
 ## Remaining milestones
 
-### M2 — `codeindex-cli`
+### M2 — remaining `codeindex-cli` surface
 
-Build a separate CLI consumer with `index`, `embed`, `query`, `search`,
+Extend the existing atomic `index`/status lifecycle consumer with `embed`, `query`, `search`,
 `similar`, `capabilities`, and model/source diagnostics. Machine output should
 use stable, versioned JSON envelopes. The CLI must contain presentation and
 orchestration only; indexing, embedding-space management, and search remain

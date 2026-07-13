@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 /// embedding spaces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexSnapshot {
+    /// Identity of the latest fully published indexing run.
+    #[serde(default)]
+    pub published_generation: u64,
     pub projects: Vec<ProjectRecord>,
     pub units: Vec<UnitRecord>,
     pub spaces: Vec<EmbeddingSpaceSnapshot>,
@@ -44,6 +47,9 @@ pub struct ProjectRecord {
     pub label: String,
     pub source_dir: String,
     pub role: Option<String>,
+    /// The run that most recently reconciled this project.
+    #[serde(default)]
+    pub last_index_run_id: Option<u64>,
 }
 
 /// One code unit: stable/version identity, location, and stored representations.
@@ -131,10 +137,12 @@ mod tests {
     #[test]
     fn snapshot_json_round_trips_multiple_spaces() {
         let snapshot = IndexSnapshot {
+            published_generation: 1,
             projects: vec![ProjectRecord {
                 label: "main".into(),
                 source_dir: "memory://fixture".into(),
                 role: None,
+                last_index_run_id: Some(1),
             }],
             units: vec![UnitRecord {
                 entity_id: EntityId::new("e1"),
