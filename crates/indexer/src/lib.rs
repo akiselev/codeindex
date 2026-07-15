@@ -520,6 +520,55 @@ mod tests {
     }
 
     #[test]
+    fn lexical_index_tracks_publication_and_deletion() {
+        let mut source = MemorySource::new("memory://lexical");
+        source.insert(
+            "flags.rs",
+            "fn parse_flags(input: &str) -> usize { let total = input.len(); total }",
+        );
+        source.insert(
+            "sum.rs",
+            "fn checksum(bytes: &[u8]) -> u32 { let mut acc = 0u32; acc += bytes.len() as u32; acc }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+
+        let hits = db.lexical_search("parse_flags input", 10).unwrap();
+        assert!(!hits.is_empty());
+        let snapshot = db.snapshot(&[]).unwrap();
+        let top = snapshot
+            .units
+            .iter()
+            .find(|unit| unit.entity_version_id == hits[0].entity_version_id)
+            .unwrap();
+        assert_eq!(top.name, "parse_flags");
+
+        // Code fragments with punctuation are safe FTS input.
+        assert!(
+            !db.lexical_search("acc += bytes.len() as u32", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Deleting the document removes its lexical rows.
+        source.remove("flags.rs");
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        let hits = db.lexical_search("parse_flags", 10).unwrap();
+        assert!(
+            hits.is_empty(),
+            "deleted document must leave no lexical rows"
+        );
+    }
+
+    #[test]
     fn body_and_name_erased_channels_are_materialized() {
         let mut source = MemorySource::new("memory://representations");
         source.insert(

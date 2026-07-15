@@ -29,6 +29,14 @@ pub struct Db {
     conn: Connection,
 }
 
+/// One BM25-ranked lexical hit, aligned to snapshot units by version id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LexicalHit {
+    pub entity_version_id: EntityVersionId,
+    pub project_label: String,
+    pub score: f64,
+}
+
 /// Where a representation can be re-derived from its source provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashLocation {
@@ -194,6 +202,11 @@ impl Db {
                     existing.id
                 ],
             )?;
+            self.conn.execute(
+                "DELETE FROM lexical_index WHERE rowid IN
+                   (SELECT id FROM code_units WHERE file_id = ?1)",
+                [existing.id],
+            )?;
             self.conn
                 .execute("DELETE FROM code_units WHERE file_id = ?1", [existing.id])?;
             return Ok(existing.id);
@@ -277,6 +290,23 @@ impl Db {
                     serde_json::to_string(&repr.origin)?,
                 ])?;
             }
+            let content = unit
+                .representations
+                .iter()
+                .find(|repr| repr.kind == RepresentationKind::Implementation)
+                .and_then(|repr| repr.content.as_deref())
+                .unwrap_or("");
+            self.conn.execute(
+                "INSERT INTO lexical_index(rowid, name, scope, path, content)
+                 SELECT ?1, ?2, ?3, relative_path, ?4 FROM files WHERE id = ?5",
+                params![
+                    unit_id,
+                    unit.name,
+                    unit.scope.as_deref().unwrap_or(""),
+                    content,
+                    file_id
+                ],
+            )?;
             ids.push(unit_id);
         }
         Ok(ids)
@@ -335,6 +365,43 @@ impl Db {
         )?;
         Ok(stmt
             .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ----- lexical retrieval -----
+
+    /// BM25-ranked lexical hits for free text. The query is reduced to
+    /// identifier-ish tokens (OR-combined), so raw user text and code
+    /// fragments are both safe FTS input. Scores are `-bm25` (higher is
+    /// better). Hits are keyed by `(project_label, entity_version_id)` for
+    /// alignment with snapshot units.
+    pub fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<LexicalHit>> {
+        let tokens: Vec<String> = query
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|token| token.len() >= 2)
+            .map(|token| format!("\"{token}\""))
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_expression = tokens.join(" OR ");
+        let mut stmt = self.conn.prepare(
+            "SELECT u.entity_version_id, p.label, bm25(lexical_index)
+             FROM lexical_index
+             JOIN code_units u ON u.id = lexical_index.rowid
+             JOIN files f ON f.id = u.file_id
+             JOIN projects p ON p.id = f.project_id
+             WHERE lexical_index MATCH ?1
+             ORDER BY rank LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![match_expression, limit as i64], |row| {
+                Ok(LexicalHit {
+                    entity_version_id: EntityVersionId::new(row.get::<_, String>(0)?),
+                    project_label: row.get(1)?,
+                    score: -row.get::<_, f64>(2)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 

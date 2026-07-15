@@ -54,6 +54,43 @@ pub fn unit_line(unit: &impl UnitView) -> String {
     )
 }
 
+/// Whether test entities participate in a query. Trivial test chunks
+/// dominate degraded rankings (see evals/2026-07-14-qwen3-scenarios.md), so
+/// consumers typically exclude them unless the intent is about tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestsPolicy {
+    Include,
+    Exclude,
+    Only,
+}
+
+/// Heuristic test detection over the extracted metadata: the frontend's
+/// `test` kind, the `tests` scope assigned to `cfg(test)` items,
+/// conventional test-file paths, and test-prefixed/suffixed names.
+pub fn looks_like_test(unit: &impl UnitView) -> bool {
+    if unit.kind() == "test" || unit.scope() == Some("tests") {
+        return true;
+    }
+    let path = unit.relative_path();
+    if path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.ends_with("_test.go")
+        || path.ends_with("_test.py")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".test.js")
+        || path.ends_with("_spec.rb")
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|file| file.starts_with("test_"))
+    {
+        return true;
+    }
+    let name = unit.name();
+    name.starts_with("test_") || name.ends_with("_test")
+}
+
 #[derive(Default)]
 pub struct WhereFilter {
     clauses: Vec<String>,
@@ -64,6 +101,7 @@ pub struct WhereFilter {
     scope: Vec<GlobMatcher>,
     path: Vec<GlobMatcher>,
     min_nodes: Option<usize>,
+    tests: Option<TestsPolicy>,
 }
 
 impl WhereFilter {
@@ -89,8 +127,16 @@ impl WhereFilter {
                             format!("min_nodes wants an integer, got {value:?}")
                         })?);
                 }
+                "tests" => {
+                    filter.tests = Some(match value {
+                        "include" => TestsPolicy::Include,
+                        "exclude" => TestsPolicy::Exclude,
+                        "only" => TestsPolicy::Only,
+                        other => bail!("tests wants include|exclude|only, got {other:?}"),
+                    });
+                }
                 _ => bail!(
-                    "unknown --where key {key:?} (supported: project, language, kind, name, scope, path, min_nodes)"
+                    "unknown --where key {key:?} (supported: project, language, kind, name, scope, path, min_nodes, tests)"
                 ),
             }
             filter.clauses.push(clause.to_owned());
@@ -117,6 +163,22 @@ impl WhereFilter {
             && self
                 .min_nodes
                 .is_none_or(|minimum| unit.body_node_count() >= minimum)
+            && match self.tests.unwrap_or(TestsPolicy::Include) {
+                TestsPolicy::Include => true,
+                TestsPolicy::Exclude => !looks_like_test(unit),
+                TestsPolicy::Only => looks_like_test(unit),
+            }
+    }
+
+    /// The explicit `tests=` clause, when one was given. Consumers apply
+    /// their own default (the CLI excludes tests) only when this is unset.
+    pub fn tests_policy(&self) -> Option<TestsPolicy> {
+        self.tests
+    }
+
+    /// Set the tests policy without an explicit `tests=` clause.
+    pub fn set_tests_policy(&mut self, policy: TestsPolicy) {
+        self.tests = Some(policy);
     }
 
     pub fn clauses(&self) -> &[String] {
@@ -161,6 +223,55 @@ pub fn rank_candidates<'a>(
             .then(left.index.cmp(&right.index))
     });
     scored
+}
+
+/// One retrieval source's ranked unit indices for fusion.
+pub struct RankedList {
+    /// Source label recorded in contributions (e.g. `dense`, `lexical`).
+    pub source: String,
+    pub weight: f32,
+    /// Unit indices, best first.
+    pub indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedIndex {
+    pub index: usize,
+    pub score: f32,
+    /// `(source, 1-based rank)` for every list that contributed.
+    pub contributions: Vec<(String, usize)>,
+}
+
+/// Weighted reciprocal-rank fusion across heterogeneous retrieval sources
+/// (dense spaces, lexical BM25, …). Ranks are combined — never raw scores,
+/// which are incomparable across sources. Deterministic: ties break by unit
+/// index.
+pub fn reciprocal_rank_fusion(lists: &[RankedList], rrf_k: usize) -> Vec<FusedIndex> {
+    let mut fused: std::collections::HashMap<usize, (f32, Vec<(String, usize)>)> =
+        std::collections::HashMap::new();
+    for list in lists {
+        for (zero_rank, &index) in list.indices.iter().enumerate() {
+            let rank = zero_rank + 1;
+            let entry = fused.entry(index).or_default();
+            entry.0 += list.weight / (rrf_k + rank) as f32;
+            entry.1.push((list.source.clone(), rank));
+        }
+    }
+    let mut hits: Vec<FusedIndex> = fused
+        .into_iter()
+        .map(|(index, (score, contributions))| FusedIndex {
+            index,
+            score,
+            contributions,
+        })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(left.index.cmp(&right.index))
+    });
+    hits
 }
 
 /// Field-by-field differences between two semantic model contracts, derived
@@ -258,6 +369,54 @@ mod tests {
                 .unwrap()
                 .matches(&value)
         );
+    }
+
+    #[test]
+    fn test_likeness_and_policy_filtering() {
+        let mut test_unit = unit("src/walk.rs");
+        test_unit.scope = Some("tests".into());
+        let plain = unit("src/walk.rs");
+        assert!(looks_like_test(&test_unit));
+        assert!(!looks_like_test(&plain));
+        let by_path = unit("tests/integration.rs");
+        assert!(looks_like_test(&by_path));
+
+        let mut filter = WhereFilter::parse(None).unwrap();
+        assert!(filter.matches(&test_unit), "default includes tests");
+        filter.set_tests_policy(TestsPolicy::Exclude);
+        assert!(!filter.matches(&test_unit));
+        assert!(filter.matches(&plain));
+
+        let only = WhereFilter::parse(Some("tests=only")).unwrap();
+        assert_eq!(only.tests_policy(), Some(TestsPolicy::Only));
+        assert!(only.matches(&test_unit));
+        assert!(!only.matches(&plain));
+    }
+
+    #[test]
+    fn rrf_fuses_ranked_lists_deterministically() {
+        let fused = reciprocal_rank_fusion(
+            &[
+                RankedList {
+                    source: "dense".into(),
+                    weight: 1.0,
+                    indices: vec![7, 3, 9],
+                },
+                RankedList {
+                    source: "lexical".into(),
+                    weight: 1.0,
+                    indices: vec![3, 11],
+                },
+            ],
+            60,
+        );
+        // 3 appears in both lists (ranks 2 and 1) and must win.
+        assert_eq!(fused[0].index, 3);
+        assert_eq!(fused[0].contributions.len(), 2);
+        // 7 (dense#1) beats 11 (lexical#2) and 9 (dense#3).
+        assert_eq!(fused[1].index, 7);
+        let expected = 1.0 / 62.0 + 1.0 / 61.0;
+        assert!((fused[0].score - expected).abs() < 1e-6);
     }
 
     #[test]

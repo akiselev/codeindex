@@ -118,6 +118,31 @@ struct SearchArgs {
     /// List the built-in task presets and exit.
     #[arg(long)]
     list_tasks: bool,
+    /// Include test entities. Excluded by default — trivial test chunks
+    /// dominate degraded rankings; an explicit `--where tests=` clause wins.
+    #[arg(long)]
+    include_tests: bool,
+    /// Retrieval mode. `hybrid` fuses the dense space with lexical BM25
+    /// (SQLite FTS5) via weighted reciprocal rank.
+    #[arg(long, value_enum, default_value_t = RetrievalArgument::Hybrid)]
+    retrieval: RetrievalArgument,
+    /// Rerank the top candidates with a cross-encoder (requires the
+    /// `candle` feature; downloads the reranker on first use).
+    #[arg(long)]
+    rerank: bool,
+    /// Reranker model reference.
+    #[arg(long, default_value = "hf:Qwen/Qwen3-Reranker-0.6B")]
+    rerank_model: String,
+    /// How many fused candidates the reranker judges.
+    #[arg(long, default_value_t = 12)]
+    rerank_candidates: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RetrievalArgument {
+    Hybrid,
+    Dense,
+    Lexical,
 }
 
 #[derive(Debug, Clone)]
@@ -449,8 +474,9 @@ struct EmbedResultOut {
 fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
     use codeindex_core::{EmbeddingSpaceId, EmbeddingTask};
     use codeindex_embedding::config::EmbeddingConfig;
-    use codeindex_query::WhereFilter;
+    use codeindex_query::{RankedList, TestsPolicy, WhereFilter, reciprocal_rank_fusion};
     use codeindex_search::SearchIndex;
+    use std::collections::HashMap;
 
     if arguments.list_tasks {
         for (id, instruction) in TASK_PRESETS {
@@ -473,7 +499,6 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         execution_provider: arguments.execution_provider.clone(),
         ..EmbeddingConfig::default()
     };
-    let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
 
     let task = match (&arguments.task, &arguments.instruction) {
         (Some(preset), _) => Some(EmbeddingTask::new(
@@ -497,25 +522,145 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         (None, None) => None,
     };
 
-    let filter = WhereFilter::parse(arguments.filter.as_deref())?;
+    let mut filter = WhereFilter::parse(arguments.filter.as_deref())?;
+    if filter.tests_policy().is_none() && !arguments.include_tests {
+        filter.set_tests_policy(TestsPolicy::Exclude);
+    }
     let index = SearchIndex::from_snapshot(db.snapshot(&[])?)?;
-    let results = index.search_text(
-        embedder.as_mut(),
-        &arguments.query,
-        task.as_ref(),
-        &space_id,
-        &filter,
-        arguments.limit,
-    )?;
 
-    let hits: Vec<SearchHitOut> = results
-        .hits
+    // First stage: dense and/or lexical candidate lists over one filter.
+    let candidates = (arguments.limit * 5).max(50);
+    let dense_indices: Vec<usize> = if arguments.retrieval == RetrievalArgument::Lexical {
+        Vec::new()
+    } else {
+        let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
+        index
+            .search_text(
+                embedder.as_mut(),
+                &arguments.query,
+                task.as_ref(),
+                &space_id,
+                &filter,
+                candidates,
+            )?
+            .hits
+            .iter()
+            .map(|hit| hit.index)
+            .collect()
+    };
+    let lexical_indices: Vec<usize> = if arguments.retrieval == RetrievalArgument::Dense {
+        Vec::new()
+    } else {
+        let by_version: HashMap<(&str, &str), usize> = index
+            .units
+            .iter()
+            .enumerate()
+            .map(|(position, unit)| {
+                (
+                    (unit.project_label.as_str(), unit.entity_version_id.as_str()),
+                    position,
+                )
+            })
+            .collect();
+        db.lexical_search(&arguments.query, candidates * 2)?
+            .iter()
+            .filter_map(|hit| {
+                by_version
+                    .get(&(hit.project_label.as_str(), hit.entity_version_id.as_str()))
+                    .copied()
+            })
+            .filter(|position| filter.matches(&index.units[*position]))
+            .take(candidates)
+            .collect()
+    };
+
+    let mut lists = Vec::new();
+    if !dense_indices.is_empty() {
+        lists.push(RankedList {
+            source: "dense".into(),
+            weight: 1.0,
+            indices: dense_indices,
+        });
+    }
+    if !lexical_indices.is_empty() {
+        lists.push(RankedList {
+            source: "lexical".into(),
+            weight: 1.0,
+            indices: lexical_indices,
+        });
+    }
+    // `mut` is exercised only by the cfg-gated rerank arm below.
+    #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
+    let mut fused = reciprocal_rank_fusion(&lists, 60);
+
+    // Second stage: cross-encoder judgement of the fused head.
+    #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
+    let mut rerank_scores: HashMap<usize, f32> = HashMap::new();
+    if arguments.rerank {
+        #[cfg(not(feature = "candle"))]
+        anyhow::bail!("--rerank needs the `candle` feature; rebuild with --features candle");
+        #[cfg(feature = "candle")]
+        {
+            use codeindex_embedding::rerank::{Qwen3Reranker, Reranker as _};
+            let head = arguments.rerank_candidates.min(fused.len());
+            let instruction = task
+                .as_ref()
+                .map(|task| task.instruction.clone())
+                .unwrap_or_else(|| {
+                    "Given a code search query, retrieve relevant code implementations".to_string()
+                });
+            let mut judged: Vec<(usize, &str)> = Vec::new();
+            for hit in fused.iter().take(head) {
+                let unit = &index.units[hit.index];
+                let text = unit
+                    .representations
+                    .iter()
+                    .find(|repr| repr.kind == codeindex_core::RepresentationKind::Implementation)
+                    .and_then(|repr| repr.content.as_deref())
+                    .or(unit.display_source.as_deref());
+                if let Some(text) = text {
+                    judged.push((hit.index, text));
+                }
+            }
+            if !judged.is_empty() {
+                let mut reranker = Qwen3Reranker::from_reference(&arguments.rerank_model, &config)?;
+                let documents: Vec<&str> = judged.iter().map(|(_, text)| *text).collect();
+                let scores = reranker.rerank(&instruction, &arguments.query, &documents)?;
+                for ((position, _), score) in judged.iter().zip(scores) {
+                    rerank_scores.insert(*position, score);
+                }
+                // Judged candidates re-sort by relevance; unjudged keep their
+                // fused order below them.
+                fused.sort_by(|left, right| {
+                    match (
+                        rerank_scores.get(&left.index),
+                        rerank_scores.get(&right.index),
+                    ) {
+                        (Some(a), Some(b)) => b.total_cmp(a),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => right.score.total_cmp(&left.score),
+                    }
+                });
+            }
+        }
+    }
+
+    let matched = fused.len();
+    let hits: Vec<SearchHitOut> = fused
         .iter()
+        .take(arguments.limit)
         .map(|hit| {
             let unit = &index.units[hit.index];
             SearchHitOut {
                 selector: codeindex_query::unit_id(unit),
-                score: hit.score,
+                score: rerank_scores.get(&hit.index).copied().unwrap_or(hit.score),
+                rerank_score: rerank_scores.get(&hit.index).copied(),
+                sources: hit
+                    .contributions
+                    .iter()
+                    .map(|(source, rank)| format!("{source}#{rank}"))
+                    .collect(),
                 project: unit.project_label.clone(),
                 path: unit.relative_path.clone(),
                 lines: [unit.start_line, unit.end_line],
@@ -533,7 +678,7 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
             query: arguments.query.clone(),
             space: arguments.space.clone(),
             task: task.clone(),
-            matched: results.matched,
+            matched,
             hits,
         },
     )?;
@@ -554,6 +699,10 @@ struct SearchResultsOut {
 struct SearchHitOut {
     selector: String,
     score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_score: Option<f32>,
+    /// `source#rank` contributions from each first-stage list.
+    sources: Vec<String>,
     project: String,
     path: String,
     lines: [usize; 2],

@@ -85,3 +85,39 @@ its indexing tests exposed a real codeindex bug — file deletions were
 silently ignored by the journal indexer (no Delete observations were ever
 synthesized) — fixed with a regression test in
 `Fix silent loss of file deletions in the journal indexer`.
+
+## Addendum 2026-07-15: follow-up features, live before/after
+
+Re-run of the weak scenarios after landing the no-tests default, FTS5+RRF
+hybrid retrieval, and the Qwen3-Reranker (`--rerank`):
+
+- **S12 pirate instruction + no-tests default**: before, all five hits were
+  3-7-line test asserts; after, zero trivial tests in top-5 (real code:
+  `scan`, `ensure_current_directory_exists`, regex helpers). Results remain
+  off-topic under the absurd instruction — as they should — but no longer
+  collapse onto low-information chunks.
+- **S09 Spanish + no-tests**: the correct function
+  (`ensure_use_hidden_option_for_leading_dot_pattern`) is now dense rank 1
+  (previously rank 2 behind a test). Nuance: hybrid fusion dilutes it to
+  fused #3, because Spanish tokens match nothing lexically — cross-lingual
+  queries argue for down-weighting the lexical list when token overlap with
+  the corpus is near zero.
+- **S03 pipe-color hybrid**: the misleading `gnu_ls` distractor (dense #1)
+  is gone from the hybrid top-5, and the usable uncolorized-print thread
+  ranks #2 with dense+lexical agreement. The deepest target
+  (`construct_config`'s ColorWhen::Auto decision) still doesn't surface —
+  it lives inside a 150-line config function; finer-grained chunking or
+  callHierarchy expansion is the remaining lever.
+- **S13 app-factory + rerank**: the reranker works exactly as promised
+  mechanically — the flat 0.48-0.44 band became a decisive 0.89 / 0.73 /
+  0.53 / 0.24 / 0.13 spread, and `FlaskGroup.__init__` (whose docstring
+  describes create_app factories) rose to #2. But the true target
+  (`find_best_app`) never entered the candidate set, and a reranker can
+  only reorder candidates: first-stage recall is now the limiting factor
+  for narrative queries.
+
+Net: the trivial-test failure mode is fixed, hybrid retrieval removes
+lexical-blind-spot distractors and adds per-source explainability, and the
+reranker delivers the score discrimination it was added for. Next lever by
+this data: candidate recall for narrative queries (query compression
+presets, relation-graph expansion of seeds).
