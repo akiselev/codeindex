@@ -305,6 +305,61 @@ impl SearchIndex {
         self.search_vector(&query, space_id, filter, limit)
     }
 
+    /// Expand seed units through analyzer relations (both directions, one
+    /// hop), returning newly reached unit indices in seed-major order.
+    /// This is a recall lever: first-stage retrieval finds *some* relevant
+    /// region, and the call graph pulls in the neighbors an agent needs —
+    /// including targets whose own text never matches the query.
+    pub fn expand_by_relations(&self, seeds: &[usize], limit: usize) -> Vec<usize> {
+        if self.relations.is_empty() || seeds.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let by_entity: HashMap<&str, usize> = self
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| (unit.entity_id.as_str(), index))
+            .collect();
+        let seed_set: std::collections::HashSet<usize> = seeds.iter().copied().collect();
+        // Neighbors rank by corroboration — how many seed edges (call sites)
+        // touch them — with ties broken by seed-major discovery order.
+        let mut edge_counts: HashMap<usize, usize> = HashMap::new();
+        let mut discovered = Vec::new();
+        for &seed in seeds {
+            let seed_entity = self.units[seed].entity_id.as_str();
+            for relation in &self.relations {
+                let neighbor = if relation.from_entity_id.as_str() == seed_entity {
+                    relation
+                        .to_entity_id
+                        .as_ref()
+                        .and_then(|id| by_entity.get(id.as_str()))
+                } else if relation
+                    .to_entity_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == seed_entity)
+                {
+                    by_entity.get(relation.from_entity_id.as_str())
+                } else {
+                    None
+                };
+                if let Some(&index) = neighbor
+                    && !seed_set.contains(&index)
+                {
+                    match edge_counts.get_mut(&index) {
+                        Some(count) => *count += 1,
+                        None => {
+                            edge_counts.insert(index, 1);
+                            discovered.push(index);
+                        }
+                    }
+                }
+            }
+        }
+        discovered.sort_by_key(|index| std::cmp::Reverse(edge_counts[index]));
+        discovered.truncate(limit);
+        discovered
+    }
+
     /// Filtered `(unit index, vector)` candidates of one space, optionally
     /// excluding a query unit.
     fn candidates<'a>(

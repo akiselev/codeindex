@@ -225,6 +225,48 @@ pub fn rank_candidates<'a>(
     scored
 }
 
+/// Function words dropped by [`compress_query`]. Deliberately small and
+/// English-only: the goal is shedding narrative filler, not linguistics.
+const QUERY_STOPWORDS: &[&str] = &[
+    "a", "about", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because",
+    "been", "being", "but", "by", "can", "could", "did", "do", "does", "doing", "for", "from",
+    "had", "has", "have", "having", "how", "i", "if", "in", "into", "is", "it", "its", "just",
+    "me", "my", "no", "not", "of", "on", "or", "our", "out", "over", "should", "so", "some",
+    "such", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "under", "up", "very", "want", "was", "we", "were", "what", "when", "where",
+    "which", "while", "who", "why", "will", "with", "would", "you", "your",
+];
+
+/// Compress a narrative query to its distinctive terms: strip function
+/// words, deduplicate while preserving order, cap the length. Long
+/// paragraph-style questions drown their salient terms in phrasing and
+/// drift dense retrieval toward generic chunks; the compressed form is
+/// fused *alongside* the original, never instead of it. Returns `None`
+/// when the query has fewer than `min_words` words or too few distinctive
+/// terms — compressing an already-compact query only discards signal.
+pub fn compress_query(query: &str, max_terms: usize, min_words: usize) -> Option<String> {
+    let words = query.split_whitespace().count();
+    if words < min_words {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let terms: Vec<&str> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|term| term.len() >= 3)
+        .filter(|term| !QUERY_STOPWORDS.contains(&term.to_lowercase().as_str()))
+        .filter(|term| seen.insert(term.to_lowercase()))
+        .take(max_terms)
+        .collect();
+    if terms.len() < 4 {
+        return None;
+    }
+    let compressed = terms.join(" ");
+    if compressed == query {
+        return None;
+    }
+    Some(compressed)
+}
+
 /// One retrieval source's ranked unit indices for fusion.
 pub struct RankedList {
     /// Source label recorded in contributions (e.g. `dense`, `lexical`).
@@ -391,6 +433,32 @@ mod tests {
         assert_eq!(only.tests_policy(), Some(TestsPolicy::Only));
         assert!(only.matches(&test_unit));
         assert!(!only.matches(&plain));
+    }
+
+    #[test]
+    fn narrative_queries_compress_to_distinctive_terms() {
+        let paragraph = "I am building a larger application and want to avoid a global \
+                         application object. The pattern I read about creates the application \
+                         inside a function so that configuration can be passed in, multiple \
+                         instances can exist for testing, and extensions get initialized \
+                         against whichever instance is current. Where is that implemented?";
+        let compressed = compress_query(paragraph, 16, 25).unwrap();
+        assert!(compressed.contains("application"));
+        assert!(!compressed.contains("factory"), "no invented terms");
+        assert!(!compressed.contains("the "), "stopwords stripped");
+        assert!(compressed.split_whitespace().count() <= 16);
+        // Compact queries stay untouched.
+        assert_eq!(compress_query("parse command line flags", 16, 25), None);
+        assert_eq!(
+            compress_query(
+                "walk the directory tree while respecting gitignore rules",
+                16,
+                25
+            ),
+            None
+        );
+        // `min_words: 0` (--compress always) still refuses no-op compression.
+        assert_eq!(compress_query("parse command line flags", 16, 0), None);
     }
 
     #[test]

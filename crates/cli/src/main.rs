@@ -136,6 +136,23 @@ struct SearchArgs {
     /// How many fused candidates the reranker judges.
     #[arg(long, default_value_t = 12)]
     rerank_candidates: usize,
+    /// Fuse a compressed variant of the query (function words stripped) as
+    /// an extra dense list. `auto` compresses only paragraph-length queries,
+    /// whose salient terms otherwise drown in narrative phrasing.
+    #[arg(long, value_enum, default_value_t = CompressArgument::Auto)]
+    compress: CompressArgument,
+    /// Disable relation-graph expansion. By default, when analyzer relations
+    /// are stored (`lsp-enrich`), 1-hop callers/callees of the top fused
+    /// seeds join the fusion as a low-weight `graph` list.
+    #[arg(long)]
+    no_graph: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompressArgument {
+    Auto,
+    Off,
+    Always,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -530,14 +547,18 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
 
     // First stage: dense and/or lexical candidate lists over one filter.
     let candidates = (arguments.limit * 5).max(50);
-    let dense_indices: Vec<usize> = if arguments.retrieval == RetrievalArgument::Lexical {
-        Vec::new()
+    let mut embedder = if arguments.retrieval == RetrievalArgument::Lexical {
+        None
     } else {
-        let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
-        index
+        Some(codeindex_embedding::embedder_from_config(&config)?)
+    };
+    let dense_hits = |embedder: &mut Box<dyn codeindex_embedding::embed::EmbeddingBackend>,
+                      text: &str|
+     -> Result<Vec<usize>> {
+        Ok(index
             .search_text(
                 embedder.as_mut(),
-                &arguments.query,
+                text,
                 task.as_ref(),
                 &space_id,
                 &filter,
@@ -546,7 +567,22 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
             .hits
             .iter()
             .map(|hit| hit.index)
-            .collect()
+            .collect())
+    };
+    let dense_indices: Vec<usize> = match embedder.as_mut() {
+        Some(embedder) => dense_hits(embedder, &arguments.query)?,
+        None => Vec::new(),
+    };
+    // A compressed variant recovers targets whose salient terms drown in
+    // narrative phrasing (evals S13); fused alongside, never instead.
+    let compressed_query = match arguments.compress {
+        CompressArgument::Off => None,
+        CompressArgument::Auto => codeindex_query::compress_query(&arguments.query, 24, 25),
+        CompressArgument::Always => codeindex_query::compress_query(&arguments.query, 24, 0),
+    };
+    let compressed_indices: Vec<usize> = match (embedder.as_mut(), compressed_query.as_deref()) {
+        (Some(embedder), Some(compressed)) => dense_hits(embedder, compressed)?,
+        _ => Vec::new(),
     };
     let lexical_indices: Vec<usize> = if arguments.retrieval == RetrievalArgument::Dense {
         Vec::new()
@@ -582,6 +618,13 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
             indices: dense_indices,
         });
     }
+    if !compressed_indices.is_empty() {
+        lists.push(RankedList {
+            source: "dense-compressed".into(),
+            weight: 0.7,
+            indices: compressed_indices,
+        });
+    }
     if !lexical_indices.is_empty() {
         lists.push(RankedList {
             source: "lexical".into(),
@@ -589,9 +632,27 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
             indices: lexical_indices,
         });
     }
-    // `mut` is exercised only by the cfg-gated rerank arm below.
-    #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
     let mut fused = reciprocal_rank_fusion(&lists, 60);
+
+    // Relation-graph expansion: 1-hop callers/callees of the top seeds join
+    // as a low-weight list and everything re-fuses. This reaches targets
+    // whose own text never matches the query.
+    if !arguments.no_graph && !index.relations.is_empty() && !fused.is_empty() {
+        let seeds: Vec<usize> = fused.iter().take(10).map(|hit| hit.index).collect();
+        let expanded: Vec<usize> = index
+            .expand_by_relations(&seeds, candidates)
+            .into_iter()
+            .filter(|position| filter.matches(&index.units[*position]))
+            .collect();
+        if !expanded.is_empty() {
+            lists.push(RankedList {
+                source: "graph".into(),
+                weight: 0.5,
+                indices: expanded,
+            });
+            fused = reciprocal_rank_fusion(&lists, 60);
+        }
+    }
 
     // Second stage: cross-encoder judgement of the fused head.
     #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
@@ -676,6 +737,7 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         "search",
         &SearchResultsOut {
             query: arguments.query.clone(),
+            compressed_query,
             space: arguments.space.clone(),
             task: task.clone(),
             matched,
@@ -688,6 +750,9 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
 #[derive(Debug, Serialize)]
 struct SearchResultsOut {
     query: String,
+    /// The compressed query variant fused in, when one was derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compressed_query: Option<String>,
     space: String,
     /// The exact task rendered into the query, for reproducibility.
     task: Option<codeindex_core::EmbeddingTask>,
