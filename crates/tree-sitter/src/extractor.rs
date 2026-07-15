@@ -193,9 +193,21 @@ fn build_unit(
         .map(|r| r.start.saturating_sub(start_byte)..r.end.saturating_sub(start_byte))
         .collect();
     collect_comment_ranges(node, &def.spec.comment_nodes, start_byte, &mut strip);
-    let embedding_text = strip_ranges(display_source, &strip);
+    let mut embedding_text = strip_ranges(display_source, &strip);
+    // Oversized bodies truncate rather than vanish: interpreter dispatch
+    // loops and generated builders are exactly the units agents ask about,
+    // and a dropped unit is invisible to every retrieval mode (measured:
+    // jq's `jq_next` was unfindable because it exceeded the cap). The
+    // normalized hash is computed over the truncated text so identity
+    // matches the stored representation.
+    if embedding_text.chars().count() > options.max_body_chars {
+        embedding_text = embedding_text
+            .chars()
+            .take(options.max_body_chars)
+            .collect();
+    }
     let normalized = normalize_for_hash(&embedding_text);
-    if normalized.is_empty() || embedding_text.chars().count() > options.max_body_chars {
+    if normalized.is_empty() {
         return None;
     }
     let scope = pending
@@ -578,5 +590,22 @@ fn negated() { do_it() }
                 .unwrap()
                 .contains("a + b")
         );
+    }
+
+    #[test]
+    fn oversized_bodies_truncate_instead_of_vanishing() {
+        let huge_body: String = (0..2000)
+            .map(|i| format!("    let variable_{i} = compute_{i}(input);\n"))
+            .collect();
+        let source = format!("fn interpreter_dispatch_loop(input: u32) {{\n{huge_body}}}\n");
+        let units = small_units("rust", &source);
+        let unit = units
+            .iter()
+            .find(|unit| unit.name == "interpreter_dispatch_loop")
+            .expect("oversized function must stay indexed");
+        let implementation = unit
+            .representation(&codeindex_core::RepresentationKind::Implementation)
+            .expect("implementation representation present");
+        assert!(implementation.content.chars().count() <= 10_000);
     }
 }

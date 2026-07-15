@@ -56,6 +56,10 @@ pub fn open_or_create(path: &Path) -> Result<Db> {
     }
     let conn = Connection::open(path)
         .with_context(|| format!("cannot open database {}", path.display()))?;
+    // The daemon era makes concurrent writers routine (a background embed
+    // job and an lsp-enrich pass on the same project database); without a
+    // busy timeout the second writer fails instantly with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     Db::from_connection(conn)
 }
 
