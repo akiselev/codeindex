@@ -119,10 +119,21 @@ pub fn enrich_project(
                 "position": {"line": line, "character": character},
             });
             // The first request may hit the server mid-load; retry until the
-            // workspace is ready rather than persisting an empty pass.
+            // workspace is ready rather than persisting an empty pass. Large
+            // workspaces on loaded machines take minutes, and an expired
+            // probe must be loud — a cold server answers every later request
+            // with null and the pass "succeeds" with zero enrichment.
             let hover = if first_request {
                 first_request = false;
-                retry_until_some(|| lsp.request("textDocument/hover", params.clone()), 120)?
+                let probe =
+                    retry_until_some(|| lsp.request("textDocument/hover", params.clone()), 600)?;
+                if probe.is_none() {
+                    eprintln!(
+                        "warning: language server gave no hover for the readiness probe within \
+                         5 minutes; it is likely still analyzing and enrichment will be empty"
+                    );
+                }
+                probe
             } else {
                 lsp.request("textDocument/hover", params.clone()).ok()
             };
