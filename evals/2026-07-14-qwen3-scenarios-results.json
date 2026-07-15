@@ -1,0 +1,1131 @@
+{
+ "S01a_walk_codesearch": {
+  "query": "walk the directory tree while respecting gitignore rules",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5256,
+    "name": "walker.run(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     444,
+     613
+    ]
+   },
+   {
+    "score": 0.5246,
+    "name": "build_walker",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     347,
+     404
+    ]
+   },
+   {
+    "score": 0.5156,
+    "name": "Box::new(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     459,
+     612
+    ]
+   },
+   {
+    "score": 0.4857,
+    "name": "should_ignore",
+    "path": "filetypes.rs",
+    "kind": "function",
+    "lines": [
+     21,
+     42
+    ]
+   },
+   {
+    "score": 0.457,
+    "name": "run",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     75,
+     112
+    ]
+   }
+  ]
+ },
+ "S01b_walk_editloc": {
+  "query": "walk the directory tree while respecting gitignore rules",
+  "task": "locate-edit-targets",
+  "instruction": "Given a software change request, retrieve code regions likely to require editing",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.4919,
+    "name": "build_walker",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     347,
+     404
+    ]
+   },
+   {
+    "score": 0.4891,
+    "name": "walker.run(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     444,
+     613
+    ]
+   },
+   {
+    "score": 0.4876,
+    "name": "Box::new(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     459,
+     612
+    ]
+   },
+   {
+    "score": 0.4872,
+    "name": "should_ignore",
+    "path": "filetypes.rs",
+    "kind": "function",
+    "lines": [
+     21,
+     42
+    ]
+   },
+   {
+    "score": 0.486,
+    "name": "search_str_no_base_dir_with_file_in_current_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     738,
+     743
+    ]
+   }
+  ]
+ },
+ "S01c_walk_analogues": {
+  "query": "walk the directory tree while respecting gitignore rules",
+  "task": "find-analogues",
+  "instruction": "Given a code fragment, retrieve functionally equivalent implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5439,
+    "name": "build_walker",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     347,
+     404
+    ]
+   },
+   {
+    "score": 0.5383,
+    "name": "walker.run(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     444,
+     613
+    ]
+   },
+   {
+    "score": 0.5323,
+    "name": "should_ignore",
+    "path": "filetypes.rs",
+    "kind": "function",
+    "lines": [
+     21,
+     42
+    ]
+   },
+   {
+    "score": 0.5191,
+    "name": "Box::new(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     459,
+     612
+    ]
+   },
+   {
+    "score": 0.4831,
+    "name": "search_str_no_base_dir_with_file_in_current_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     738,
+     743
+    ]
+   }
+  ]
+ },
+ "S02_dotpattern_issue": {
+  "query": "a search pattern starting with a literal dot should imply showing hidden files, but hidden files are still being skipped",
+  "task": "locate-edit-targets",
+  "instruction": "Given a software change request, retrieve code regions likely to require editing",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.7493,
+    "name": "ensure_use_hidden_option_for_leading_dot_pattern",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     521,
+     539
+    ]
+   },
+   {
+    "score": 0.5858,
+    "name": "search_str_for_entry_strips_dot_prefix",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     704,
+     710
+    ]
+   },
+   {
+    "score": 0.5738,
+    "name": "matches_strings_with_leading_dot_simple",
+    "path": "regex_helper.rs",
+    "kind": "function",
+    "lines": [
+     99,
+     105
+    ]
+   },
+   {
+    "score": 0.5625,
+    "name": "ensure_single_search_pattern_is_not_a_path",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     185,
+     216
+    ]
+   },
+   {
+    "score": 0.5566,
+    "name": "hir_matches_strings_with_leading_dot",
+    "path": "regex_helper.rs",
+    "kind": "function",
+    "lines": [
+     50,
+     79
+    ]
+   }
+  ]
+ },
+ "S03_pipe_color": {
+  "query": "why is colored output disabled when the output is piped to another command",
+  "task": "explain-behavior",
+  "instruction": "Given a question about repository behavior, retrieve code that provides evidence for the answer",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.6635,
+    "name": "gnu_ls",
+    "path": "main.rs",
+    "kind": "closure",
+    "lines": [
+     414,
+     429
+    ]
+   },
+   {
+    "score": 0.5175,
+    "name": "push",
+    "path": "exec/command.rs",
+    "kind": "function",
+    "lines": [
+     26,
+     28
+    ]
+   },
+   {
+    "score": 0.5159,
+    "name": "print_entry_uncolorized",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     168,
+     182
+    ]
+   },
+   {
+    "score": 0.5113,
+    "name": "strips_cr_output_forgery",
+    "path": "sanitize.rs",
+    "kind": "function",
+    "lines": [
+     88,
+     90
+    ]
+   },
+   {
+    "score": 0.4969,
+    "name": "print_entry_uncolorized_base",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     142,
+     156
+    ]
+   }
+  ]
+ },
+ "S04_channel_panic": {
+  "query": "thread panicked while sending on a closed channel during the parallel directory scan",
+  "task": "diagnose-failure",
+  "instruction": "Given a failure report, retrieve implementation, tests, configuration, and error-handling paths relevant to diagnosing it",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.4947,
+    "name": "spawn_senders",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     443,
+     614
+    ]
+   },
+   {
+    "score": 0.4409,
+    "name": "scan",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     617,
+     653
+    ]
+   },
+   {
+    "score": 0.4198,
+    "name": "poll",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     198,
+     249
+    ]
+   },
+   {
+    "score": 0.3874,
+    "name": "walker.run(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     444,
+     613
+    ]
+   },
+   {
+    "score": 0.3756,
+    "name": "ensure_single_search_pattern_is_not_a_path",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     185,
+     216
+    ]
+   }
+  ]
+ },
+ "S05a_args_fd": {
+  "query": "parse command line arguments into typed options",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.4616,
+    "name": "from_arg_matches",
+    "path": "cli.rs",
+    "kind": "function",
+    "lines": [
+     862,
+     874
+    ]
+   },
+   {
+    "score": 0.4602,
+    "name": "update_from_arg_matches",
+    "path": "cli.rs",
+    "kind": "function",
+    "lines": [
+     876,
+     879
+    ]
+   },
+   {
+    "score": 0.4462,
+    "name": "gnu_ls",
+    "path": "main.rs",
+    "kind": "closure",
+    "lines": [
+     414,
+     429
+    ]
+   }
+  ]
+ },
+ "S05b_args_flask": {
+  "query": "parse command line arguments into typed options",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5701,
+    "name": "parse_args",
+    "path": "flask/cli.py",
+    "kind": "function",
+    "lines": [
+     678,
+     688
+    ]
+   },
+   {
+    "score": 0.3938,
+    "name": "__init__",
+    "path": "flask/cli.py",
+    "kind": "function",
+    "lines": [
+     563,
+     598
+    ]
+   },
+   {
+    "score": 0.3874,
+    "name": "__init__",
+    "path": "flask/cli.py",
+    "kind": "function",
+    "lines": [
+     788,
+     789
+    ]
+   }
+  ]
+ },
+ "S06a_cookies_docs": {
+  "query": "how session cookies are signed and verified",
+  "task": "explain-behavior",
+  "instruction": "Given a question about repository behavior, retrieve code that provides evidence for the answer",
+  "space": "docs",
+  "hits": [
+   {
+    "score": 0.6684,
+    "name": "get_cookie_name",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     171,
+     173
+    ]
+   },
+   {
+    "score": 0.5842,
+    "name": "get_cookie_domain",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     175,
+     185
+    ]
+   },
+   {
+    "score": 0.5823,
+    "name": "should_set_cookie",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     233,
+     247
+    ]
+   },
+   {
+    "score": 0.5625,
+    "name": "get_cookie_secure",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     202,
+     206
+    ]
+   },
+   {
+    "score": 0.543,
+    "name": "get_cookie_samesite",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     208,
+     213
+    ]
+   }
+  ]
+ },
+ "S06b_cookies_code": {
+  "query": "how session cookies are signed and verified",
+  "task": "explain-behavior",
+  "instruction": "Given a question about repository behavior, retrieve code that provides evidence for the answer",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.6722,
+    "name": "open_session",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     323,
+     335
+    ]
+   },
+   {
+    "score": 0.609,
+    "name": "save_session",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     337,
+     385
+    ]
+   },
+   {
+    "score": 0.5715,
+    "name": "get_cookie_secure",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     202,
+     206
+    ]
+   },
+   {
+    "score": 0.5574,
+    "name": "get_cookie_samesite",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     208,
+     213
+    ]
+   },
+   {
+    "score": 0.5444,
+    "name": "should_set_cookie",
+    "path": "flask/sessions.py",
+    "kind": "function",
+    "lines": [
+     233,
+     247
+    ]
+   }
+  ]
+ },
+ "S07_identifier": {
+  "query": "make_response",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.777,
+    "name": "make_response",
+    "path": "flask/helpers.py",
+    "kind": "function",
+    "lines": [
+     151,
+     197
+    ]
+   },
+   {
+    "score": 0.6925,
+    "name": "make_response",
+    "path": "flask/app.py",
+    "kind": "function",
+    "lines": [
+     1224,
+     1364
+    ]
+   },
+   {
+    "score": 0.6508,
+    "name": "make_default_options_response",
+    "path": "flask/app.py",
+    "kind": "function",
+    "lines": [
+     1053,
+     1063
+    ]
+   },
+   {
+    "score": 0.6501,
+    "name": "jsonify",
+    "path": "flask/json/__init__.py",
+    "kind": "function",
+    "lines": [
+     138,
+     170
+    ]
+   },
+   {
+    "score": 0.6465,
+    "name": "response",
+    "path": "flask/json/provider.py",
+    "kind": "function",
+    "lines": [
+     89,
+     105
+    ]
+   }
+  ]
+ },
+ "S08_walk_256": {
+  "query": "walk the directory tree while respecting gitignore rules",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code256",
+  "hits": [
+   {
+    "score": 0.5521,
+    "name": "walker.run(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     444,
+     613
+    ]
+   },
+   {
+    "score": 0.552,
+    "name": "build_walker",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     347,
+     404
+    ]
+   },
+   {
+    "score": 0.5265,
+    "name": "Box::new(...)",
+    "path": "walk.rs",
+    "kind": "closure",
+    "lines": [
+     459,
+     612
+    ]
+   },
+   {
+    "score": 0.5107,
+    "name": "scan",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     617,
+     653
+    ]
+   },
+   {
+    "score": 0.5002,
+    "name": "run",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     75,
+     112
+    ]
+   }
+  ]
+ },
+ "S09_spanish": {
+  "query": "los archivos ocultos no se muestran en los resultados de busqueda",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5453,
+    "name": "search_str_no_base_dir_with_file_in_current_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     738,
+     743
+    ]
+   },
+   {
+    "score": 0.5395,
+    "name": "ensure_use_hidden_option_for_leading_dot_pattern",
+    "path": "main.rs",
+    "kind": "function",
+    "lines": [
+     521,
+     539
+    ]
+   },
+   {
+    "score": 0.5223,
+    "name": "search_str_for_entry_strips_dot_prefix",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     704,
+     710
+    ]
+   },
+   {
+    "score": 0.5187,
+    "name": "search_str_no_base_dir_with_plain_relative_path",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     730,
+     735
+    ]
+   },
+   {
+    "score": 0.5138,
+    "name": "search_str_no_base_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     722,
+     727
+    ]
+   }
+  ]
+ },
+ "S10_emoji": {
+  "query": "\ud83d\udc1b weird bug: file names print garbled on some terminals \ud83e\udd14 unicode?",
+  "task": "diagnose-failure",
+  "instruction": "Given a failure report, retrieve implementation, tests, configuration, and error-handling paths relevant to diagnosing it",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5675,
+    "name": "escape_preserves_information",
+    "path": "sanitize.rs",
+    "kind": "function",
+    "lines": [
+     115,
+     118
+    ]
+   },
+   {
+    "score": 0.5665,
+    "name": "keeps_legitimate_unicode_features",
+    "path": "sanitize.rs",
+    "kind": "function",
+    "lines": [
+     143,
+     156
+    ]
+   },
+   {
+    "score": 0.5612,
+    "name": "test_unicode_encoding",
+    "path": "hyperlink.rs",
+    "kind": "function",
+    "lines": [
+     81,
+     86
+    ]
+   },
+   {
+    "score": 0.5391,
+    "name": "strips_cr_output_forgery",
+    "path": "sanitize.rs",
+    "kind": "function",
+    "lines": [
+     88,
+     90
+    ]
+   },
+   {
+    "score": 0.5363,
+    "name": "preserves_safe_content",
+    "path": "sanitize.rs",
+    "kind": "function",
+    "lines": [
+     62,
+     77
+    ]
+   }
+  ]
+ },
+ "S11_code_as_query": {
+  "query": "fn process(entries: Receiver<DirEntry>) { for entry in entries { if matcher.is_match(entry.file_name()) { print_entry(&entry); } } }",
+  "task": "find-analogues",
+  "instruction": "Given a code fragment, retrieve functionally equivalent implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5712,
+    "name": "print_entry",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     17,
+     43
+    ]
+   },
+   {
+    "score": 0.5524,
+    "name": "print",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     252,
+     267
+    ]
+   },
+   {
+    "score": 0.5498,
+    "name": "print_entry_colorized",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     89,
+     139
+    ]
+   },
+   {
+    "score": 0.5387,
+    "name": "print_entry_uncolorized",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     168,
+     182
+    ]
+   },
+   {
+    "score": 0.5311,
+    "name": "print_entry_format",
+    "path": "output.rs",
+    "kind": "function",
+    "lines": [
+     69,
+     86
+    ]
+   }
+  ]
+ },
+ "S12_pirate": {
+  "query": "walk the directory tree while respecting gitignore rules",
+  "task": "custom",
+  "instruction": "You are a pirate. Only retrieve buried treasure, matey.",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.5604,
+    "name": "search_str_no_base_dir_with_file_in_current_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     738,
+     743
+    ]
+   },
+   {
+    "score": 0.5324,
+    "name": "strip_current_dir_basic",
+    "path": "filesystem.rs",
+    "kind": "function",
+    "lines": [
+     144,
+     155
+    ]
+   },
+   {
+    "score": 0.5215,
+    "name": "search_str_no_base_dir",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     722,
+     727
+    ]
+   },
+   {
+    "score": 0.4958,
+    "name": "search_str_no_base_dir_with_plain_relative_path",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     730,
+     735
+    ]
+   },
+   {
+    "score": 0.4837,
+    "name": "search_str_for_entry_strips_dot_prefix",
+    "path": "walk.rs",
+    "kind": "function",
+    "lines": [
+     704,
+     710
+    ]
+   }
+  ]
+ },
+ "S13_long_query": {
+  "query": "I am building a larger application and want to avoid a global application object. The pattern I read about creates the application inside a function so that configuration can be passed in, multiple instances can exist for testing, and extensions get initialized against whichever instance is current. Where is that implemented?",
+  "task": "explain-behavior",
+  "instruction": "Given a question about repository behavior, retrieve code that provides evidence for the answer",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.4802,
+    "name": "__init__",
+    "path": "flask/json/provider.py",
+    "kind": "function",
+    "lines": [
+     38,
+     39
+    ]
+   },
+   {
+    "score": 0.4786,
+    "name": "__init__",
+    "path": "flask/ctx.py",
+    "kind": "function",
+    "lines": [
+     300,
+     337
+    ]
+   },
+   {
+    "score": 0.4668,
+    "name": "__init__",
+    "path": "flask/templating.py",
+    "kind": "function",
+    "lines": [
+     42,
+     46
+    ]
+   },
+   {
+    "score": 0.4491,
+    "name": "__init__",
+    "path": "flask/sansio/app.py",
+    "kind": "function",
+    "lines": [
+     279,
+     408
+    ]
+   },
+   {
+    "score": 0.4438,
+    "name": "__init__",
+    "path": "flask/sansio/blueprints.py",
+    "kind": "function",
+    "lines": [
+     41,
+     85
+    ]
+   }
+  ]
+ },
+ "S14a_snapshot_types": {
+  "query": "function that loads an IndexSnapshot from the sqlite database",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "types",
+  "hits": [
+   {
+    "score": 0.7187,
+    "name": "from_snapshot",
+    "path": "search/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     153,
+     250
+    ]
+   },
+   {
+    "score": 0.6388,
+    "name": "snapshot_with_spaces_in_transaction",
+    "path": "sqlite/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     884,
+     1049
+    ]
+   },
+   {
+    "score": 0.6364,
+    "name": "snapshot_with_spaces",
+    "path": "sqlite/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     867,
+     882
+    ]
+   },
+   {
+    "score": 0.5635,
+    "name": "space",
+    "path": "storage/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     52,
+     54
+    ]
+   },
+   {
+    "score": 0.5426,
+    "name": "wrong_owner_cannot_checkpoint_or_pause",
+    "path": "sqlite/src/index_runs.rs",
+    "kind": "function",
+    "lines": [
+     1036,
+     1049
+    ]
+   }
+  ]
+ },
+ "S14b_snapshot_code": {
+  "query": "function that loads an IndexSnapshot from the sqlite database",
+  "task": "code-search",
+  "instruction": "Given a code search query, retrieve relevant code implementations",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.6695,
+    "name": "from_snapshot",
+    "path": "search/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     153,
+     250
+    ]
+   },
+   {
+    "score": 0.6041,
+    "name": "snapshot_with_spaces",
+    "path": "sqlite/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     867,
+     882
+    ]
+   },
+   {
+    "score": 0.5761,
+    "name": "snapshot_with_spaces_in_transaction",
+    "path": "sqlite/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     884,
+     1049
+    ]
+   },
+   {
+    "score": 0.5425,
+    "name": "snapshot_json_round_trips_multiple_spaces",
+    "path": "storage/src/lib.rs",
+    "kind": "function",
+    "lines": [
+     148,
+     204
+    ]
+   },
+   {
+    "score": 0.5413,
+    "name": "concurrent_snapshots_are_entirely_old_or_new",
+    "path": "indexer/tests/atomic_resumable.rs",
+    "kind": "function",
+    "lines": [
+     604,
+     679
+    ]
+   }
+  ]
+ },
+ "S15_publish_txn": {
+  "query": "where is the publish transaction that atomically commits an index run to the live tables",
+  "task": "explain-behavior",
+  "instruction": "Given a question about repository behavior, retrieve code that provides evidence for the answer",
+  "space": "code",
+  "hits": [
+   {
+    "score": 0.6656,
+    "name": "every_publish_fault_rolls_back_the_entire_live_corpus",
+    "path": "indexer/tests/atomic_resumable.rs",
+    "kind": "function",
+    "lines": [
+     51,
+     112
+    ]
+   },
+   {
+    "score": 0.6008,
+    "name": "run",
+    "path": "indexer/src/run.rs",
+    "kind": "function",
+    "lines": [
+     291,
+     411
+    ]
+   },
+   {
+    "score": 0.5753,
+    "name": "several_projects_publish_all_or_none",
+    "path": "indexer/tests/atomic_resumable.rs",
+    "kind": "function",
+    "lines": [
+     421,
+     467
+    ]
+   },
+   {
+    "score": 0.5575,
+    "name": "create_or_resume_run",
+    "path": "sqlite/src/index_runs.rs",
+    "kind": "function",
+    "lines": [
+     291,
+     395
+    ]
+   },
+   {
+    "score": 0.5529,
+    "name": "gc_staged_runs",
+    "path": "sqlite/src/index_runs.rs",
+    "kind": "function",
+    "lines": [
+     960,
+     968
+    ]
+   }
+  ]
+ },
+ "S16_incremental": [
+  {
+   "space_id": "code",
+   "channel": "implementation",
+   "embedded": 1,
+   "unresolved": 0,
+   "batches": 1
+  }
+ ]
+}
