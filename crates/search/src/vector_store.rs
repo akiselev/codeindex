@@ -175,9 +175,7 @@ fn pair_ranks_before(x: &ScoredPair, y: &ScoredPair) -> bool {
     }
 }
 
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
+pub use codeindex_query::dot;
 
 #[cfg(test)]
 mod tests {

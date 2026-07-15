@@ -1,15 +1,15 @@
+use std::collections::HashSet;
 use std::ops::Range;
 
 use anyhow::{Context, Result};
 use codeindex_core::{
-    EntityKind, ExtractedEntity, ExtractedFile, LanguageId, Representation, RepresentationKind,
-    SourceSpan,
+    EntityKind, ExtractedEntity, LanguageId, Representation, RepresentationKind, SourceSpan,
 };
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, QueryCursor};
 
 use crate::language::{LanguageDef, PendingUnit};
-use crate::normalizer::{merge_ranges, normalize_for_hash, sha256_hex, strip_ranges};
+use crate::normalizer::{normalize_for_hash, sha256_hex, strip_ranges};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractOptions {
@@ -24,17 +24,6 @@ impl Default for ExtractOptions {
             max_body_chars: 10_000,
         }
     }
-}
-
-pub fn extract_file(
-    def: &LanguageDef,
-    source: &str,
-    options: &ExtractOptions,
-) -> Result<ExtractedFile> {
-    Ok(ExtractedFile {
-        entities: extract_units(def, source, options)?,
-        diagnostics: Vec::new(),
-    })
 }
 
 pub fn extract_units(
@@ -57,7 +46,7 @@ pub fn extract_units(
     let scope_idx = capture_index(def, "unit.scope");
 
     let mut units = Vec::new();
-    let mut seen_ranges: Vec<Range<usize>> = Vec::new();
+    let mut seen_ranges: HashSet<(usize, usize)> = HashSet::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&def.query, tree.root_node(), source.as_bytes());
     while let Some(query_match) = matches.next() {
@@ -69,6 +58,7 @@ pub fn extract_units(
             name: None,
             scope: None,
             strip: Vec::new(),
+            doc: None,
         };
         for capture in query_match.captures {
             let index = Some(capture.index);
@@ -97,11 +87,11 @@ pub fn extract_units(
             adapter.refine(source, &mut pending);
         }
         let range = pending.node.byte_range();
-        if seen_ranges.contains(&range) {
+        if seen_ranges.contains(&(range.start, range.end)) {
             continue;
         }
         if let Some(unit) = build_unit(def, source, pending, options) {
-            seen_ranges.push(range);
+            seen_ranges.insert((range.start, range.end));
             units.push(unit);
         }
     }
@@ -142,6 +132,8 @@ pub fn extract_references(def: &LanguageDef, source: &str) -> Result<Vec<RawRefe
         .position(|n| *n == "ref.callee")
         .map(|i| i as u32);
 
+    // One pass over the source instead of O(lines) per reference.
+    let lines: Vec<&str> = source.lines().collect();
     let mut references = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
@@ -153,9 +145,8 @@ pub fn extract_references(def: &LanguageDef, source: &str) -> Result<Vec<RawRefe
             let node = capture.node;
             let symbol = source[node.byte_range()].split_whitespace().collect();
             let line = node.start_position().row;
-            let snippet = source
-                .lines()
-                .nth(line)
+            let snippet = lines
+                .get(line)
                 .map(|l| l.trim())
                 .unwrap_or("")
                 .chars()
@@ -202,7 +193,7 @@ fn build_unit(
         .map(|r| r.start.saturating_sub(start_byte)..r.end.saturating_sub(start_byte))
         .collect();
     collect_comment_ranges(node, &def.spec.comment_nodes, start_byte, &mut strip);
-    let embedding_text = strip_ranges(display_source, &merge_ranges(&strip));
+    let embedding_text = strip_ranges(display_source, &strip);
     let normalized = normalize_for_hash(&embedding_text);
     if normalized.is_empty() || embedding_text.chars().count() > options.max_body_chars {
         return None;
@@ -256,10 +247,16 @@ fn build_unit(
         }
     }
 
-    // Documentation: the contiguous run of comment-node siblings immediately
-    // preceding the unit (doc comments in most languages sit right above the
-    // declaration). Stored raw — markers carry meaning for embedding.
-    if let Some(doc) = leading_documentation(def, source, node)
+    // Documentation: an adapter-identified documentation literal (Python
+    // docstring) when present, otherwise the contiguous run of comment-node
+    // siblings immediately preceding the unit. Comment text is stored raw —
+    // markers carry meaning for embedding.
+    let doc = pending
+        .doc
+        .as_ref()
+        .and_then(|range| clean_docstring(&source[range.clone()]))
+        .or_else(|| leading_documentation(def, source, node));
+    if let Some(doc) = doc
         && !doc.is_empty()
     {
         representations.push(Representation::new(
@@ -295,22 +292,61 @@ fn build_unit(
     })
 }
 
+/// Strip string prefixes and quotes from an adapter-identified docstring
+/// literal (`"""…"""`, `'''…'''`, `r"""…"""`, plain quotes). Only raw/unicode
+/// prefixes appear here — the adapter never marks f-string or bytes literals
+/// as docstrings.
+fn clean_docstring(literal: &str) -> Option<String> {
+    let trimmed = literal.trim();
+    let trimmed = trimmed.trim_start_matches(['r', 'R', 'u', 'U']);
+    let unquoted = ["\"\"\"", "'''", "\"", "'"].iter().find_map(|quote| {
+        trimmed
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+    })?;
+    let text = unquoted.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// The contiguous block of comment-node siblings directly above `node`, joined
-/// top-to-bottom. Used as the `Documentation` channel.
+/// top-to-bottom. Used as the `Documentation` channel. Attribute/annotation
+/// nodes between the declaration and its comments are skipped — but only until
+/// the comment block starts, so `/// doc` + `#[inline]` + `fn` yields the doc
+/// comment while an unrelated comment sitting above the attributes of an
+/// already-documented item is never merged in. When the declaration is wrapped
+/// in a container node (Python's `decorated_definition`), the walk continues
+/// from the container's preceding siblings.
 fn leading_documentation(def: &LanguageDef, source: &str, node: Node<'_>) -> Option<String> {
     let comment_kinds = &def.spec.comment_nodes;
     if comment_kinds.is_empty() {
         return None;
     }
+    let attribute_kinds = &def.spec.attribute_nodes;
+    let container_kinds = &def.spec.doc_container_nodes;
     let mut comments: Vec<Range<usize>> = Vec::new();
-    let mut sibling = node.prev_sibling();
-    while let Some(current) = sibling {
+    let mut anchor = node;
+    let mut sibling = anchor.prev_sibling();
+    loop {
+        let Some(current) = sibling else {
+            match anchor.parent() {
+                Some(parent)
+                    if comments.is_empty()
+                        && container_kinds.iter().any(|kind| kind == parent.kind()) =>
+                {
+                    anchor = parent;
+                    sibling = parent.prev_sibling();
+                    continue;
+                }
+                _ => break,
+            }
+        };
         if comment_kinds.iter().any(|kind| kind == current.kind()) {
             comments.push(current.byte_range());
-            sibling = current.prev_sibling();
-        } else {
+        } else if !comments.is_empty() || !attribute_kinds.iter().any(|kind| kind == current.kind())
+        {
             break;
         }
+        sibling = current.prev_sibling();
     }
     if comments.is_empty() {
         return None;
@@ -395,6 +431,131 @@ fn recover_scope(def: &LanguageDef, source: &str, node: Node<'_>) -> Option<Stri
 mod tests {
     use super::*;
     use crate::LanguageRegistry;
+
+    fn small_units(language: &str, source: &str) -> Vec<ExtractedEntity> {
+        let def = LanguageRegistry::global().get(language).unwrap();
+        extract_units(
+            def,
+            source,
+            &ExtractOptions {
+                body_node_count_threshold: 1,
+                max_body_chars: 10_000,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cfg_test_detection_is_structural() {
+        let units = small_units(
+            "rust",
+            r#"
+#[cfg(test)]
+fn direct() { do_it() }
+
+#[cfg(all(test, not(windows)))]
+fn nested() { do_it() }
+
+#[cfg(feature = "testing")]
+fn feature_gated() { do_it() }
+
+#[cfg(not(test))]
+fn negated() { do_it() }
+"#,
+        );
+        let scope = |name: &str| {
+            units
+                .iter()
+                .find(|u| u.name == name)
+                .unwrap_or_else(|| panic!("unit {name} missing"))
+                .scope
+                .clone()
+        };
+        assert_eq!(scope("direct").as_deref(), Some("tests"));
+        assert_eq!(scope("nested").as_deref(), Some("tests"));
+        assert_eq!(scope("feature_gated"), None);
+        assert_eq!(scope("negated"), None);
+    }
+
+    #[test]
+    fn python_docstring_feeds_documentation_channel() {
+        let units = small_units(
+            "python",
+            "def parse(data):\n    \"\"\"Parse data into an AST.\"\"\"\n    return build(data)\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].representation_text(&RepresentationKind::Documentation),
+            Some("Parse data into an AST.")
+        );
+        // The docstring stays stripped from the Implementation channel.
+        assert!(
+            !units[0]
+                .representation_text(&RepresentationKind::Implementation)
+                .unwrap()
+                .contains("Parse data into an AST")
+        );
+    }
+
+    #[test]
+    fn leading_docs_survive_intervening_attributes() {
+        let units = small_units(
+            "rust",
+            "/// Documented function.\n#[inline]\nfn documented() { do_it() }\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].representation_text(&RepresentationKind::Documentation),
+            Some("/// Documented function.")
+        );
+    }
+
+    #[test]
+    fn unrelated_comments_above_attributes_are_not_merged_into_docs() {
+        let units = small_units(
+            "rust",
+            "// unrelated section note\n#[derive(Debug)]\n/// Documented.\nfn documented() { do_it() }\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].representation_text(&RepresentationKind::Documentation),
+            Some("/// Documented.")
+        );
+    }
+
+    #[test]
+    fn decorated_python_function_keeps_leading_comment_docs() {
+        let units = small_units(
+            "python",
+            "# validates user input\n@lru_cache\ndef check(x):\n    return x + 1\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].representation_text(&RepresentationKind::Documentation),
+            Some("# validates user input")
+        );
+    }
+
+    #[test]
+    fn python_fstring_first_statement_is_not_a_docstring() {
+        let units = small_units(
+            "python",
+            "def h(x):\n    f\"\"\"Doc {x}.\"\"\"\n    return x\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].representation_text(&RepresentationKind::Documentation),
+            None
+        );
+        // The runtime f-string expression must stay in the Implementation
+        // channel rather than being stripped as a docstring.
+        assert!(
+            units[0]
+                .representation_text(&RepresentationKind::Implementation)
+                .unwrap()
+                .contains("Doc {x}")
+        );
+    }
 
     #[test]
     fn extracts_parser_neutral_rust_entity() {

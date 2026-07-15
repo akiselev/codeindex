@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use codeindex_sqlite::index_publish::{IndexReport, PublishStep};
 use codeindex_sqlite::index_runs::{
     CreateRunSpec, DocumentAction, DocumentState, IndexRunPhase, IndexRunState, IndexRunStatus,
-    ManifestDocument, RunProjectSpec, STAGED_PAYLOAD_SCHEMA_VERSION,
+    ManifestDocument, RunProjectSpec, STAGED_PAYLOAD_SCHEMA_VERSION, manifest_digest,
 };
 use codeindex_sqlite::{Db, FileRecord};
 use codeindex_tree_sitter::normalizer::sha256_hex;
@@ -412,6 +412,9 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
 
     fn run_owned(&self, run_id: i64, owner_token: &str) -> Result<IndexOutcome> {
         self.validate_immutable_settings()?;
+        // Constant for the run's lifetime; the per-document fingerprint loop
+        // must not re-query run status for it.
+        let config_fingerprint = self.config_fingerprint(run_id)?;
         let enabled: HashSet<String> = self.settings.enabled_languages.iter().cloned().collect();
         let projects_by_label: HashMap<&str, &SourceProject<'provider>> = self
             .projects
@@ -521,7 +524,7 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
                     };
                     let action = action_for(live, document, &source_hash);
                     let fingerprint = document_fingerprint(
-                        &self.config_fingerprint(run_id)?,
+                        &config_fingerprint,
                         project.provider.provider_fingerprint().as_str(),
                         document,
                         &source_hash,
@@ -536,10 +539,49 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
                         action,
                     });
                 }
+                // Live documents the provider no longer reports are deletions.
+                // Without these rows the publish transaction has nothing to
+                // remove and deleted files silently survive reindexing.
+                let observed: HashSet<&str> = documents
+                    .iter()
+                    .map(|document| document.id.as_str())
+                    .collect();
+                let mut deleted_ids: Vec<&String> = live_files
+                    .keys()
+                    .filter(|id| !observed.contains(id.as_str()))
+                    .collect();
+                deleted_ids.sort();
+                for id in deleted_ids {
+                    let file = &live_files[id];
+                    let fingerprint = sha256_hex(&serde_json::to_string(&serde_json::json!({
+                        "config": config_fingerprint,
+                        "provider": project.provider.provider_fingerprint(),
+                        "id": id,
+                        "deleted": true,
+                    }))?);
+                    observations.push(ManifestDocument {
+                        source_document_id: id.clone(),
+                        relative_path: file.relative_path.clone(),
+                        language_id: file.language_id.clone(),
+                        source_revision_json: serde_json::to_string(&file.source_revision)?,
+                        observed_source_hash: String::new(),
+                        input_fingerprint: fingerprint,
+                        action: DocumentAction::Delete,
+                    });
+                }
                 if unstable {
                     break;
                 }
-                let digest = manifest_digest(&observations);
+                // The manifest digest covers surviving documents only; the
+                // publish transaction recomputes it the same way (delete rows
+                // are journaled but excluded from the digest).
+                let digest = manifest_digest(
+                    &observations
+                        .iter()
+                        .filter(|document| document.action != DocumentAction::Delete)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
                 refreshes.push((project.label.clone(), documents, observations, digest));
             }
             if unstable {
@@ -588,20 +630,7 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
                 }
                 self.db.mark_run_ready(run_id, owner_token)?;
                 self.emit_progress(run_id, IndexRunPhase::Ready, None, None)?;
-                let immutable = [
-                    (
-                        "index.body_node_count_threshold",
-                        self.settings.body_node_count_threshold.to_string(),
-                    ),
-                    (
-                        "index.retention",
-                        self.settings.retention.as_str().to_string(),
-                    ),
-                    (
-                        "embedding.max_body_chars",
-                        self.settings.max_body_chars.to_string(),
-                    ),
-                ];
+                let immutable = self.immutable_settings();
                 let report = self.db.publish_run(
                     run_id,
                     owner_token,
@@ -806,8 +835,11 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
         Ok(self.db.run_status(run_id)?.config_fingerprint)
     }
 
-    fn validate_immutable_settings(&self) -> Result<()> {
-        for (key, expected) in [
+    /// Settings fixed once a corpus is first published. Enforced inside the
+    /// publish transaction and validated against any existing database before
+    /// a run starts; both sites must use this single list.
+    fn immutable_settings(&self) -> [(&'static str, String); 3] {
+        [
             (
                 "index.body_node_count_threshold",
                 self.settings.body_node_count_threshold.to_string(),
@@ -820,7 +852,11 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
                 "embedding.max_body_chars",
                 self.settings.max_body_chars.to_string(),
             ),
-        ] {
+        ]
+    }
+
+    fn validate_immutable_settings(&self) -> Result<()> {
+        for (key, expected) in self.immutable_settings() {
             if let Some(existing) = self.db.get_setting(key)? {
                 ensure!(
                     existing == expected,
@@ -892,22 +928,4 @@ fn document_fingerprint(
         "revision": document.revision,
         "source_hash": source_hash,
     }))?))
-}
-
-fn manifest_digest(documents: &[ManifestDocument]) -> String {
-    let mut rows: Vec<String> = documents
-        .iter()
-        .map(|document| {
-            format!(
-                "{}\0{}\0{}\0{}\0{}",
-                document.source_document_id,
-                document.relative_path,
-                document.language_id,
-                document.input_fingerprint,
-                document.action.as_str(),
-            )
-        })
-        .collect();
-    rows.sort();
-    sha256_hex(&rows.join("\n"))
 }

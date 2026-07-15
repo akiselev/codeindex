@@ -29,6 +29,160 @@ enum Command {
     Abandon(RunArgs),
     /// Mark an unfinished indexing run superseded without starting a replacement.
     Supersede(RunArgs),
+    /// Inspect and resolve embedding model references.
+    #[command(subcommand)]
+    Models(ModelsCommand),
+    /// Embed pending representations into an explicit embedding space.
+    Embed(EmbedArgs),
+    /// Search an embedding space with an optional task instruction.
+    Search(SearchArgs),
+    /// Enrich a published project through a language server: derived
+    /// `typed_signature` representations plus exact `calls` relations.
+    LspEnrich(LspEnrichArgs),
+}
+
+#[derive(Args)]
+struct LspEnrichArgs {
+    #[command(flatten)]
+    database: DatabaseArgs,
+    /// Indexed project label to enrich.
+    #[arg(long)]
+    project: String,
+    /// Root directory the language server runs against (the indexed tree).
+    #[arg(long)]
+    root: PathBuf,
+    /// Language server executable.
+    #[arg(long, default_value = "rust-analyzer")]
+    server: String,
+    /// Extra arguments for the language server.
+    #[arg(long = "server-arg")]
+    server_args: Vec<String>,
+    /// Language id the server covers.
+    #[arg(long, default_value = "rust")]
+    language: String,
+}
+
+#[derive(Args)]
+struct EmbedArgs {
+    #[command(flatten)]
+    database: DatabaseArgs,
+    /// Model reference: `hf:owner/name[@rev]`, `dir:/path`, `fastembed:Name`.
+    #[arg(long)]
+    model: String,
+    /// Space as `ID=CHANNEL`, e.g. `code=implementation` or
+    /// `docs=documentation`. Repeat to project several spaces in one run.
+    #[arg(long = "space", required = true, value_parser = parse_space)]
+    spaces: Vec<SpaceArgument>,
+    /// Document-side prompt prefixed to every representation at embed time
+    /// (part of the space's immutable contract).
+    #[arg(long)]
+    document_prompt: Option<String>,
+    /// Matryoshka projection: store only this many leading dimensions.
+    #[arg(long)]
+    output_dimensions: Option<usize>,
+    /// Model cache root override.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Execution provider (cpu, cuda, metal, ...).
+    #[arg(long, default_value = "cpu")]
+    execution_provider: String,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    #[command(flatten)]
+    database: DatabaseArgs,
+    /// Query text.
+    query: String,
+    /// Embedding space to search.
+    #[arg(long)]
+    space: String,
+    /// Named task preset (see `--list-tasks`) rendered as the query
+    /// instruction on instruction-aware models.
+    #[arg(long, conflicts_with = "instruction")]
+    task: Option<String>,
+    /// Raw task instruction (instruction-aware models only).
+    #[arg(long)]
+    instruction: Option<String>,
+    /// Metadata filter, e.g. `language=rust kind=function path=src/**`.
+    #[arg(long = "where")]
+    filter: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Model cache root override.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Execution provider (cpu, cuda, metal, ...).
+    #[arg(long, default_value = "cpu")]
+    execution_provider: String,
+    /// List the built-in task presets and exit.
+    #[arg(long)]
+    list_tasks: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SpaceArgument {
+    id: String,
+    channel: String,
+}
+
+fn parse_space(value: &str) -> Result<SpaceArgument, String> {
+    let (id, channel) = value
+        .split_once('=')
+        .ok_or_else(|| "expected ID=CHANNEL, e.g. code=implementation".to_string())?;
+    if id.is_empty() || channel.is_empty() {
+        return Err("space id and channel must both be non-empty".into());
+    }
+    Ok(SpaceArgument {
+        id: id.into(),
+        channel: channel.into(),
+    })
+}
+
+/// Built-in retrieval intents (FEEDBACK.md §1): stable ids agents can pass as
+/// `--task` instead of hand-writing instructions.
+const TASK_PRESETS: &[(&str, &str)] = &[
+    (
+        "code-search",
+        "Given a code search query, retrieve relevant code implementations",
+    ),
+    (
+        "locate-edit-targets",
+        "Given a software change request, retrieve code regions likely to require editing",
+    ),
+    (
+        "explain-behavior",
+        "Given a question about repository behavior, retrieve code that provides evidence for \
+         the answer",
+    ),
+    (
+        "find-analogues",
+        "Given a code fragment, retrieve functionally equivalent implementations",
+    ),
+    (
+        "diagnose-failure",
+        "Given a failure report, retrieve implementation, tests, configuration, and \
+         error-handling paths relevant to diagnosing it",
+    ),
+];
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// Resolve a model reference into its semantic contract without loading
+    /// any weights.
+    Resolve(ModelResolveArgs),
+}
+
+#[derive(Args)]
+struct ModelResolveArgs {
+    /// Model reference: `hf:owner/name[@rev]`, `owner/name`, or `dir:/path`.
+    reference: String,
+    /// Model cache root (defaults to the codeindex cache).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Emit versioned newline-delimited JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -126,11 +280,22 @@ impl From<RetentionArgument> for RetentionMode {
     }
 }
 
+/// Version of the newline-delimited JSON envelope this binary emits.
+const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct Envelope<'a, T> {
     version: u32,
     event: &'a str,
     data: T,
+}
+
+fn envelope_line<T: Serialize>(event: &str, data: T) -> serde_json::Result<String> {
+    serde_json::to_string(&Envelope {
+        version: PROTOCOL_VERSION,
+        event,
+        data,
+    })
 }
 
 fn main() -> ExitCode {
@@ -161,7 +326,298 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Abandon(arguments) => update_run(arguments, |db, run| db.abandon_run(run)),
         Command::Supersede(arguments) => update_run(arguments, |db, run| db.supersede_run(run)),
+        Command::Models(ModelsCommand::Resolve(arguments)) => models_resolve(arguments),
+        Command::Embed(arguments) => embed_command(arguments),
+        Command::Search(arguments) => search_command(arguments),
+        Command::LspEnrich(arguments) => lsp_enrich_command(arguments),
     }
+}
+
+fn lsp_enrich_command(arguments: LspEnrichArgs) -> Result<ExitCode> {
+    let db = open_or_create(&arguments.database.db)?;
+    let report = codeindex_lsp::enrich_project(
+        &db,
+        &arguments.project,
+        &arguments.root,
+        &codeindex_lsp::LspServer {
+            language_id: arguments.language.clone(),
+            command: arguments.server.clone(),
+            args: arguments.server_args.clone(),
+        },
+    )?;
+    print_value(
+        arguments.database.json,
+        "lsp-enrich",
+        &LspEnrichOut {
+            files_visited: report.files_visited,
+            units_visited: report.units_visited,
+            typed_signatures: report.typed_signatures,
+            relations: report.relations,
+        },
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Serialize)]
+struct LspEnrichOut {
+    files_visited: usize,
+    units_visited: usize,
+    typed_signatures: usize,
+    relations: usize,
+}
+
+fn embed_command(arguments: EmbedArgs) -> Result<ExitCode> {
+    use codeindex_core::{DocumentSideContract, EmbeddingSpaceId, EmbeddingSpaceIdentity};
+    use codeindex_embedding::config::{EmbeddingConfig, EmbeddingRunConfig, SourceRecoveryConfig};
+
+    let db = open_or_create(&arguments.database.db)?;
+    let config = EmbeddingConfig {
+        model: arguments.model.clone(),
+        cache_dir: arguments.cache_dir.clone(),
+        execution_provider: arguments.execution_provider.clone(),
+        ..EmbeddingConfig::default()
+    };
+    let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
+    let run_config = EmbeddingRunConfig {
+        embedding: config,
+        source_recovery: SourceRecoveryConfig {
+            body_node_count_threshold: 10,
+        },
+    };
+    let document_side = DocumentSideContract {
+        prompt: arguments.document_prompt.clone(),
+        output_dimensions: arguments.output_dimensions,
+    };
+    let json = arguments.database.json;
+    let mut totals = Vec::new();
+    for space in &arguments.spaces {
+        let identity = EmbeddingSpaceIdentity::new(
+            EmbeddingSpaceId::new(space.id.clone()),
+            space.channel.as_str().into(),
+            embedder.contract().clone(),
+        )
+        .with_document_side(document_side.clone());
+        let stats = codeindex_indexer::embed_space_pending_with_progress(
+            &db,
+            embedder.as_mut(),
+            &run_config,
+            &identity,
+            None,
+            &mut |progress| {
+                if json
+                    && let Ok(line) = envelope_line(
+                        "progress",
+                        &EmbedProgressOut {
+                            space_id: progress.space_id.to_string(),
+                            embedded: progress.embedded,
+                            pending_total: progress.pending_total,
+                        },
+                    )
+                {
+                    println!("{line}");
+                }
+            },
+        )?;
+        totals.push(EmbedResultOut {
+            space_id: space.id.clone(),
+            channel: space.channel.clone(),
+            embedded: stats.embedded,
+            unresolved: stats.unresolved,
+            batches: stats.batches,
+        });
+    }
+    print_value(json, "embed", &totals)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Serialize)]
+struct EmbedProgressOut {
+    space_id: String,
+    embedded: usize,
+    pending_total: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbedResultOut {
+    space_id: String,
+    channel: String,
+    embedded: usize,
+    unresolved: usize,
+    batches: usize,
+}
+
+fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
+    use codeindex_core::{EmbeddingSpaceId, EmbeddingTask};
+    use codeindex_embedding::config::EmbeddingConfig;
+    use codeindex_query::WhereFilter;
+    use codeindex_search::SearchIndex;
+
+    if arguments.list_tasks {
+        for (id, instruction) in TASK_PRESETS {
+            println!("{id}: {instruction}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let db = open_or_create(&arguments.database.db)?;
+    let space_id = EmbeddingSpaceId::new(arguments.space.clone());
+    let space = db
+        .get_space(&space_id)?
+        .with_context(|| format!("embedding space {:?} is not stored", arguments.space))?;
+
+    // The stored semantic contract's model field is itself a resolvable
+    // reference, so the matching query embedder reconstructs automatically.
+    let config = EmbeddingConfig {
+        model: space.identity.model.model.clone(),
+        cache_dir: arguments.cache_dir.clone(),
+        execution_provider: arguments.execution_provider.clone(),
+        ..EmbeddingConfig::default()
+    };
+    let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
+
+    let task = match (&arguments.task, &arguments.instruction) {
+        (Some(preset), _) => Some(EmbeddingTask::new(
+            preset.clone(),
+            TASK_PRESETS
+                .iter()
+                .find(|(id, _)| id == preset)
+                .map(|(_, instruction)| (*instruction).to_string())
+                .with_context(|| {
+                    format!(
+                        "unknown task preset {preset:?}; available: {}",
+                        TASK_PRESETS
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+        )),
+        (None, Some(instruction)) => Some(EmbeddingTask::new("custom", instruction.clone())),
+        (None, None) => None,
+    };
+
+    let filter = WhereFilter::parse(arguments.filter.as_deref())?;
+    let index = SearchIndex::from_snapshot(db.snapshot(&[])?)?;
+    let results = index.search_text(
+        embedder.as_mut(),
+        &arguments.query,
+        task.as_ref(),
+        &space_id,
+        &filter,
+        arguments.limit,
+    )?;
+
+    let hits: Vec<SearchHitOut> = results
+        .hits
+        .iter()
+        .map(|hit| {
+            let unit = &index.units[hit.index];
+            SearchHitOut {
+                selector: codeindex_query::unit_id(unit),
+                score: hit.score,
+                project: unit.project_label.clone(),
+                path: unit.relative_path.clone(),
+                lines: [unit.start_line, unit.end_line],
+                language: unit.language_id.clone(),
+                kind: unit.kind.clone(),
+                name: unit.name.clone(),
+                scope: unit.scope.clone(),
+            }
+        })
+        .collect();
+    print_value(
+        arguments.database.json,
+        "search",
+        &SearchResultsOut {
+            query: arguments.query.clone(),
+            space: arguments.space.clone(),
+            task: task.clone(),
+            matched: results.matched,
+            hits,
+        },
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResultsOut {
+    query: String,
+    space: String,
+    /// The exact task rendered into the query, for reproducibility.
+    task: Option<codeindex_core::EmbeddingTask>,
+    matched: usize,
+    hits: Vec<SearchHitOut>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchHitOut {
+    selector: String,
+    score: f32,
+    project: String,
+    path: String,
+    lines: [usize; 2],
+    language: String,
+    kind: String,
+    name: String,
+    scope: Option<String>,
+}
+
+fn models_resolve(arguments: ModelResolveArgs) -> Result<ExitCode> {
+    use codeindex_embedding::resolve::{
+        ModelRef, default_model_root, fetcher_for, model_cache_dir, resolve_model,
+    };
+
+    #[derive(Debug, Serialize)]
+    struct WeightsOutput {
+        file: String,
+        declared_bytes: u64,
+        dtypes: Vec<String>,
+        tensors: usize,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ResolvedOutput {
+        contract: codeindex_core::ModelContract,
+        local_dir: String,
+        weight_files: Vec<String>,
+        /// Safetensors preflight (header-only range read): size and dtypes
+        /// known before any weight download.
+        weights: Option<WeightsOutput>,
+    }
+
+    let reference = ModelRef::parse(&arguments.reference)?;
+    let root = arguments.cache_dir.unwrap_or_else(default_model_root);
+    let cache_dir = model_cache_dir(&root, &reference);
+    let fetcher = fetcher_for(&reference)?;
+    let resolved = resolve_model(&reference, fetcher.as_ref(), &cache_dir)?;
+    let weights = resolved
+        .weight_files
+        .iter()
+        .find(|file| file.ends_with(".safetensors"))
+        .and_then(|file| {
+            let preflight =
+                codeindex_embedding::resolve::preflight_safetensors(fetcher.as_ref(), file)
+                    .ok()
+                    .flatten()?;
+            Some(WeightsOutput {
+                file: file.clone(),
+                declared_bytes: preflight.declared_size,
+                dtypes: preflight.dtypes,
+                tensors: preflight.tensor_names.len(),
+            })
+        });
+    print_value(
+        arguments.json,
+        "model",
+        &ResolvedOutput {
+            contract: resolved.contract,
+            local_dir: resolved.local_dir.display().to_string(),
+            weight_files: resolved.weight_files,
+            weights,
+        },
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn update_run(
@@ -213,12 +669,7 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
     let json = arguments.database.json;
     let progress = |progress: IndexProgress| {
         if json {
-            let envelope = Envelope {
-                version: 1,
-                event: "progress",
-                data: progress,
-            };
-            if let Ok(line) = serde_json::to_string(&envelope) {
+            if let Ok(line) = envelope_line("progress", &progress) {
                 println!("{line}");
             }
         } else if let (Some(project), Some(document)) =
@@ -271,14 +722,7 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
 
 fn print_value<T: Serialize + std::fmt::Debug>(json: bool, event: &str, value: &T) -> Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&Envelope {
-                version: 1,
-                event,
-                data: value,
-            })?
-        );
+        println!("{}", envelope_line(event, value)?);
     } else {
         println!("{value:#?}");
     }

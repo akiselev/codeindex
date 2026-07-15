@@ -1,5 +1,4 @@
 id = "ruby"
-name = "Ruby"
 extensions = ["rb"]
 comment_nodes = ["comment"]
 

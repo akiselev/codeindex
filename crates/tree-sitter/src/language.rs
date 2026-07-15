@@ -11,11 +11,20 @@ use tree_sitter::{Language, Node, Query};
 #[serde(deny_unknown_fields)]
 pub struct LanguageSpec {
     pub id: String,
-    pub name: String,
     pub extensions: Vec<String>,
     /// Node kinds stripped from unit text before hashing/embedding.
     #[serde(default)]
     pub comment_nodes: Vec<String>,
+    /// Node kinds for attributes/annotations/decorators that may sit between
+    /// documentation comments and the declaration; skipped (not collected)
+    /// when harvesting the Documentation channel.
+    #[serde(default)]
+    pub attribute_nodes: Vec<String>,
+    /// Wrapper node kinds whose child carries the declaration (Python's
+    /// `decorated_definition`); the documentation walk continues from the
+    /// wrapper's preceding siblings when the declaration has none of its own.
+    #[serde(default)]
+    pub doc_container_nodes: Vec<String>,
     /// Optional adapter hook name (see `adapter_by_name`).
     #[serde(default)]
     pub adapter: Option<String>,
@@ -42,6 +51,10 @@ pub struct PendingUnit<'t> {
     /// Absolute byte ranges (into the file source) removed before
     /// normalization, in addition to comment nodes.
     pub strip: Vec<Range<usize>>,
+    /// Absolute byte range of an adapter-identified documentation literal
+    /// (e.g. a Python docstring), preferred over leading comment siblings for
+    /// the Documentation channel.
+    pub doc: Option<Range<usize>>,
 }
 
 /// Hook layer for cases queries cannot express cleanly: anonymous-function
@@ -54,7 +67,7 @@ pub trait LanguageAdapter: Send + Sync {
 struct PythonAdapter;
 
 impl LanguageAdapter for PythonAdapter {
-    fn refine(&self, _source: &str, unit: &mut PendingUnit<'_>) {
+    fn refine(&self, source: &str, unit: &mut PendingUnit<'_>) {
         let Some(body) = unit.body else { return };
         let Some(first) = body.named_child(0) else {
             return;
@@ -62,10 +75,21 @@ impl LanguageAdapter for PythonAdapter {
         if first.kind() == "expression_statement"
             && let Some(expr) = first.named_child(0)
             && expr.kind() == "string"
+            && is_plain_string_literal(source, expr)
         {
             unit.strip.push(first.byte_range());
+            unit.doc = Some(expr.byte_range());
         }
     }
+}
+
+/// Only a plain (optionally raw/unicode) string literal is a docstring;
+/// f-strings and bytes literals are runtime expressions, not documentation.
+fn is_plain_string_literal(source: &str, string_node: Node<'_>) -> bool {
+    source[string_node.byte_range()]
+        .chars()
+        .take_while(|c| *c != '"' && *c != '\'')
+        .all(|c| matches!(c, 'r' | 'R' | 'u' | 'U'))
 }
 
 /// JavaScript/TypeScript: name anonymous functions from their assignment
@@ -159,7 +183,7 @@ fn name_from_call_argument(
     }
     match label {
         Some(label) => Some(format!("{callee}(\"{label}\")")),
-        None => Some(format!("{callee}(... )").replace("... ", "...")),
+        None => Some(format!("{callee}(...)")),
     }
 }
 
@@ -222,8 +246,7 @@ fn has_cfg_test_attribute(source: &str, node: Node<'_>) -> bool {
     while let Some(current) = sibling {
         match current.kind() {
             "attribute_item" => {
-                let text = &source[current.byte_range()];
-                if text.starts_with("#[cfg(") && text.contains("test") && !text.contains("not(") {
+                if attribute_enables_cfg_test(source, current) {
                     return true;
                 }
             }
@@ -231,6 +254,56 @@ fn has_cfg_test_attribute(source: &str, node: Node<'_>) -> bool {
             _ => return false,
         }
         sibling = current.prev_named_sibling();
+    }
+    false
+}
+
+/// Whether an `attribute_item` is `#[cfg(...)]` with a bare `test` token in an
+/// enabled position, i.e. not inside a `not(...)` group.
+fn attribute_enables_cfg_test(source: &str, item: Node<'_>) -> bool {
+    let Some(attribute) = item.named_child(0) else {
+        return false;
+    };
+    if attribute.kind() != "attribute" {
+        return false;
+    }
+    let Some(path) = attribute.named_child(0) else {
+        return false;
+    };
+    if &source[path.byte_range()] != "cfg" {
+        return false;
+    }
+    let Some(arguments) = attribute.named_child(1) else {
+        return false;
+    };
+    arguments.kind() == "token_tree" && token_tree_enables_test(source, arguments)
+}
+
+/// Scan a `cfg` token tree for a standalone `test` identifier token. Groups
+/// guarded by `not` are skipped; string literals (`feature = "testing"`) are
+/// distinct token kinds and never match.
+fn token_tree_enables_test(source: &str, tree: Node<'_>) -> bool {
+    let mut skip_next_group = false;
+    for i in 0..tree.named_child_count() as u32 {
+        let Some(child) = tree.named_child(i) else {
+            continue;
+        };
+        match child.kind() {
+            "identifier" => match &source[child.byte_range()] {
+                "not" => skip_next_group = true,
+                "test" => return true,
+                _ => {}
+            },
+            "token_tree" => {
+                if std::mem::take(&mut skip_next_group) {
+                    continue;
+                }
+                if token_tree_enables_test(source, child) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
     }
     false
 }
@@ -452,15 +525,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_matches_config_language_ids() {
+    fn registry_matches_bundled_language_ids() {
         let registry = LanguageRegistry::global();
-        for id in crate::config::KNOWN_LANGUAGE_IDS {
-            assert!(registry.get(id).is_some(), "config id {id} missing");
+        for id in crate::BUNDLED_LANGUAGE_IDS {
+            assert!(registry.get(id).is_some(), "bundled id {id} missing");
         }
-        assert_eq!(
-            registry.ids().count(),
-            crate::config::KNOWN_LANGUAGE_IDS.len()
-        );
+        assert_eq!(registry.ids().count(), crate::BUNDLED_LANGUAGE_IDS.len());
     }
 
     #[test]

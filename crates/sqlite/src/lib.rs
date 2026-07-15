@@ -8,8 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use codeindex_core::{
-    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, RepresentationKind,
-    RepresentationOrigin,
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, Pooling,
+    RepresentationKind,
 };
 use codeindex_storage::{
     EmbeddingSpaceSnapshot, IndexSnapshot, ProjectRecord, RepresentationRef, UnitRecord,
@@ -17,8 +17,8 @@ use codeindex_storage::{
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 pub use models::{
-    CodeUnit, EmbeddingModelRecord, EmbeddingSpaceRecord, FileId, FileRecord, ModelId,
-    ModelIdentity, NewCodeUnit, NewFile, NewRepresentation, Project, ProjectId,
+    CodeUnit, EmbeddingModelRecord, EmbeddingSpaceRecord, ExecutionInfo, FileId, FileRecord,
+    ModelContract, ModelId, NewCodeUnit, NewFile, NewRepresentation, Project, ProjectId,
     StagedDocumentPayload, StagedReference, UnitId, blob_to_vector, vector_to_blob,
 };
 
@@ -37,14 +37,6 @@ pub struct HashLocation {
     pub source_document_id: String,
     pub relative_path: String,
     pub language_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewReference {
-    pub caller_unit_id: UnitId,
-    pub callee_symbol: String,
-    pub call_snippet: String,
-    pub start_line: i64,
 }
 
 pub fn open_or_create(path: &Path) -> Result<Db> {
@@ -75,10 +67,6 @@ impl Db {
         &self.conn
     }
 
-    pub fn transaction(&mut self) -> Result<rusqlite::Transaction<'_>> {
-        Ok(self.conn.transaction()?)
-    }
-
     // ----- settings -----
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -97,17 +85,6 @@ impl Db {
             [key, value],
         )?;
         Ok(())
-    }
-
-    pub fn check_or_set_immutable(&self, key: &str, value: &str) -> Result<()> {
-        match self.get_setting(key)? {
-            None => self.set_setting(key, value),
-            Some(existing) if existing == value => Ok(()),
-            Some(existing) => bail!(
-                "setting `{key}` is fixed once the database is created: stored {existing:?}, \
-                 config now says {value:?}. Delete the database file to reindex with new settings."
-            ),
-        }
     }
 
     pub fn current_generation(&self) -> Result<i64> {
@@ -141,7 +118,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, label, source_dir, role, last_index_run_id
+                "SELECT id, label, source_dir, last_index_run_id
                  FROM projects WHERE label = ?1",
                 [label],
                 row_to_project,
@@ -151,7 +128,7 @@ impl Db {
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, source_dir, role, last_index_run_id
+            "SELECT id, label, source_dir, last_index_run_id
                  FROM projects ORDER BY label",
         )?;
         Ok(stmt
@@ -159,22 +136,7 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn delete_project(&self, label: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM projects WHERE label = ?1", [label])?
-            > 0)
-    }
-
     // ----- source documents -----
-
-    pub fn get_file(
-        &self,
-        project_id: ProjectId,
-        relative_path: &str,
-    ) -> Result<Option<FileRecord>> {
-        self.get_file_where(project_id, "relative_path", relative_path)
-    }
 
     pub fn get_file_by_source_id(
         &self,
@@ -252,26 +214,6 @@ impl Db {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn update_file_meta(
-        &self,
-        file_id: FileId,
-        source_revision: &str,
-        mtime_ns: i64,
-        size: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE files SET source_revision = ?1, mtime_ns = ?2, size = ?3 WHERE id = ?4",
-            params![source_revision, mtime_ns, size, file_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_file(&self, file_id: FileId) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM files WHERE id = ?1", [file_id])?;
-        Ok(())
     }
 
     // ----- units and representations -----
@@ -381,32 +323,95 @@ impl Db {
         )?)
     }
 
-    pub fn set_representation(
-        &self,
-        unit_id: UnitId,
-        kind: &RepresentationKind,
-        content_hash: &str,
-        content: Option<&str>,
-    ) -> Result<()> {
-        self.set_representation_with_origin(
-            unit_id,
-            kind,
-            content_hash,
-            content,
-            &RepresentationOrigin::Derived {
-                producer: "codeindex".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )
+    /// Raw frontend call sites attributed to units of one file:
+    /// `(caller_unit_id, callee_symbol, start_line)`, ordered by line.
+    pub fn raw_references_for_file(&self, file_id: FileId) -> Result<Vec<(UnitId, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.caller_unit_id, r.callee_symbol, r.start_line
+             FROM references_raw r
+             JOIN code_units u ON u.id = r.caller_unit_id
+             WHERE u.file_id = ?1
+             ORDER BY r.start_line, r.caller_unit_id",
+        )?;
+        Ok(stmt
+            .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn set_representation_with_origin(
+    // ----- relations -----
+
+    /// Replace one producer's relations for a generation in a single
+    /// transaction. Post-publish analyzers (LSP, SCIP) call this after
+    /// resolving edges against the published corpus.
+    pub fn replace_relations(
+        &self,
+        generation: i64,
+        provenance: &str,
+        relations: &[storage::RelationRecord],
+    ) -> Result<usize> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.conn.execute(
+            "DELETE FROM relations WHERE generation = ?1 AND provenance = ?2",
+            params![generation, provenance],
+        )?;
+        let mut inserted = 0;
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO relations(
+                   generation, from_entity_id, to_entity_id, to_symbol, kind,
+                   resolution, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for relation in relations {
+                inserted += stmt.execute(params![
+                    generation,
+                    relation.from_entity_id.as_str(),
+                    relation.to_entity_id.as_ref().map(|id| id.as_str()),
+                    relation.to_symbol,
+                    relation.kind,
+                    relation.resolution,
+                    relation.provenance,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Every relation recorded for a generation, deterministic order.
+    pub fn relations_for_generation(
+        &self,
+        generation: i64,
+    ) -> Result<Vec<storage::RelationRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_entity_id, to_entity_id, to_symbol, kind, resolution, provenance
+             FROM relations WHERE generation = ?1
+             ORDER BY from_entity_id, kind, to_symbol, id",
+        )?;
+        Ok(stmt
+            .query_map([generation], |row| {
+                Ok(storage::RelationRecord {
+                    from_entity_id: EntityId::new(row.get::<_, String>(0)?),
+                    to_entity_id: row.get::<_, Option<String>>(1)?.map(EntityId::new),
+                    to_symbol: row.get(2)?,
+                    kind: row.get(3)?,
+                    resolution: row.get(4)?,
+                    provenance: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Insert or replace one derived/imported representation on a live unit.
+    /// Post-publish analyzers use this for channels like `typed_signature`;
+    /// deterministic extracted channels always come from the staging pipeline.
+    pub fn upsert_representation(
         &self,
         unit_id: UnitId,
-        kind: &RepresentationKind,
-        content_hash: &str,
-        content: Option<&str>,
-        origin: &RepresentationOrigin,
+        representation: &NewRepresentation,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO representations(unit_id, kind, content_hash, content, origin_json)
@@ -417,104 +422,38 @@ impl Db {
                origin_json = excluded.origin_json",
             params![
                 unit_id,
-                kind.as_str(),
-                content_hash,
-                content,
-                serde_json::to_string(origin)?
+                representation.kind.as_str(),
+                representation.content_hash,
+                representation.content,
+                serde_json::to_string(&representation.origin)?
             ],
         )?;
         Ok(())
     }
 
-    pub fn clear_channel_for_project(
-        &self,
-        project_id: ProjectId,
-        kind: &RepresentationKind,
-    ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM representations WHERE kind = ?1 AND unit_id IN
-               (SELECT u.id FROM code_units u JOIN files f ON f.id = u.file_id
-                WHERE f.project_id = ?2)",
-            params![kind.as_str(), project_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn prune_orphan_entities(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM entities WHERE entity_id NOT IN
-               (SELECT DISTINCT entity_id FROM code_units)",
-            [],
-        )?)
-    }
-
-    // ----- references -----
-
-    pub fn insert_references(&self, references: &[NewReference]) -> Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO references_raw(caller_unit_id, callee_symbol, call_snippet, start_line)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for reference in references {
-            stmt.execute(params![
-                reference.caller_unit_id,
-                reference.callee_symbol,
-                reference.call_snippet,
-                reference.start_line,
-            ])?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn references_for_project(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<(UnitId, String, Option<String>, String, String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.caller_unit_id, u.name, u.scope, r.callee_symbol,
-                    r.call_snippet, r.start_line
-             FROM references_raw r
-             JOIN code_units u ON u.id = r.caller_unit_id
-             JOIN files f ON f.id = u.file_id
-             WHERE f.project_id = ?1 ORDER BY r.caller_unit_id, r.start_line",
-        )?;
-        Ok(stmt
-            .query_map([project_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
     // ----- models and spaces -----
 
-    pub fn find_or_create_model(&self, identity: &ModelIdentity) -> Result<ModelId> {
+    pub fn find_or_create_model(&self, contract: &ModelContract) -> Result<ModelId> {
+        let prompts_json = serde_json::to_string(&contract.prompts)?;
         let existing: Option<ModelId> = self
             .conn
             .query_row(
                 "SELECT id FROM embedding_models
-                 WHERE backend = ?1 AND backend_version = ?2 AND model = ?3
-                   AND revision IS ?4 AND dimensions = ?5
-                   AND tokenizer_hash IS ?6 AND model_hash IS ?7
-                   AND normalize = ?8 AND execution_provider = ?9 AND quantization IS ?10",
+                 WHERE model = ?1 AND revision IS ?2 AND model_hash IS ?3
+                   AND tokenizer_hash IS ?4 AND pooling = ?5 AND normalize = ?6
+                   AND native_dimensions = ?7 AND max_sequence_length = ?8
+                   AND prompts_json = ?9 AND quantization IS ?10",
                 params![
-                    identity.backend,
-                    identity.backend_version,
-                    identity.model,
-                    identity.revision,
-                    identity.dimensions as i64,
-                    identity.tokenizer_hash,
-                    identity.model_hash,
-                    identity.normalize as i64,
-                    identity.execution_provider,
-                    identity.quantization,
+                    contract.model,
+                    contract.revision,
+                    contract.model_hash,
+                    contract.tokenizer_hash,
+                    contract.pooling.as_str(),
+                    contract.normalize as i64,
+                    contract.native_dimensions as i64,
+                    contract.max_sequence_length as i64,
+                    prompts_json,
+                    contract.quantization,
                 ],
                 |row| row.get(0),
             )
@@ -524,46 +463,100 @@ impl Db {
         }
         self.conn.execute(
             "INSERT INTO embedding_models(
-               backend, backend_version, runtime_version, model, revision, dimensions,
-               tokenizer_hash, model_hash, normalize, execution_provider, quantization, cache_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+               model, revision, model_hash, tokenizer_hash, pooling, normalize,
+               native_dimensions, max_sequence_length, prompts_json, quantization)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                identity.backend,
-                identity.backend_version,
-                identity.runtime_version,
-                identity.model,
-                identity.revision,
-                identity.dimensions as i64,
-                identity.tokenizer_hash,
-                identity.model_hash,
-                identity.normalize as i64,
-                identity.execution_provider,
-                identity.quantization,
-                identity.cache_path,
+                contract.model,
+                contract.revision,
+                contract.model_hash,
+                contract.tokenizer_hash,
+                contract.pooling.as_str(),
+                contract.normalize as i64,
+                contract.native_dimensions as i64,
+                contract.max_sequence_length as i64,
+                prompts_json,
+                contract.quantization,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn get_model(&self, id: ModelId) -> Result<Option<EmbeddingModelRecord>> {
-        Ok(self
+    /// Record that a model executed in a given environment. Append-only
+    /// provenance: one row per distinct environment, `last_seen_at` refreshed
+    /// on repeats.
+    pub fn record_model_execution(
+        &self,
+        model_id: ModelId,
+        execution: &ExecutionInfo,
+    ) -> Result<()> {
+        let existing: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id, backend, backend_version, runtime_version, model, revision,
-                        dimensions, tokenizer_hash, model_hash, normalize,
-                        execution_provider, quantization, cache_path
-                 FROM embedding_models WHERE id = ?1",
-                [id],
-                row_to_model,
+                "SELECT id FROM model_executions
+                 WHERE model_id = ?1 AND backend = ?2 AND backend_version = ?3
+                   AND runtime_version IS ?4 AND execution_provider = ?5 AND cache_path IS ?6",
+                params![
+                    model_id,
+                    execution.backend,
+                    execution.backend_version,
+                    execution.runtime_version,
+                    execution.execution_provider,
+                    execution.cache_path,
+                ],
+                |row| row.get(0),
             )
-            .optional()?)
+            .optional()?;
+        match existing {
+            Some(id) => {
+                self.conn.execute(
+                    "UPDATE model_executions SET last_seen_at = datetime('now') WHERE id = ?1",
+                    [id],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO model_executions(
+                       model_id, backend, backend_version, runtime_version,
+                       execution_provider, cache_path, first_seen_at, last_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+                    params![
+                        model_id,
+                        execution.backend,
+                        execution.backend_version,
+                        execution.runtime_version,
+                        execution.execution_provider,
+                        execution.cache_path,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every execution environment recorded for a model, oldest first.
+    pub fn model_executions(&self, model_id: ModelId) -> Result<Vec<ExecutionInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT backend, backend_version, runtime_version, execution_provider, cache_path
+             FROM model_executions WHERE model_id = ?1 ORDER BY id",
+        )?;
+        Ok(stmt
+            .query_map([model_id], |row| {
+                Ok(ExecutionInfo {
+                    backend: row.get(0)?,
+                    backend_version: row.get(1)?,
+                    runtime_version: row.get(2)?,
+                    execution_provider: row.get(3)?,
+                    cache_path: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn list_models(&self) -> Result<Vec<EmbeddingModelRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, backend, backend_version, runtime_version, model, revision,
-                    dimensions, tokenizer_hash, model_hash, normalize,
-                    execution_provider, quantization, cache_path
+            "SELECT id, model, revision, model_hash, tokenizer_hash, pooling, normalize,
+                    native_dimensions, max_sequence_length, prompts_json, quantization
              FROM embedding_models ORDER BY id",
         )?;
         Ok(stmt
@@ -579,7 +572,7 @@ impl Db {
             if existing.identity != *identity {
                 bail!(
                     "embedding space {:?} already exists with a different model, channel, or \
-                     input transform",
+                     document-side contract",
                     identity.id.as_str()
                 );
             }
@@ -587,13 +580,14 @@ impl Db {
         }
         let model_id = self.find_or_create_model(&identity.model)?;
         self.conn.execute(
-            "INSERT INTO embedding_spaces(space_id, model_id, channel, input_transform, created_at)
+            "INSERT INTO embedding_spaces(
+               space_id, model_id, channel, document_side_json, created_at)
              VALUES (?1, ?2, ?3, ?4, datetime('now'))",
             params![
                 identity.id.as_str(),
                 model_id,
                 identity.channel.as_str(),
-                identity.input_transform,
+                serde_json::to_string(&identity.document_side)?,
             ],
         )?;
         Ok(identity.id.clone())
@@ -603,12 +597,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT s.space_id, s.model_id, s.channel, s.input_transform,
-                        m.backend, m.backend_version, m.runtime_version, m.model, m.revision,
-                        m.dimensions, m.tokenizer_hash, m.model_hash, m.normalize,
-                        m.execution_provider, m.quantization, m.cache_path
-                 FROM embedding_spaces s JOIN embedding_models m ON m.id = s.model_id
-                 WHERE s.space_id = ?1",
+                &format!("{SPACE_SELECT} WHERE s.space_id = ?1"),
                 [id.as_str()],
                 row_to_space,
             )
@@ -616,14 +605,9 @@ impl Db {
     }
 
     pub fn list_spaces(&self) -> Result<Vec<EmbeddingSpaceRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.space_id, s.model_id, s.channel, s.input_transform,
-                    m.backend, m.backend_version, m.runtime_version, m.model, m.revision,
-                    m.dimensions, m.tokenizer_hash, m.model_hash, m.normalize,
-                    m.execution_provider, m.quantization, m.cache_path
-             FROM embedding_spaces s JOIN embedding_models m ON m.id = s.model_id
-             ORDER BY s.space_id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SPACE_SELECT} ORDER BY s.space_id"))?;
         Ok(stmt
             .query_map([], row_to_space)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -648,47 +632,83 @@ impl Db {
         content_hash: &str,
         vector: &[f32],
     ) -> Result<()> {
+        self.insert_embeddings(space_id, &[(content_hash.to_string(), vector.to_vec())])
+            .map(|_| ())
+    }
+
+    /// Insert one page of vectors in a single transaction. The space is
+    /// resolved and dimension-checked once per call; each row is still guarded
+    /// against re-introducing an orphan content hash.
+    pub fn insert_embeddings(
+        &self,
+        space_id: &EmbeddingSpaceId,
+        vectors: &[(String, Vec<f32>)],
+    ) -> Result<usize> {
+        if vectors.is_empty() {
+            return Ok(0);
+        }
         let space = self
             .get_space(space_id)?
             .with_context(|| format!("unknown embedding space {space_id}"))?;
-        anyhow::ensure!(
-            vector.len() == space.identity.model.dimensions,
-            "embedding space {space_id} expects {} dimensions, got {}",
-            space.identity.model.dimensions,
-            vector.len()
-        );
-        let norm = vector
-            .iter()
-            .map(|value| (*value as f64) * (*value as f64))
-            .sum::<f64>()
-            .sqrt();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO embeddings(space_id, content_hash, vector_blob, norm, created_at)
-             SELECT ?1, ?2, ?3, ?4, datetime('now')
-             WHERE EXISTS (
-               SELECT 1 FROM embedding_spaces s
-               JOIN representations r ON r.kind = s.channel
-               WHERE s.space_id = ?1 AND r.content_hash = ?2
-             )",
-            params![space_id.as_str(), content_hash, vector_to_blob(vector), norm],
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
         )?;
-        Ok(())
+        let mut inserted = 0;
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO embeddings(space_id, content_hash, vector_blob, norm, created_at)
+                 SELECT ?1, ?2, ?3, ?4, datetime('now')
+                 WHERE EXISTS (
+                   SELECT 1 FROM embedding_spaces s
+                   JOIN representations r ON r.kind = s.channel
+                   WHERE s.space_id = ?1 AND r.content_hash = ?2
+                 )",
+            )?;
+            let expected_dimensions = space.identity.effective_dimensions();
+            for (content_hash, vector) in vectors {
+                anyhow::ensure!(
+                    vector.len() == expected_dimensions,
+                    "embedding space {space_id} expects {expected_dimensions} dimensions, got {}",
+                    vector.len()
+                );
+                let norm = vector
+                    .iter()
+                    .map(|value| (*value as f64) * (*value as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                // Rows the orphan guard rejects (or that already exist) count
+                // zero changed rows and must not be reported as stored.
+                inserted += stmt.execute(params![
+                    space_id.as_str(),
+                    content_hash,
+                    vector_to_blob(vector),
+                    norm
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
     }
 
-    pub fn get_embedding(
+    /// Every stored vector of one space as `(content_hash, vector)`,
+    /// hash-ordered. Read API for drift gates and export tooling.
+    pub fn embeddings_for_space(
         &self,
         space_id: &EmbeddingSpaceId,
-        content_hash: &str,
-    ) -> Result<Option<Vec<f32>>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT vector_blob FROM embeddings WHERE space_id = ?1 AND content_hash = ?2",
-                params![space_id.as_str(), content_hash],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|blob| blob_to_vector(&blob)))
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, vector_blob FROM embeddings
+             WHERE space_id = ?1 ORDER BY content_hash",
+        )?;
+        Ok(stmt
+            .query_map([space_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    blob_to_vector(&row.get::<_, Vec<u8>>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn count_embeddings(&self, space_id: &EmbeddingSpaceId) -> Result<i64> {
@@ -802,19 +822,6 @@ impl Db {
         Ok(locations)
     }
 
-    pub fn prune_orphan_embeddings(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM embeddings
-             WHERE NOT EXISTS (
-               SELECT 1 FROM embedding_spaces s
-               JOIN representations r
-                 ON r.kind = s.channel AND r.content_hash = embeddings.content_hash
-               WHERE s.space_id = embeddings.space_id
-             )",
-            [],
-        )?)
-    }
-
     // ----- analysis provenance -----
 
     pub fn create_analysis_run(
@@ -921,7 +928,8 @@ impl Db {
         let sql = format!(
             "SELECT u.id, u.entity_id, u.entity_version_id, u.generation,
                     p.label, f.relative_path, u.language_id, u.kind, u.name, u.scope,
-                    u.start_byte, u.end_byte, u.start_line, u.end_line, u.body_node_count
+                    u.start_byte, u.end_byte, u.start_line, u.end_line, u.body_node_count,
+                    u.normalized_body_hash
              FROM code_units u
              JOIN files f ON f.id = u.file_id
              JOIN projects p ON p.id = f.project_id
@@ -952,6 +960,7 @@ impl Db {
                                 row.get::<_, i64>(13)? as usize,
                             ),
                             body_node_count: row.get::<_, i64>(14)? as usize,
+                            normalized_body_hash: row.get(15)?,
                             representations: Vec::new(),
                         },
                     ))
@@ -1042,14 +1051,15 @@ impl Db {
             });
         }
 
+        let published_generation = self.current_generation()?;
         Ok(IndexSnapshot {
-            published_generation: self.current_generation()? as u64,
+            published_generation: published_generation as u64,
+            relations: self.relations_for_generation(published_generation)?,
             projects: projects
                 .into_iter()
                 .map(|project| ProjectRecord {
                     label: project.label,
                     source_dir: project.source_dir,
-                    role: project.role,
                     last_index_run_id: project.last_index_run_id.map(|id| id as u64),
                 })
                 .collect(),
@@ -1064,8 +1074,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         id: row.get(0)?,
         label: row.get(1)?,
         source_dir: row.get(2)?,
-        role: row.get(3)?,
-        last_index_run_id: row.get(4)?,
+        last_index_run_id: row.get(3)?,
     })
 }
 
@@ -1104,23 +1113,52 @@ fn row_to_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeUnit> {
     })
 }
 
+/// Shared select list for spaces joined with their semantic model contract.
+const SPACE_SELECT: &str = "SELECT s.space_id, s.model_id, s.channel, s.document_side_json,
+        m.model, m.revision, m.model_hash, m.tokenizer_hash, m.pooling, m.normalize,
+        m.native_dimensions, m.max_sequence_length, m.prompts_json, m.quantization
+ FROM embedding_spaces s JOIN embedding_models m ON m.id = s.model_id";
+
+/// Decode a JSON column, surfacing malformed persisted data as a conversion
+/// error instead of a panic.
+fn json_column<T: serde::de::DeserializeOwned>(index: usize, value: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+fn pooling_column(index: usize, value: &str) -> rusqlite::Result<Pooling> {
+    Pooling::parse(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            format!("unknown pooling {value:?}").into(),
+        )
+    })
+}
+
+fn model_contract_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ModelContract> {
+    Ok(ModelContract {
+        model: row.get(offset)?,
+        revision: row.get(offset + 1)?,
+        model_hash: row.get(offset + 2)?,
+        tokenizer_hash: row.get(offset + 3)?,
+        pooling: pooling_column(offset + 4, &row.get::<_, String>(offset + 4)?)?,
+        normalize: row.get::<_, i64>(offset + 5)? != 0,
+        native_dimensions: row.get::<_, i64>(offset + 6)? as usize,
+        max_sequence_length: row.get::<_, i64>(offset + 7)? as usize,
+        prompts: json_column(offset + 8, &row.get::<_, String>(offset + 8)?)?,
+        quantization: row.get(offset + 9)?,
+    })
+}
+
 fn row_to_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingModelRecord> {
     Ok(EmbeddingModelRecord {
         id: row.get(0)?,
-        identity: ModelIdentity {
-            backend: row.get(1)?,
-            backend_version: row.get(2)?,
-            runtime_version: row.get(3)?,
-            model: row.get(4)?,
-            revision: row.get(5)?,
-            dimensions: row.get::<_, i64>(6)? as usize,
-            tokenizer_hash: row.get(7)?,
-            model_hash: row.get(8)?,
-            normalize: row.get::<_, i64>(9)? != 0,
-            execution_provider: row.get(10)?,
-            quantization: row.get(11)?,
-            cache_path: row.get(12)?,
-        },
+        contract: model_contract_from_row(row, 1)?,
     })
 }
 
@@ -1129,21 +1167,8 @@ fn row_to_space(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingSpaceRecor
         identity: EmbeddingSpaceIdentity {
             id: EmbeddingSpaceId::new(row.get::<_, String>(0)?),
             channel: RepresentationKind::from(row.get::<_, String>(2)?.as_str()),
-            input_transform: row.get(3)?,
-            model: ModelIdentity {
-                backend: row.get(4)?,
-                backend_version: row.get(5)?,
-                runtime_version: row.get(6)?,
-                model: row.get(7)?,
-                revision: row.get(8)?,
-                dimensions: row.get::<_, i64>(9)? as usize,
-                tokenizer_hash: row.get(10)?,
-                model_hash: row.get(11)?,
-                normalize: row.get::<_, i64>(12)? != 0,
-                execution_provider: row.get(13)?,
-                quantization: row.get(14)?,
-                cache_path: row.get(15)?,
-            },
+            document_side: json_column(3, &row.get::<_, String>(3)?)?,
+            model: model_contract_from_row(row, 4)?,
         },
         model_id: row.get(1)?,
     })
@@ -1153,20 +1178,18 @@ fn row_to_space(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingSpaceRecor
 mod tests {
     use super::*;
 
-    fn model(name: &str, dimensions: usize) -> ModelIdentity {
-        ModelIdentity {
-            backend: "hash".into(),
-            backend_version: "0".into(),
-            runtime_version: None,
+    fn model(name: &str, dimensions: usize) -> ModelContract {
+        ModelContract {
             model: name.into(),
             revision: None,
-            dimensions,
-            tokenizer_hash: None,
             model_hash: None,
+            tokenizer_hash: None,
+            pooling: Pooling::Mean,
             normalize: true,
-            execution_provider: "cpu".into(),
+            native_dimensions: dimensions,
+            max_sequence_length: 512,
+            prompts: codeindex_core::PromptContract::Symmetric,
             quantization: None,
-            cache_path: None,
         }
     }
 

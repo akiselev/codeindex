@@ -1,4 +1,3 @@
 id = "c"
-name = "C"
 extensions = ["c", "h"]
 comment_nodes = ["comment"]

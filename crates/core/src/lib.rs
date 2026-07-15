@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -417,22 +418,144 @@ pub struct ExtractedFile {
     pub diagnostics: Vec<IndexDiagnostic>,
 }
 
-/// Everything that identifies an embedding model for reproducible runs.
+/// How a model reduces token states to one vector. Part of vector semantics:
+/// two runs of the same weights with different pooling produce incompatible
+/// vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pooling {
+    Mean,
+    Cls,
+    /// Last non-padding token (decoder-style embedders such as Qwen3).
+    LastToken,
+    /// Pooling is baked into the executing backend's own per-model
+    /// configuration (fastembed catalog models) and not independently known.
+    ModelDefined,
+}
+
+impl Pooling {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::Cls => "cls",
+            Self::LastToken => "last_token",
+            Self::ModelDefined => "model_defined",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mean" => Some(Self::Mean),
+            "cls" => Some(Self::Cls),
+            "last_token" => Some(Self::LastToken),
+            "model_defined" => Some(Self::ModelDefined),
+            _ => None,
+        }
+    }
+}
+
+/// Prompt templates for both retrieval roles, keyed by task profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelIdentity {
+pub struct PairedPrompts {
+    pub query: String,
+    pub document: String,
+}
+
+/// How a model expects queries and documents to be rendered before encoding.
+/// Part of vector semantics on the document side; the query side is applied
+/// per request and recorded with results rather than in space identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptContract {
+    /// Symmetric encoders (BGE, MiniLM): queries and documents embed verbatim.
+    Symmetric,
+    /// Qwen3 style: queries take a task instruction rendered through
+    /// `query_template` (placeholders `{instruction}` and `{query}`);
+    /// documents embed raw. `default_instruction` is the model's shipped
+    /// default task when the caller supplies none.
+    QueryInstruction {
+        query_template: String,
+        default_instruction: Option<String>,
+    },
+    /// Fixed role prefixes (CodeRankEmbed, E5): each side gets one literal
+    /// prefix; task instructions are not supported.
+    RolePrefixes { query: String, document: String },
+    /// Per-task paired templates on both sides (Jina Code). Changing task
+    /// changes document vectors, so the chosen task must live in the space's
+    /// document-side contract.
+    PairedTask {
+        tasks: BTreeMap<String, PairedPrompts>,
+    },
+}
+
+/// A named retrieval intent plus the instruction text an instruction-aware
+/// model renders for it on the query side. Recorded with search results for
+/// reproducibility; never part of document-side space identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingTask {
+    pub id: String,
+    pub instruction: String,
+}
+
+impl EmbeddingTask {
+    pub fn new(id: impl Into<String>, instruction: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            instruction: instruction.into(),
+        }
+    }
+}
+
+/// The semantic identity of an embedding model: every field that changes the
+/// meaning of produced vectors, and nothing that does not. This is the value
+/// persisted with embedding spaces and compared for compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelContract {
+    /// Model reference, e.g. `hf:Qwen/Qwen3-Embedding-0.6B` or a catalog name.
+    pub model: String,
+    /// Resolved revision (commit, pinned tag, or artifact descriptor).
+    pub revision: Option<String>,
+    pub model_hash: Option<String>,
+    pub tokenizer_hash: Option<String>,
+    pub pooling: Pooling,
+    pub normalize: bool,
+    /// The model's own output width. A space may project to fewer dimensions
+    /// via its document-side contract (Matryoshka truncation).
+    pub native_dimensions: usize,
+    pub max_sequence_length: usize,
+    pub prompts: PromptContract,
+    /// Quantization changes vectors; quantized artifacts never share spaces
+    /// with fp32 ones.
+    pub quantization: Option<String>,
+}
+
+/// Where and how a model executed. Provenance only: never compared for
+/// space compatibility, persisted append-only for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionInfo {
     pub backend: String,
     pub backend_version: String,
-    /// ONNX Runtime / `ort` version when applicable.
+    /// ONNX Runtime / candle version when applicable.
     pub runtime_version: Option<String>,
-    pub model: String,
-    pub revision: Option<String>,
-    pub dimensions: usize,
-    pub tokenizer_hash: Option<String>,
-    pub model_hash: Option<String>,
-    pub normalize: bool,
     pub execution_provider: String,
-    pub quantization: Option<String>,
     pub cache_path: Option<String>,
+}
+
+/// The document-side half of a space's input contract: how stored
+/// representation text is rendered before embedding, and the projected output
+/// width. Rendered at embed time — never baked into stored representation
+/// content, so content-addressed vector reuse survives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSideContract {
+    /// Literal prefix (or task-selected document template, pre-rendered)
+    /// applied to every document before encoding. `None` embeds verbatim —
+    /// correct for Qwen3, whose documents take no instruction.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Matryoshka projection: keep this many leading dimensions and
+    /// re-normalize. `None` keeps the model's native width.
+    #[serde(default)]
+    pub output_dimensions: Option<usize>,
 }
 
 /// Immutable meaning of one embedding space.
@@ -440,24 +563,35 @@ pub struct ModelIdentity {
 pub struct EmbeddingSpaceIdentity {
     pub id: EmbeddingSpaceId,
     pub channel: RepresentationKind,
-    pub model: ModelIdentity,
-    /// Stable name for preprocessing applied before embedding. `identity` means
-    /// the stored representation text is embedded verbatim.
-    pub input_transform: String,
+    pub model: ModelContract,
+    pub document_side: DocumentSideContract,
 }
 
 impl EmbeddingSpaceIdentity {
     pub fn new(
         id: impl Into<EmbeddingSpaceId>,
         channel: RepresentationKind,
-        model: ModelIdentity,
+        model: ModelContract,
     ) -> Self {
         Self {
             id: id.into(),
             channel,
             model,
-            input_transform: "identity".to_string(),
+            document_side: DocumentSideContract::default(),
         }
+    }
+
+    pub fn with_document_side(mut self, document_side: DocumentSideContract) -> Self {
+        self.document_side = document_side;
+        self
+    }
+
+    /// The dimension count vectors in this space actually have: the
+    /// document-side projection when set, the model's native width otherwise.
+    pub fn effective_dimensions(&self) -> usize {
+        self.document_side
+            .output_dimensions
+            .unwrap_or(self.model.native_dimensions)
     }
 }
 

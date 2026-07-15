@@ -219,6 +219,48 @@ pub struct ManifestDocument {
     pub action: DocumentAction,
 }
 
+/// One manifest row's digest line. A project's manifest digest is the sha256
+/// of its sorted row lines joined with `\n`; `publish_run` recomputes the same
+/// digest from the journal to verify consistency, so this row format must
+/// never drift between the refresh and publish sides.
+pub fn manifest_row_line(
+    source_document_id: &str,
+    relative_path: &str,
+    language_id: &str,
+    input_fingerprint: &str,
+    action: &str,
+) -> String {
+    format!("{source_document_id}\0{relative_path}\0{language_id}\0{input_fingerprint}\0{action}")
+}
+
+/// Digest of a complete manifest given its row lines, in any order.
+pub fn manifest_digest_from_lines(mut lines: Vec<String>) -> String {
+    lines.sort();
+    use sha2::Digest as _;
+    sha2::Sha256::digest(lines.join("\n").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Digest of a refreshed manifest observation set.
+pub fn manifest_digest(documents: &[ManifestDocument]) -> String {
+    manifest_digest_from_lines(
+        documents
+            .iter()
+            .map(|document| {
+                manifest_row_line(
+                    &document.source_document_id,
+                    &document.relative_path,
+                    &document.language_id,
+                    &document.input_fingerprint,
+                    document.action.as_str(),
+                )
+            })
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconcileResult {
     pub changed: bool,

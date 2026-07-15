@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use codeindex_core::ModelIdentity;
+use codeindex_core::ModelContract;
 use globset::{GlobBuilder, GlobMatcher};
 use sha2::{Digest, Sha256};
 
@@ -163,67 +163,23 @@ pub fn rank_candidates<'a>(
     scored
 }
 
-pub fn identity_diff(stored: &ModelIdentity, current: &ModelIdentity) -> Vec<String> {
-    let optional = |value: &Option<String>| value.clone().unwrap_or_else(|| "none".into());
-    let mut differences = Vec::new();
-    let mut field = |name: &str, left: String, right: String| {
-        if left != right {
-            differences.push(format!("{name} ({left:?} -> {right:?})"));
-        }
+/// Field-by-field differences between two semantic model contracts, derived
+/// mechanically from their serialized form so newly added contract fields can
+/// never be silently omitted from mismatch diagnostics.
+pub fn contract_diff(stored: &ModelContract, current: &ModelContract) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(stored)), Ok(serde_json::Value::Object(current))) =
+        (serde_json::to_value(stored), serde_json::to_value(current))
+    else {
+        return vec!["model contracts could not be serialized for comparison".into()];
     };
-    field("backend", stored.backend.clone(), current.backend.clone());
-    field(
-        "backend_version",
-        stored.backend_version.clone(),
-        current.backend_version.clone(),
-    );
-    field(
-        "runtime_version",
-        optional(&stored.runtime_version),
-        optional(&current.runtime_version),
-    );
-    field("model", stored.model.clone(), current.model.clone());
-    field(
-        "revision",
-        optional(&stored.revision),
-        optional(&current.revision),
-    );
-    field(
-        "dimensions",
-        stored.dimensions.to_string(),
-        current.dimensions.to_string(),
-    );
-    field(
-        "tokenizer_hash",
-        optional(&stored.tokenizer_hash),
-        optional(&current.tokenizer_hash),
-    );
-    field(
-        "model_hash",
-        optional(&stored.model_hash),
-        optional(&current.model_hash),
-    );
-    field(
-        "normalize",
-        stored.normalize.to_string(),
-        current.normalize.to_string(),
-    );
-    field(
-        "execution_provider",
-        stored.execution_provider.clone(),
-        current.execution_provider.clone(),
-    );
-    field(
-        "quantization",
-        optional(&stored.quantization),
-        optional(&current.quantization),
-    );
-    field(
-        "cache_path",
-        optional(&stored.cache_path),
-        optional(&current.cache_path),
-    );
-    differences
+    stored
+        .iter()
+        .filter(|(key, left)| current.get(*key) != Some(left))
+        .map(|(key, left)| {
+            let right = current.get(key).unwrap_or(&serde_json::Value::Null);
+            format!("{key} ({left} -> {right})")
+        })
+        .collect()
 }
 
 #[cfg(test)]

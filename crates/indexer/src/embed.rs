@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use codeindex_core::{EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelIdentity, RepresentationKind};
+use codeindex_core::{EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelContract, RepresentationKind};
 use codeindex_embedding::config::EmbeddingRunConfig;
 use codeindex_embedding::{
-    Embedder, TokenStats, estimated_tokens, normalize_in_place, pack_batches,
+    EmbedRequest, EmbeddingBackend, EmbeddingRole, TokenStats, apply_output_dimensions,
+    estimated_tokens, normalize_in_place, pack_batches, render_input,
 };
 use codeindex_sqlite::{Db, ModelId};
 use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_units};
@@ -37,7 +38,7 @@ pub struct EmbedProgress {
 /// embeddable representation channel using the same model.
 pub fn embed_pending(
     db: &Db,
-    embedder: &mut dyn Embedder,
+    embedder: &mut dyn EmbeddingBackend,
     config: &EmbeddingRunConfig,
 ) -> Result<EmbedStats> {
     embed_pending_with_progress(db, embedder, config, |_| {})
@@ -45,7 +46,7 @@ pub fn embed_pending(
 
 pub fn embed_pending_with_progress(
     db: &Db,
-    embedder: &mut dyn Embedder,
+    embedder: &mut dyn EmbeddingBackend,
     config: &EmbeddingRunConfig,
     mut progress: impl FnMut(EmbedProgress),
 ) -> Result<EmbedStats> {
@@ -54,7 +55,7 @@ pub fn embed_pending_with_progress(
         let identity = EmbeddingSpaceIdentity::new(
             EmbeddingSpaceId::new(format!("default/{channel}")),
             channel,
-            embedder.identity().clone(),
+            embedder.contract().clone(),
         );
         let stats = embed_space_pending_with_progress(
             db,
@@ -73,7 +74,7 @@ pub fn embed_pending_with_progress(
 /// when they target the same representation channel.
 pub fn embed_space_pending(
     db: &Db,
-    embedder: &mut dyn Embedder,
+    embedder: &mut dyn EmbeddingBackend,
     config: &EmbeddingRunConfig,
     space: &EmbeddingSpaceIdentity,
 ) -> Result<EmbedStats> {
@@ -83,24 +84,21 @@ pub fn embed_space_pending(
 /// Embed one explicit space with provider-backed source recovery and progress.
 pub fn embed_space_pending_with_progress(
     db: &Db,
-    embedder: &mut dyn Embedder,
+    embedder: &mut dyn EmbeddingBackend,
     config: &EmbeddingRunConfig,
     space: &EmbeddingSpaceIdentity,
     sources: Option<&SourceProviderCatalog<'_>>,
     progress: &mut impl FnMut(EmbedProgress),
 ) -> Result<EmbedStats> {
     anyhow::ensure!(
-        embedder.identity() == &space.model,
-        "embedder identity does not match embedding space {}",
-        space.id
-    );
-    anyhow::ensure!(
-        space.input_transform == "identity",
-        "embedding space {} requests unsupported input transform {:?}",
+        embedder.contract() == &space.model,
+        "embedder does not match embedding space {}; differing contract fields: {}",
         space.id,
-        space.input_transform
+        codeindex_query::contract_diff(&space.model, embedder.contract()).join(", ")
     );
     db.find_or_create_space(space)?;
+    let model_id = db.find_or_create_model(&space.model)?;
+    db.record_model_execution(model_id, embedder.execution())?;
 
     let mut stats = EmbedStats {
         pending_total: db.count_unembedded_hashes(&space.id)? as usize,
@@ -113,13 +111,14 @@ pub fn embed_space_pending_with_progress(
 
 fn embed_space(
     db: &Db,
-    embedder: &mut dyn Embedder,
+    embedder: &mut dyn EmbeddingBackend,
     config: &EmbeddingRunConfig,
     space: &EmbeddingSpaceIdentity,
     sources: Option<&SourceProviderCatalog<'_>>,
     stats: &mut EmbedStats,
     progress: &mut impl FnMut(EmbedProgress),
 ) -> Result<()> {
+    let document_prompt = space.document_side.prompt.clone();
     let mut after_hash: Option<String> = None;
     loop {
         let pending = db.unembedded_hashes_page(
@@ -141,8 +140,7 @@ fn embed_space(
             }
         }
         if !missing.is_empty() {
-            let recovered =
-                recover_channel_texts(db, config, &space.identity_channel(), &missing, sources)?;
+            let recovered = recover_channel_texts(db, config, &space.channel, &missing, sources)?;
             for hash in missing {
                 match recovered.get(&hash) {
                     Some(text) => resolved.push((hash, text.clone())),
@@ -152,16 +150,25 @@ fn embed_space(
         }
 
         let max_sequence_length = embedder.max_sequence_length();
+        // Token budgets must measure what the model will actually see: the
+        // document text rendered through the prompt contract.
         let mut sized: Vec<(String, String, usize)> = resolved
             .into_iter()
             .map(|(hash, text)| {
+                let rendered = render_input(
+                    &space.model,
+                    EmbeddingRole::Document,
+                    None,
+                    document_prompt.as_deref(),
+                    &text,
+                )?;
                 let tokens = embedder
-                    .count_tokens(&text)
-                    .unwrap_or_else(|| estimated_tokens(&text, max_sequence_length))
+                    .count_tokens(&rendered)
+                    .unwrap_or_else(|| estimated_tokens(&rendered, max_sequence_length))
                     .min(max_sequence_length.max(1));
-                (hash, text, tokens)
+                Ok((hash, text, tokens))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         sized.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
 
         for batch in pack_batches(
@@ -174,28 +181,40 @@ fn embed_space(
                 batch.iter().map(|(_, _, tokens)| *tokens),
                 max_sequence_length,
             );
-            let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
-            let vectors = embedder.embed(&texts)?;
+            let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
+            let request = EmbedRequest {
+                role: EmbeddingRole::Document,
+                task: None,
+                document_prompt: document_prompt.as_deref(),
+                inputs: &texts,
+            };
+            let vectors = embedder.embed(&request)?;
             anyhow::ensure!(
                 vectors.len() == batch.len(),
                 "embedder returned {} vectors for {} inputs",
                 vectors.len(),
                 batch.len()
             );
+            let mut page = Vec::with_capacity(batch.len());
             for ((hash, _, _), mut vector) in batch.iter().zip(vectors) {
                 anyhow::ensure!(
-                    vector.len() == space.model.dimensions,
+                    vector.len() == space.model.native_dimensions,
                     "model {} returned {} dimensions, expected {}",
                     space.model.model,
                     vector.len(),
-                    space.model.dimensions
+                    space.model.native_dimensions
                 );
                 if space.model.normalize {
                     normalize_in_place(&mut vector);
                 }
-                db.insert_embedding(&space.id, hash, &vector)?;
-                stats.embedded += 1;
+                apply_output_dimensions(
+                    &mut vector,
+                    space.document_side.output_dimensions,
+                    space.model.normalize,
+                )?;
+                page.push((hash.clone(), vector));
             }
+            stats.embedded += db.insert_embeddings(&space.id, &page)?;
             stats.batches += 1;
             progress(EmbedProgress {
                 space_id: space.id.clone(),
@@ -210,13 +229,12 @@ fn embed_space(
     Ok(())
 }
 
-trait SpaceChannel {
-    fn identity_channel(&self) -> RepresentationKind;
-}
-
-impl SpaceChannel for EmbeddingSpaceIdentity {
-    fn identity_channel(&self) -> RepresentationKind {
-        self.channel.clone()
+fn persisted_usize(db: &Db, key: &str) -> Result<Option<usize>> {
+    match db.get_setting(key)? {
+        None => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(|_| {
+            anyhow::anyhow!("persisted setting `{key}` is not a valid integer: {value:?}")
+        }),
     }
 }
 
@@ -229,8 +247,8 @@ fn merge_stats(total: &mut EmbedStats, stats: EmbedStats) {
     total.tokens.merge(&stats.tokens);
 }
 
-pub fn find_or_create_model_id(db: &Db, identity: &ModelIdentity) -> Result<ModelId> {
-    db.find_or_create_model(identity)
+pub fn find_or_create_model_id(db: &Db, contract: &ModelContract) -> Result<ModelId> {
+    db.find_or_create_model(contract)
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +260,7 @@ pub struct LanguageTokens {
 pub fn token_report(
     db: &Db,
     config: &EmbeddingRunConfig,
-    embedder: &dyn Embedder,
+    embedder: &dyn EmbeddingBackend,
 ) -> Result<Vec<LanguageTokens>> {
     token_report_channel(
         db,
@@ -256,7 +274,7 @@ pub fn token_report(
 pub fn token_report_channel(
     db: &Db,
     config: &EmbeddingRunConfig,
-    embedder: &dyn Embedder,
+    embedder: &dyn EmbeddingBackend,
     channel: &RepresentationKind,
     sources: Option<&SourceProviderCatalog<'_>>,
 ) -> Result<Vec<LanguageTokens>> {
@@ -304,9 +322,14 @@ fn recover_channel_texts(
 ) -> Result<HashMap<String, String>> {
     let wanted: HashSet<&str> = hashes.iter().map(String::as_str).collect();
     let locations = db.locations_for_content_hashes(channel, hashes)?;
+    // Re-extraction must use the exact settings the corpus was indexed with,
+    // or recovered text hashes silently fail to match and rows are counted
+    // unresolved. Prefer the persisted immutable settings over caller config.
     let options = ExtractOptions {
-        body_node_count_threshold: config.source_recovery.body_node_count_threshold,
-        max_body_chars: config.embedding.max_body_chars,
+        body_node_count_threshold: persisted_usize(db, "index.body_node_count_threshold")?
+            .unwrap_or(config.source_recovery.body_node_count_threshold),
+        max_body_chars: persisted_usize(db, "embedding.max_body_chars")?
+            .unwrap_or(config.embedding.max_body_chars),
     };
     let registry = LanguageRegistry::global();
     let mut recovered = HashMap::new();

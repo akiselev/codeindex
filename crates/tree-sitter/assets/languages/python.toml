@@ -1,7 +1,8 @@
 id = "python"
-name = "Python"
 extensions = ["py"]
 comment_nodes = ["comment"]
+attribute_nodes = ["decorator"]
+doc_container_nodes = ["decorated_definition"]
 adapter = "python"
 
 [[scopes]]

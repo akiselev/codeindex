@@ -1,5 +1,4 @@
 id = "csharp"
-name = "C#"
 extensions = ["cs"]
 comment_nodes = ["comment"]
 

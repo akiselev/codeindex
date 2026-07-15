@@ -1,7 +1,7 @@
 id = "rust"
-name = "Rust"
 extensions = ["rs"]
 comment_nodes = ["line_comment", "block_comment"]
+attribute_nodes = ["attribute_item"]
 adapter = "rust"
 
 [[scopes]]

@@ -16,25 +16,36 @@ codeindex = { path = "../codeindex/crates/codeindex", features = ["fastembed"] }
 
 ## 1. Embed arbitrary text without storage or parsers
 
-Depend directly on `codeindex-embedding` for the leanest path.
+Depend directly on `codeindex-embedding` for the leanest path. Its default
+features are empty, so enable `fastembed` here too:
+
+```toml
+[dependencies]
+codeindex-embedding = { path = "../codeindex/crates/embedding", features = ["fastembed"] }
+```
 
 ```rust
 use codeindex_embedding::{
-    Embedder,
+    EmbedRequest,
     config::EmbeddingConfig,
     embedder_from_config,
 };
 
 fn main() -> anyhow::Result<()> {
     let config = EmbeddingConfig {
-        model: "BGESmallENV15".into(),
+        // Any HuggingFace repo (`hf:owner/name`), local dir (`dir:/path`), or
+        // fastembed catalog name works; there is no implicit default model.
+        model: "fastembed:BGESmallENV15".into(),
         ..Default::default()
     };
     let mut embedder = embedder_from_config(&config)?;
-    let vectors = embedder.embed(&[
-        "fn parse(input: &str) -> Result<Ast>".to_string(),
-        "def parse(input): return build_ast(input)".to_string(),
-    ])?;
+    let vectors = embedder.embed(&EmbedRequest::documents(
+        &[
+            "fn parse(input: &str) -> Result<Ast>",
+            "def parse(input): return build_ast(input)",
+        ],
+        None,
+    ))?;
     println!("{} dimensions", vectors[0].len());
     Ok(())
 }
@@ -174,14 +185,13 @@ documentation.
 ```rust
 use codeindex::core::{EmbeddingSpaceIdentity, RepresentationKind};
 use codeindex::embedding::{
-    Embedder,
     config::{EmbeddingConfig, EmbeddingRunConfig, SourceRecoveryConfig},
     embedder_from_config,
 };
 use codeindex::indexer;
 
 let embedding_config = EmbeddingConfig {
-    model: "BGESmallENV15".into(),
+    model: "fastembed:BGESmallENV15".into(),
     ..Default::default()
 };
 let run_config = EmbeddingRunConfig {
@@ -194,7 +204,7 @@ let mut embedder = embedder_from_config(&embedding_config)?;
 let space = EmbeddingSpaceIdentity::new(
     "docs",
     RepresentationKind::Documentation,
-    embedder.identity().clone(),
+    embedder.contract().clone(),
 );
 let stats = indexer::embed_space_pending(
     &db,
@@ -205,8 +215,8 @@ let stats = indexer::embed_space_pending(
 println!("embedded {} representations", stats.embedded);
 ```
 
-Reusing the id `docs` with a different channel, model identity, or input
-transform is rejected.
+Reusing the id `docs` with a different channel, model contract, or
+document-side contract is rejected.
 
 `embed_pending` is a convenience operation that uses one embedder for every
 present channel, creating spaces named `default/<channel>`.
@@ -232,15 +242,23 @@ values rather than trusting external stores.
 
 ## 7. Search an explicit space
 
-The query embedder must exactly match the selected space's model identity.
+The query embedder must match the selected space's semantic model contract
+(execution environment — device, versions, cache paths — is provenance and
+never compared). Instruction-aware models accept an optional task describing
+the retrieval intent; documents never re-embed when the task changes.
 
 ```rust
-use codeindex::core::EmbeddingSpaceId;
+use codeindex::core::{EmbeddingSpaceId, EmbeddingTask};
 use codeindex::query::WhereFilter;
 
+let task = EmbeddingTask::new(
+    "code-search",
+    "Given a question about repository behavior, retrieve code that answers it",
+);
 let results = index.search_text(
     embedder.as_mut(),
     "parse command line flags",
+    Some(&task), // or None for the model's default query prompt
     &EmbeddingSpaceId::new("docs"),
     &WhereFilter::default(),
     10,
@@ -325,6 +343,7 @@ Supported keys are `project`, `language`, `kind`, `name`, `scope`, `path`, and
 
 ## Schema compatibility
 
-The schema is pre-release at epoch 3. Databases from an incompatible epoch are rejected
-with a delete-and-reindex message. This avoids accepting an old layout and
-failing later with unrelated SQL errors.
+The schema is pre-release (`codeindex_sqlite::SCHEMA_VERSION` is the current
+epoch). Databases from an incompatible epoch are rejected with a
+delete-and-reindex message. This avoids accepting an old layout and failing
+later with unrelated SQL errors.

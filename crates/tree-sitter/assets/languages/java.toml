@@ -1,5 +1,4 @@
 id = "java"
-name = "Java"
 extensions = ["java"]
 comment_nodes = ["line_comment", "block_comment"]
 

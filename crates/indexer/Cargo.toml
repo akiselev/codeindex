@@ -14,15 +14,13 @@ publish = false
 anyhow = "1.0.103"
 codeindex-core = { path = "../core" }
 codeindex-embedding = { path = "../embedding", default-features = false }
+codeindex-query = { path = "../query" }
 codeindex-sqlite = { path = "../sqlite" }
 codeindex-tree-sitter = { path = "../tree-sitter" }
 ignore = "0.4.27"
 rand = "0.9.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-
-[dev-dependencies]
-codeindex-query = { path = "../query" }
 codeindex-search = { path = "../search" }
 rusqlite = "0.40.1"
 tempfile = "3.27.0"

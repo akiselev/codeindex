@@ -1,5 +1,4 @@
 id = "kotlin"
-name = "Kotlin"
 extensions = ["kt", "kts"]
 comment_nodes = ["line_comment", "block_comment"]
 
