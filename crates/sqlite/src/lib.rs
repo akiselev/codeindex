@@ -294,11 +294,21 @@ impl Db {
                     serde_json::to_string(&repr.origin)?,
                 ])?;
             }
+            // Lexical retrieval indexes the FULL text (FullSource), not the
+            // capped embedding representation: a token deep inside an
+            // oversized body must still match (docs/oversized-units-plan.md).
+            // Implementation is the fallback for lean retention modes.
             let content = unit
                 .representations
                 .iter()
-                .find(|repr| repr.kind == RepresentationKind::Implementation)
+                .find(|repr| repr.kind == RepresentationKind::FullSource)
                 .and_then(|repr| repr.content.as_deref())
+                .or_else(|| {
+                    unit.representations
+                        .iter()
+                        .find(|repr| repr.kind == RepresentationKind::Implementation)
+                        .and_then(|repr| repr.content.as_deref())
+                })
                 .unwrap_or("");
             self.conn.execute(
                 "INSERT INTO lexical_index(rowid, name, scope, path, content)

@@ -838,7 +838,7 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
     /// Settings fixed once a corpus is first published. Enforced inside the
     /// publish transaction and validated against any existing database before
     /// a run starts; both sites must use this single list.
-    fn immutable_settings(&self) -> [(&'static str, String); 3] {
+    fn immutable_settings(&self) -> [(&'static str, String); 5] {
         [
             (
                 "index.body_node_count_threshold",
@@ -851,6 +851,14 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
             (
                 "embedding.max_body_chars",
                 self.settings.max_body_chars.to_string(),
+            ),
+            (
+                "index.fragment_threshold_chars",
+                self.settings.fragment_threshold_chars.to_string(),
+            ),
+            (
+                "index.fragment_target_chars",
+                self.settings.fragment_target_chars.to_string(),
             ),
         ]
     }

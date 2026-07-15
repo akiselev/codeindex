@@ -15,6 +15,11 @@ use crate::normalizer::{normalize_for_hash, sha256_hex, strip_ranges};
 pub struct ExtractOptions {
     pub body_node_count_threshold: usize,
     pub max_body_chars: usize,
+    /// Bodies whose stripped text exceeds this also emit fragment entities
+    /// split at AST boundaries (docs/oversized-units-plan.md).
+    pub fragment_threshold_chars: usize,
+    /// Greedy packing target for one fragment.
+    pub fragment_target_chars: usize,
 }
 
 impl Default for ExtractOptions {
@@ -22,6 +27,8 @@ impl Default for ExtractOptions {
         Self {
             body_node_count_threshold: 10,
             max_body_chars: 10_000,
+            fragment_threshold_chars: 6_000,
+            fragment_target_chars: 3_000,
         }
     }
 }
@@ -90,9 +97,10 @@ pub fn extract_units(
         if seen_ranges.contains(&(range.start, range.end)) {
             continue;
         }
-        if let Some(unit) = build_unit(def, source, pending, options) {
+        if let Some((unit, fragments)) = build_unit(def, source, pending, options) {
             seen_ranges.insert((range.start, range.end));
             units.push(unit);
+            units.extend(fragments);
         }
     }
     units.sort_by_key(|u| (u.span.start_byte, u.span.end_byte));
@@ -176,7 +184,7 @@ fn build_unit(
     source: &str,
     pending: PendingUnit<'_>,
     options: &ExtractOptions,
-) -> Option<ExtractedEntity> {
+) -> Option<(ExtractedEntity, Vec<ExtractedEntity>)> {
     let node = pending.node;
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
@@ -194,13 +202,15 @@ fn build_unit(
         .collect();
     collect_comment_ranges(node, &def.spec.comment_nodes, start_byte, &mut strip);
     let mut embedding_text = strip_ranges(display_source, &strip);
+    let stripped_chars = embedding_text.chars().count();
     // Oversized bodies truncate rather than vanish: interpreter dispatch
     // loops and generated builders are exactly the units agents ask about,
     // and a dropped unit is invisible to every retrieval mode (measured:
     // jq's `jq_next` was unfindable because it exceeded the cap). The
     // normalized hash is computed over the truncated text so identity
-    // matches the stored representation.
-    if embedding_text.chars().count() > options.max_body_chars {
+    // matches the stored representation. Coverage past the cap comes from
+    // fragment entities emitted below.
+    if stripped_chars > options.max_body_chars {
         embedding_text = embedding_text
             .chars()
             .take(options.max_body_chars)
@@ -228,7 +238,10 @@ fn build_unit(
     ));
     let source_hash = sha256_hex(display_source);
     let normalized_body_hash = sha256_hex(&normalized);
-    let name = pending.name.unwrap_or_else(|| "<anonymous>".to_string());
+    let name = pending
+        .name
+        .clone()
+        .unwrap_or_else(|| "<anonymous>".to_string());
 
     let mut representations = vec![
         Representation::new(
@@ -290,18 +303,161 @@ fn build_unit(
         sha256_hex(&symbol),
     ));
 
-    Some(ExtractedEntity {
-        language: LanguageId::from(def.spec.id.clone()),
-        kind: EntityKind::from(pending.kind),
-        name,
-        scope,
-        span,
-        body_span,
-        body_node_count,
-        source_hash,
-        normalized_body_hash,
-        representations,
-    })
+    let fragments = if stripped_chars > options.fragment_threshold_chars {
+        build_fragments(def, source, &pending, &name, &strip, options)
+    } else {
+        Vec::new()
+    };
+
+    Some((
+        ExtractedEntity {
+            language: LanguageId::from(def.spec.id.clone()),
+            kind: EntityKind::from(pending.kind),
+            name,
+            scope,
+            span,
+            body_span,
+            body_node_count,
+            source_hash,
+            normalized_body_hash,
+            representations,
+        },
+        fragments,
+    ))
+}
+
+/// Fragment an oversized body at AST boundaries: descend until nodes fit the
+/// packing target, then greedily pack consecutive nodes into fragments.
+/// Fragments are ordinary entities (`kind = fragment`, `scope = parent name`,
+/// names `parent#N`) that flow through representation, embedding, and lexical
+/// indexing unchanged — they give retrieval a handle on the *inside* of a
+/// giant function (docs/oversized-units-plan.md).
+fn build_fragments(
+    def: &LanguageDef,
+    source: &str,
+    pending: &PendingUnit<'_>,
+    parent_name: &str,
+    parent_strip: &[Range<usize>],
+    options: &ExtractOptions,
+) -> Vec<ExtractedEntity> {
+    let parent_node = pending.node;
+    let body_node = pending.body.unwrap_or(parent_node);
+    let parent_start = parent_node.start_byte();
+    let target = options.fragment_target_chars.max(256);
+
+    let mut leaves: Vec<Node<'_>> = Vec::new();
+    collect_fragment_leaves(body_node, source, target, &mut leaves);
+    if leaves.len() < 2 {
+        return Vec::new();
+    }
+
+    // Greedy pack consecutive leaves toward the target size.
+    let mut packs: Vec<(usize, usize)> = Vec::new(); // leaf index ranges
+    let mut pack_start = 0;
+    let mut pack_chars = 0usize;
+    for (index, leaf) in leaves.iter().enumerate() {
+        let leaf_chars = source[leaf.byte_range()].chars().count();
+        if pack_chars > 0 && pack_chars + leaf_chars > target {
+            packs.push((pack_start, index));
+            pack_start = index;
+            pack_chars = 0;
+        }
+        pack_chars += leaf_chars;
+    }
+    packs.push((pack_start, leaves.len()));
+    if packs.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut fragments = Vec::new();
+    for (ordinal, (from, to)) in packs.iter().enumerate() {
+        let first = &leaves[*from];
+        let last = &leaves[to - 1];
+        let start_byte = first.start_byte();
+        let end_byte = last.end_byte();
+        let display_source = &source[start_byte..end_byte];
+        // Reuse the parent's comment/strip ranges, re-based onto this slice.
+        let strip: Vec<Range<usize>> = parent_strip
+            .iter()
+            .filter_map(|range| {
+                let absolute = (range.start + parent_start)..(range.end + parent_start);
+                let clipped = absolute.start.max(start_byte)..absolute.end.min(end_byte);
+                (clipped.start < clipped.end)
+                    .then(|| (clipped.start - start_byte)..(clipped.end - start_byte))
+            })
+            .collect();
+        let mut fragment_text = strip_ranges(display_source, &strip);
+        if fragment_text.chars().count() > options.max_body_chars {
+            fragment_text = fragment_text.chars().take(options.max_body_chars).collect();
+        }
+        let normalized = normalize_for_hash(&fragment_text);
+        if normalized.is_empty() {
+            continue;
+        }
+        let name = format!("{parent_name}#{}", ordinal + 1);
+        let symbol = format!("{parent_name}.{name}");
+        let source_hash = sha256_hex(display_source);
+        let normalized_body_hash = sha256_hex(&normalized);
+        let span = SourceSpan::new(
+            start_byte,
+            end_byte,
+            first.start_position().row + 1,
+            last.end_position().row + 1,
+        );
+        fragments.push(ExtractedEntity {
+            language: LanguageId::from(def.spec.id.clone()),
+            kind: EntityKind::from("fragment".to_string()),
+            name,
+            scope: Some(parent_name.to_string()),
+            span,
+            body_span: Some(span),
+            body_node_count: leaves[*from..*to]
+                .iter()
+                .map(|n| count_named_nodes(*n))
+                .sum(),
+            source_hash,
+            normalized_body_hash: normalized_body_hash.clone(),
+            representations: vec![
+                Representation::new(
+                    RepresentationKind::FullSource,
+                    display_source,
+                    sha256_hex(display_source),
+                ),
+                Representation::new(
+                    RepresentationKind::Implementation,
+                    fragment_text,
+                    normalized_body_hash,
+                ),
+                Representation::new(
+                    RepresentationKind::Symbol,
+                    symbol.clone(),
+                    sha256_hex(&symbol),
+                ),
+            ],
+        });
+    }
+    fragments
+}
+
+/// Descend into nodes larger than the packing target so one giant child (a
+/// match/switch statement, a long block) splits at its own boundaries
+/// instead of forming one oversized fragment.
+fn collect_fragment_leaves<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    target: usize,
+    leaves: &mut Vec<Node<'tree>>,
+) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'tree>> = node.named_children(&mut cursor).collect();
+    for child in children {
+        let chars = source[child.byte_range()].chars().count();
+        if chars <= target || child.named_child_count() == 0 {
+            leaves.push(child);
+        } else {
+            collect_fragment_leaves(child, source, target, leaves);
+        }
+    }
 }
 
 /// Strip string prefixes and quotes from an adapter-identified docstring
@@ -452,6 +608,7 @@ mod tests {
             &ExtractOptions {
                 body_node_count_threshold: 1,
                 max_body_chars: 10_000,
+                ..ExtractOptions::default()
             },
         )
         .unwrap()
@@ -578,6 +735,7 @@ fn negated() { do_it() }
             &ExtractOptions {
                 body_node_count_threshold: 1,
                 max_body_chars: 10_000,
+                ..ExtractOptions::default()
             },
         )
         .unwrap();
@@ -590,6 +748,90 @@ fn negated() { do_it() }
                 .unwrap()
                 .contains("a + b")
         );
+    }
+
+    fn monster_source(marker: &str) -> String {
+        // Three distinct regions, each ~big enough to become its own
+        // fragment at the default 3k target.
+        let region = |tag: &str| -> String {
+            (0..60)
+                .map(|i| format!("    let {tag}_{i} = compute_{tag}({i});\n"))
+                .collect::<String>()
+        };
+        format!(
+            "fn dispatch_monster(input: u32) -> u32 {{\n{}{}{}    {marker}\n    input\n}}\n",
+            region("alpha"),
+            region("beta"),
+            region("gamma"),
+        )
+    }
+
+    #[test]
+    fn oversized_bodies_emit_fragments_at_ast_boundaries() {
+        let source = monster_source("let sentinel = 1;");
+        let units = small_units("rust", &source);
+        let parent = units
+            .iter()
+            .find(|unit| unit.name == "dispatch_monster")
+            .expect("parent present");
+        let fragments: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.kind.as_str() == "fragment")
+            .collect();
+        assert!(
+            fragments.len() >= 2,
+            "expected multiple fragments, got {}",
+            fragments.len()
+        );
+        for (index, fragment) in fragments.iter().enumerate() {
+            assert_eq!(fragment.name, format!("dispatch_monster#{}", index + 1));
+            assert_eq!(fragment.scope.as_deref(), Some("dispatch_monster"));
+            assert!(fragment.span.start_byte >= parent.span.start_byte);
+            assert!(fragment.span.end_byte <= parent.span.end_byte);
+            let implementation = fragment
+                .representation(&codeindex_core::RepresentationKind::Implementation)
+                .expect("fragment implementation");
+            assert!(!implementation.content.is_empty());
+        }
+        // Fragments tile the body in order without overlap.
+        for pair in fragments.windows(2) {
+            assert!(pair[0].span.end_byte <= pair[1].span.start_byte);
+        }
+    }
+
+    #[test]
+    fn editing_one_region_leaves_sibling_fragments_stable() {
+        let before = small_units("rust", &monster_source("let sentinel = 1;"));
+        let after = small_units("rust", &monster_source("let sentinel = 2;"));
+        let hashes = |units: &[ExtractedEntity]| -> Vec<(String, String)> {
+            units
+                .iter()
+                .filter(|unit| unit.kind.as_str() == "fragment")
+                .map(|unit| (unit.name.clone(), unit.normalized_body_hash.clone()))
+                .collect()
+        };
+        let before = hashes(&before);
+        let after = hashes(&after);
+        assert_eq!(before.len(), after.len());
+        let changed: Vec<_> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| b.1 != a.1)
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "exactly the edited region's fragment must change: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn small_bodies_do_not_fragment() {
+        let units = small_units(
+            "rust",
+            "fn compact(input: u32) -> u32 { let a = input + 1; let b = a * 2; b }",
+        );
+        assert!(units.iter().all(|unit| unit.kind.as_str() != "fragment"));
     }
 
     #[test]

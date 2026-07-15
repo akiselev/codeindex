@@ -199,6 +199,62 @@ fn relations_expand_seeds_one_hop_in_both_directions() {
 }
 
 #[test]
+fn fragments_synthesize_part_of_relations_and_resolve_parents() {
+    let db = open_in_memory().unwrap();
+    let project_id = db.upsert_project("main", "memory://fragments").unwrap();
+    let file_id = db
+        .upsert_file(&NewFile {
+            project_id,
+            source_document_id: "big.rs".into(),
+            source_revision: "r1".into(),
+            relative_path: "big.rs".into(),
+            language_id: "rust".into(),
+            mtime_ns: 0,
+            size: 0,
+            source_hash: "file".into(),
+        })
+        .unwrap();
+    let mut monster = unit("dispatch_monster", "the whole body", "Docs.", 1);
+    monster.start_byte = 0;
+    monster.end_byte = 10_000;
+    let mut fragment = unit("dispatch_monster#2", "an inner region", "", 2);
+    fragment.kind = "fragment".into();
+    fragment.scope = Some("dispatch_monster".into());
+    fragment.start_byte = 4_000;
+    fragment.end_byte = 7_000;
+    db.insert_units(file_id, &[monster, fragment]).unwrap();
+
+    let index = SearchIndex::from_snapshot(db.snapshot(&[]).unwrap()).unwrap();
+    let fragment_index = index
+        .units
+        .iter()
+        .position(|unit| unit.name == "dispatch_monster#2")
+        .unwrap();
+    let parent_index = index
+        .units
+        .iter()
+        .position(|unit| unit.name == "dispatch_monster")
+        .unwrap();
+    assert_eq!(index.parent_of(fragment_index), Some(parent_index));
+    assert_eq!(index.parent_of(parent_index), None);
+    let part_of: Vec<_> = index
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == "part-of")
+        .collect();
+    assert_eq!(part_of.len(), 1);
+    // Graph expansion bridges the family in both directions.
+    assert_eq!(
+        index.expand_by_relations(&[fragment_index], 10),
+        vec![parent_index]
+    );
+    assert_eq!(
+        index.expand_by_relations(&[parent_index], 10),
+        vec![fragment_index]
+    );
+}
+
+#[test]
 fn load_populates_independent_spaces() {
     let (index, _, _) = build_index();
     assert_eq!(index.units.len(), 3);

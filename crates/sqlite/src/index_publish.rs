@@ -622,11 +622,20 @@ fn insert_units(
                 ],
             )?;
         }
+        // Full text for lexical retrieval; see docs/oversized-units-plan.md.
         let content = unit
             .representations
             .iter()
-            .find(|representation| representation.kind == RepresentationKind::Implementation)
+            .find(|representation| representation.kind == RepresentationKind::FullSource)
             .and_then(|representation| representation.content.as_deref())
+            .or_else(|| {
+                unit.representations
+                    .iter()
+                    .find(|representation| {
+                        representation.kind == RepresentationKind::Implementation
+                    })
+                    .and_then(|representation| representation.content.as_deref())
+            })
             .unwrap_or("");
         transaction.execute(
             "INSERT INTO lexical_index(rowid, name, scope, path, content)

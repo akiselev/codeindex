@@ -34,6 +34,8 @@ fn clangd_enriches_c_signatures_and_call_relations() {
         enabled_languages: vec!["c".into()],
         body_node_count_threshold: 1,
         max_body_chars: 10_000,
+        fragment_threshold_chars: 6_000,
+        fragment_target_chars: 3_000,
         retention: RetentionMode::Full,
     };
     codeindex_indexer::index_sources(&db, &settings, &projects, None).unwrap();

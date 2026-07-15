@@ -20,6 +20,22 @@ use codeindex_storage::{IndexSnapshot, ProjectRecord, RepresentationRef};
 pub use codeindex_storage as storage;
 pub use vector_store::{ScoredPair, VectorStore, dot};
 
+/// Resolve a fragment's parent: same project and file, the fragment's name
+/// prefix before `#`, a containing span, and not itself a fragment.
+fn fragment_parent(units: &[CodeUnitRef], fragment: usize) -> Option<usize> {
+    let unit = &units[fragment];
+    let parent_name = unit.name.rsplit_once('#')?.0;
+    units.iter().enumerate().position(|(index, candidate)| {
+        index != fragment
+            && candidate.kind != "fragment"
+            && candidate.project_label == unit.project_label
+            && candidate.relative_path == unit.relative_path
+            && candidate.name == parent_name
+            && candidate.start_byte <= unit.start_byte
+            && candidate.end_byte >= unit.end_byte
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeUnitRef {
     pub entity_id: EntityId,
@@ -152,7 +168,7 @@ impl SearchIndex {
     /// data returns an error rather than panicking inside the vector store.
     pub fn from_snapshot(snapshot: IndexSnapshot) -> Result<SearchIndex> {
         let projects = snapshot.projects;
-        let relations = snapshot.relations;
+        let mut relations = snapshot.relations;
         let units: Vec<CodeUnitRef> = snapshot
             .units
             .into_iter()
@@ -182,6 +198,28 @@ impl SearchIndex {
                 }
             })
             .collect();
+
+        // Fragments link to their parents through synthesized `part-of`
+        // relations. Synthesized in memory rather than stored: the stored
+        // relations table is generation-replaced wholesale by analyzer
+        // enrichment, which would silently clobber extractor-written rows
+        // (docs/oversized-units-plan.md). Derivation is cheap and exact:
+        // same project+file, name prefix before `#`, span containment.
+        for (index, unit) in units.iter().enumerate() {
+            if unit.kind != "fragment" {
+                continue;
+            }
+            if let Some(parent) = fragment_parent(&units, index) {
+                relations.push(codeindex_storage::RelationRecord {
+                    from_entity_id: unit.entity_id.clone(),
+                    to_entity_id: Some(units[parent].entity_id.clone()),
+                    to_symbol: units[parent].name.clone(),
+                    kind: "part-of".into(),
+                    resolution: "exact".into(),
+                    provenance: "extractor".into(),
+                });
+            }
+        }
 
         let mut spaces = BTreeMap::new();
         for snapshot_space in snapshot.spaces {
@@ -358,6 +396,13 @@ impl SearchIndex {
         discovered.sort_by_key(|index| std::cmp::Reverse(edge_counts[index]));
         discovered.truncate(limit);
         discovered
+    }
+
+    /// The parent unit of a fragment hit, when resolvable.
+    pub fn parent_of(&self, index: usize) -> Option<usize> {
+        (self.units[index].kind == "fragment")
+            .then(|| fragment_parent(&self.units, index))
+            .flatten()
     }
 
     /// Filtered `(unit index, vector)` candidates of one space, optionally

@@ -62,6 +62,13 @@ pub struct IndexSection {
     /// directory.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Bodies above this many chars also emit fragment entities
+    /// (docs/oversized-units-plan.md). Default 6000.
+    #[serde(default)]
+    pub fragment_threshold_chars: Option<usize>,
+    /// Greedy packing target per fragment. Default 3000.
+    #[serde(default)]
+    pub fragment_target_chars: Option<usize>,
 }
 
 /// One embedding space definition. `model` is a resolvable reference

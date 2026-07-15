@@ -221,6 +221,9 @@ pub fn shape_results(
             let unit = &index.units[hit.index];
             SearchHit {
                 selector: codeindex_query::unit_id(unit),
+                parent: index
+                    .parent_of(hit.index)
+                    .map(|parent| codeindex_query::unit_id(&index.units[parent])),
                 score: rerank_scores.get(&hit.index).copied().unwrap_or(hit.score),
                 rerank_score: rerank_scores.get(&hit.index).copied(),
                 sources: hit
@@ -304,6 +307,8 @@ pub fn run_index_job(
         }),
         body_node_count_threshold: 10,
         max_body_chars: 10_000,
+        fragment_threshold_chars: config.index.fragment_threshold_chars.unwrap_or(6_000),
+        fragment_target_chars: config.index.fragment_target_chars.unwrap_or(3_000),
         retention: RetentionMode::Full,
     };
     let outcome = IndexRunBuilder::new(&db, &settings, &projects)

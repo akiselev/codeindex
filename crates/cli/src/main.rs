@@ -1150,6 +1150,8 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
         },
         body_node_count_threshold: arguments.body_node_count_threshold,
         max_body_chars: arguments.max_body_chars,
+        fragment_threshold_chars: 6_000,
+        fragment_target_chars: 3_000,
         retention: arguments.retention.into(),
     };
     let cancellation = CancellationToken::new();

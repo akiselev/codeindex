@@ -28,6 +28,8 @@ pub(crate) fn prepare_document(input: PrepareDocument<'_>) -> Result<StagedDocum
     let extraction = ExtractOptions {
         body_node_count_threshold: input.settings.body_node_count_threshold,
         max_body_chars: input.settings.max_body_chars,
+        fragment_threshold_chars: input.settings.fragment_threshold_chars,
+        fragment_target_chars: input.settings.fragment_target_chars,
     };
     let mut entities = extract_units(definition, input.source, &extraction).with_context(|| {
         format!(

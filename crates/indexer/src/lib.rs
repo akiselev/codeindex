@@ -67,6 +67,9 @@ pub struct IndexSettings {
     pub enabled_languages: Vec<String>,
     pub body_node_count_threshold: usize,
     pub max_body_chars: usize,
+    /// Bodies above this emit fragment entities (docs/oversized-units-plan.md).
+    pub fragment_threshold_chars: usize,
+    pub fragment_target_chars: usize,
     pub retention: RetentionMode,
 }
 
@@ -85,6 +88,10 @@ impl IndexOptions {
             enabled_languages: self.enabled_languages.clone(),
             body_node_count_threshold: self.body_node_count_threshold,
             max_body_chars: self.max_body_chars,
+            fragment_threshold_chars: codeindex_tree_sitter::ExtractOptions::default()
+                .fragment_threshold_chars,
+            fragment_target_chars: codeindex_tree_sitter::ExtractOptions::default()
+                .fragment_target_chars,
             retention: self.retention,
         }
     }
@@ -421,6 +428,8 @@ mod tests {
             enabled_languages: vec!["rust".into()],
             body_node_count_threshold: 1,
             max_body_chars: 10_000,
+            fragment_threshold_chars: 6_000,
+            fragment_target_chars: 3_000,
             retention: RetentionMode::Full,
         }
     }
@@ -552,6 +561,30 @@ mod tests {
             !db.lexical_search("acc += bytes.len() as u32", 10)
                 .unwrap()
                 .is_empty()
+        );
+
+        // A token deep inside an oversized body still matches: lexical
+        // indexes the FULL text even though the embedding representation
+        // truncates at max_body_chars (docs/oversized-units-plan.md).
+        let deep_body: String = (0..1500)
+            .map(|i| format!("    let filler_{i} = {i};\n"))
+            .chain(std::iter::once(
+                "    let zanzibar_sentinel = 42;\n".to_string(),
+            ))
+            .collect();
+        source.insert(
+            "huge.rs",
+            &format!("fn dispatch_monster(input: u32) -> u32 {{\n{deep_body}    input\n}}\n"),
+        );
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        let hits = db.lexical_search("zanzibar_sentinel", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "token past the embedding cap must match lexically"
         );
 
         // Deleting the document removes its lexical rows.

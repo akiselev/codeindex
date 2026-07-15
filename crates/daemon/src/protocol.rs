@@ -220,6 +220,9 @@ pub struct SearchResults {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchHit {
     pub selector: String,
+    /// Selector of the containing function when this hit is a fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub score: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,

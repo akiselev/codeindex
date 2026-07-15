@@ -325,11 +325,16 @@ fn recover_channel_texts(
     // Re-extraction must use the exact settings the corpus was indexed with,
     // or recovered text hashes silently fail to match and rows are counted
     // unresolved. Prefer the persisted immutable settings over caller config.
+    let defaults = ExtractOptions::default();
     let options = ExtractOptions {
         body_node_count_threshold: persisted_usize(db, "index.body_node_count_threshold")?
             .unwrap_or(config.source_recovery.body_node_count_threshold),
         max_body_chars: persisted_usize(db, "embedding.max_body_chars")?
             .unwrap_or(config.embedding.max_body_chars),
+        fragment_threshold_chars: persisted_usize(db, "index.fragment_threshold_chars")?
+            .unwrap_or(defaults.fragment_threshold_chars),
+        fragment_target_chars: persisted_usize(db, "index.fragment_target_chars")?
+            .unwrap_or(defaults.fragment_target_chars),
     };
     let registry = LanguageRegistry::global();
     let mut recovered = HashMap::new();
