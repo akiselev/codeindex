@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -21,10 +21,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Register a project root (creates .codeindex.toml if missing) and
+    /// start background indexing through the daemon.
+    Add(AddArgs),
+    /// Unregister a project (keeps .codeindex.toml; --purge deletes the db).
+    Remove(RemoveArgs),
+    /// Registered projects with index/job state.
+    List(ProjectListArgs),
+    /// Daemon and per-project status.
+    Status(DaemonStatusArgs),
+    /// Re-run indexing (and space embedding) for a registered project.
+    Reindex(ReindexArgs),
+    /// Control the background daemon.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
     /// Atomically index one or more filesystem projects.
     Index(IndexArgs),
     /// Inspect durable indexing runs.
-    Status(StatusArgs),
+    Runs(StatusArgs),
     /// Permanently abandon an unfinished indexing run.
     Abandon(RunArgs),
     /// Mark an unfinished indexing run superseded without starting a replacement.
@@ -34,7 +48,8 @@ enum Command {
     Models(ModelsCommand),
     /// Embed pending representations into an explicit embedding space.
     Embed(EmbedArgs),
-    /// Search an embedding space with an optional task instruction.
+    /// Search a project (hybrid retrieval, optional task instruction).
+    #[command(visible_alias = "query")]
     Search(SearchArgs),
     /// Enrich a published project through a language server: derived
     /// `typed_signature` representations plus exact `calls` relations.
@@ -90,13 +105,27 @@ struct EmbedArgs {
 
 #[derive(Args)]
 struct SearchArgs {
-    #[command(flatten)]
-    database: DatabaseArgs,
+    /// Explicit SQLite database path; bypasses project discovery and the
+    /// daemon entirely.
+    #[arg(long)]
+    db: Option<PathBuf>,
+    /// Emit versioned newline-delimited JSON.
+    #[arg(long)]
+    json: bool,
+    /// Registered project label or path (default: discovered from the
+    /// working directory by walking up to .codeindex.toml).
+    #[arg(long, conflicts_with = "db")]
+    project: Option<String>,
+    /// Run the search in this process with a freshly loaded model instead
+    /// of routing through the daemon.
+    #[arg(long)]
+    no_daemon: bool,
     /// Query text.
     query: String,
-    /// Embedding space to search.
+    /// Embedding space to search (default: the project's default_space or
+    /// its single stored space; lexical-only when none exists).
     #[arg(long)]
-    space: String,
+    space: Option<String>,
     /// Named task preset (see `--list-tasks`) rendered as the query
     /// instruction on instruction-aware models.
     #[arg(long, conflicts_with = "instruction")]
@@ -181,32 +210,7 @@ fn parse_space(value: &str) -> Result<SpaceArgument, String> {
     })
 }
 
-/// Built-in retrieval intents (FEEDBACK.md §1): stable ids agents can pass as
-/// `--task` instead of hand-writing instructions.
-const TASK_PRESETS: &[(&str, &str)] = &[
-    (
-        "code-search",
-        "Given a code search query, retrieve relevant code implementations",
-    ),
-    (
-        "locate-edit-targets",
-        "Given a software change request, retrieve code regions likely to require editing",
-    ),
-    (
-        "explain-behavior",
-        "Given a question about repository behavior, retrieve code that provides evidence for \
-         the answer",
-    ),
-    (
-        "find-analogues",
-        "Given a code fragment, retrieve functionally equivalent implementations",
-    ),
-    (
-        "diagnose-failure",
-        "Given a failure report, retrieve implementation, tests, configuration, and \
-         error-handling paths relevant to diagnosing it",
-    ),
-];
+use codeindex_query::TASK_PRESETS;
 
 #[derive(Subcommand)]
 enum ModelsCommand {
@@ -235,6 +239,60 @@ struct DatabaseArgs {
     /// Emit versioned newline-delimited JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct AddArgs {
+    /// Directory to register; walking up locates an enclosing project root.
+    path: Option<PathBuf>,
+    /// Index in this process instead of the daemon.
+    #[arg(long)]
+    no_daemon: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct RemoveArgs {
+    /// Project label or root path.
+    needle: String,
+    /// Also delete the project database (only when it lives in the managed
+    /// data directory).
+    #[arg(long)]
+    purge: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ProjectListArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DaemonStatusArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ReindexArgs {
+    /// Project label or root path; defaults to the project containing the
+    /// working directory.
+    needle: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Start (or attach to) the daemon and report its identity.
+    Start,
+    /// Request graceful shutdown.
+    Stop,
+    /// Lifecycle state as seen by the daemonkit runtime.
+    Status,
 }
 
 #[derive(Args)]
@@ -341,6 +399,17 @@ fn envelope_line<T: Serialize>(event: &str, data: T) -> serde_json::Result<Strin
 }
 
 fn main() -> ExitCode {
+    // A daemonkit bootstrap child never parses CLI arguments: the private
+    // channel in the environment decides, not argv (the `__daemon` argv
+    // marker exists only for `ps` readability).
+    match codeindex_daemon::bootstrap_entry() {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("daemon error: {error:#}");
+            return ExitCode::from(1);
+        }
+    }
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {
@@ -352,8 +421,14 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
+        Command::Add(arguments) => add_command(arguments),
+        Command::Remove(arguments) => remove_command(arguments),
+        Command::List(arguments) => list_command(arguments.json),
+        Command::Status(arguments) => status_command(arguments.json),
+        Command::Reindex(arguments) => reindex_command(arguments),
+        Command::Daemon(command) => daemon_command(command),
         Command::Index(arguments) => index_command(arguments),
-        Command::Status(arguments) => {
+        Command::Runs(arguments) => {
             let db = open_or_create(&arguments.database.db)?;
             if let Some(run_id) = arguments.run {
                 print_value(arguments.database.json, "status", &db.run_status(run_id)?)?;
@@ -489,12 +564,6 @@ struct EmbedResultOut {
 }
 
 fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
-    use codeindex_core::{EmbeddingSpaceId, EmbeddingTask};
-    use codeindex_embedding::config::EmbeddingConfig;
-    use codeindex_query::{RankedList, TestsPolicy, WhereFilter, reciprocal_rank_fusion};
-    use codeindex_search::SearchIndex;
-    use std::collections::HashMap;
-
     if arguments.list_tasks {
         for (id, instruction) in TASK_PRESETS {
             println!("{id}: {instruction}");
@@ -502,157 +571,210 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let db = open_or_create(&arguments.database.db)?;
-    let space_id = EmbeddingSpaceId::new(arguments.space.clone());
-    let space = db
-        .get_space(&space_id)?
-        .with_context(|| format!("embedding space {:?} is not stored", arguments.space))?;
+    // Explicit --db bypasses discovery and the daemon (scripting/evals).
+    if let Some(db_path) = arguments.db.clone() {
+        let results = direct_search(&arguments, &db_path, None, None)?;
+        print_value(arguments.json, "search", &results)?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
-    // The stored semantic contract's model field is itself a resolvable
-    // reference, so the matching query embedder reconstructs automatically.
-    let config = EmbeddingConfig {
-        model: space.identity.model.model.clone(),
-        cache_dir: arguments.cache_dir.clone(),
-        execution_provider: arguments.execution_provider.clone(),
-        ..EmbeddingConfig::default()
+    let cwd = std::env::current_dir()?;
+    let registry = codeindex_config::Registry::load()?;
+    let context = codeindex_config::discover(&cwd)?;
+    let registered = match (&arguments.project, &context) {
+        (Some(needle), _) => registry
+            .find(needle)
+            .cloned()
+            .with_context(|| format!("no registered project matches {needle:?}"))?,
+        (None, Some(context)) => registry
+            .find(&context.root.to_string_lossy())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "{} is not registered; run `codeindex add {}`",
+                    context.root.display(),
+                    context.root.display()
+                )
+            })?,
+        (None, None) => anyhow::bail!(
+            "no .codeindex.toml found walking up from {}; run `codeindex add`, or pass \
+             --project or --db",
+            cwd.display()
+        ),
     };
+    let context_tests = arguments
+        .include_tests
+        .then(|| "include".to_string())
+        .or_else(|| {
+            context
+                .as_ref()
+                .and_then(|context| context.tests_policy().map(str::to_owned))
+        });
+
+    // Reranking needs local model access; everything else goes through the
+    // warm daemon.
+    if arguments.no_daemon || arguments.rerank {
+        let results = direct_search(
+            &arguments,
+            &registered.db.clone(),
+            context_tests.as_deref(),
+            context.as_ref(),
+        )?;
+        print_value(arguments.json, "search", &results)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut connection = codeindex_daemon::client::Connection::ensure()?;
+    let params = codeindex_daemon::protocol::SearchParams {
+        project: Some(registered.label.clone()),
+        cwd: Some(cwd),
+        query: arguments.query.clone(),
+        space: arguments.space.clone(),
+        task: arguments.task.clone(),
+        instruction: arguments.instruction.clone(),
+        filter: arguments.filter.clone(),
+        limit: arguments.limit,
+        retrieval: Some(retrieval_name(arguments.retrieval).to_string()),
+        compress: Some(compress_name(arguments.compress).to_string()),
+        no_graph: arguments.no_graph,
+        tests: context_tests,
+    };
+    let value = connection.call("search", &params)?;
+    let results: codeindex_daemon::protocol::SearchResults =
+        serde_json::from_value(value).context("daemon returned an unexpected search payload")?;
+    print_value(arguments.json, "search", &results)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn retrieval_name(retrieval: RetrievalArgument) -> &'static str {
+    match retrieval {
+        RetrievalArgument::Hybrid => "hybrid",
+        RetrievalArgument::Dense => "dense",
+        RetrievalArgument::Lexical => "lexical",
+    }
+}
+
+fn compress_name(compress: CompressArgument) -> &'static str {
+    match compress {
+        CompressArgument::Auto => "auto",
+        CompressArgument::Off => "off",
+        CompressArgument::Always => "always",
+    }
+}
+
+/// The in-process search path: loads the model (if a space is involved) and
+/// runs the shared pipeline directly against the database.
+fn direct_search(
+    arguments: &SearchArgs,
+    db_path: &Path,
+    tests_policy: Option<&str>,
+    context: Option<&codeindex_config::ProjectContext>,
+) -> Result<codeindex_daemon::protocol::SearchResults> {
+    use codeindex_core::{EmbeddingSpaceId, EmbeddingTask};
+    use codeindex_daemon::pipeline::{self, Compress, HybridOptions, Retrieval};
+    use codeindex_embedding::config::EmbeddingConfig;
+    use codeindex_query::WhereFilter;
+    use codeindex_search::SearchIndex;
+    use std::collections::HashMap;
+
+    let db = open_or_create(db_path)?;
+    let retrieval: Retrieval = retrieval_name(arguments.retrieval).parse()?;
+    let compress: Compress = compress_name(arguments.compress).parse()?;
+
+    let space_id = arguments
+        .space
+        .clone()
+        .or_else(|| context.and_then(|context| context.config.search.default_space.clone()))
+        .map(EmbeddingSpaceId::new)
+        .or_else(|| {
+            let spaces = db.list_spaces().ok()?;
+            match spaces.as_slice() {
+                [only] => Some(only.identity.id.clone()),
+                _ => None,
+            }
+        });
+    if retrieval == Retrieval::Dense && space_id.is_none() {
+        anyhow::bail!(
+            "--retrieval dense needs an embedding space (pass --space or define one in \
+             .codeindex.toml)"
+        );
+    }
 
     let task = match (&arguments.task, &arguments.instruction) {
-        (Some(preset), _) => Some(EmbeddingTask::new(
-            preset.clone(),
-            TASK_PRESETS
-                .iter()
-                .find(|(id, _)| id == preset)
-                .map(|(_, instruction)| (*instruction).to_string())
-                .with_context(|| {
-                    format!(
-                        "unknown task preset {preset:?}; available: {}",
-                        TASK_PRESETS
-                            .iter()
-                            .map(|(id, _)| *id)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?,
-        )),
+        (Some(preset), _) => {
+            let from_config = context
+                .and_then(|context| context.config.tasks.get(preset))
+                .map(|task| task.instruction.clone());
+            let instruction = match from_config {
+                Some(instruction) => instruction,
+                None => TASK_PRESETS
+                    .iter()
+                    .find(|(id, _)| id == preset)
+                    .map(|(_, instruction)| (*instruction).to_string())
+                    .with_context(|| {
+                        format!(
+                            "unknown task preset {preset:?}; available: {}",
+                            TASK_PRESETS
+                                .iter()
+                                .map(|(id, _)| *id)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?,
+            };
+            Some(EmbeddingTask::new(preset.clone(), instruction))
+        }
         (None, Some(instruction)) => Some(EmbeddingTask::new("custom", instruction.clone())),
         (None, None) => None,
     };
 
     let mut filter = WhereFilter::parse(arguments.filter.as_deref())?;
-    if filter.tests_policy().is_none() && !arguments.include_tests {
-        filter.set_tests_policy(TestsPolicy::Exclude);
-    }
+    pipeline::apply_tests_policy(
+        &mut filter,
+        if arguments.include_tests {
+            Some("include")
+        } else {
+            tests_policy
+        },
+    )?;
+
     let index = SearchIndex::from_snapshot(db.snapshot(&[])?)?;
-
-    // First stage: dense and/or lexical candidate lists over one filter.
-    let candidates = (arguments.limit * 5).max(50);
-    let mut embedder = if arguments.retrieval == RetrievalArgument::Lexical {
-        None
-    } else {
-        Some(codeindex_embedding::embedder_from_config(&config)?)
-    };
-    let dense_hits = |embedder: &mut Box<dyn codeindex_embedding::embed::EmbeddingBackend>,
-                      text: &str|
-     -> Result<Vec<usize>> {
-        Ok(index
-            .search_text(
-                embedder.as_mut(),
-                text,
-                task.as_ref(),
-                &space_id,
-                &filter,
-                candidates,
-            )?
-            .hits
-            .iter()
-            .map(|hit| hit.index)
-            .collect())
-    };
-    let dense_indices: Vec<usize> = match embedder.as_mut() {
-        Some(embedder) => dense_hits(embedder, &arguments.query)?,
-        None => Vec::new(),
-    };
-    // A compressed variant recovers targets whose salient terms drown in
-    // narrative phrasing (evals S13); fused alongside, never instead.
-    let compressed_query = match arguments.compress {
-        CompressArgument::Off => None,
-        CompressArgument::Auto => codeindex_query::compress_query(&arguments.query, 24, 25),
-        CompressArgument::Always => codeindex_query::compress_query(&arguments.query, 24, 0),
-    };
-    let compressed_indices: Vec<usize> = match (embedder.as_mut(), compressed_query.as_deref()) {
-        (Some(embedder), Some(compressed)) => dense_hits(embedder, compressed)?,
-        _ => Vec::new(),
-    };
-    let lexical_indices: Vec<usize> = if arguments.retrieval == RetrievalArgument::Dense {
-        Vec::new()
-    } else {
-        let by_version: HashMap<(&str, &str), usize> = index
-            .units
-            .iter()
-            .enumerate()
-            .map(|(position, unit)| {
-                (
-                    (unit.project_label.as_str(), unit.entity_version_id.as_str()),
-                    position,
-                )
-            })
-            .collect();
-        db.lexical_search(&arguments.query, candidates * 2)?
-            .iter()
-            .filter_map(|hit| {
-                by_version
-                    .get(&(hit.project_label.as_str(), hit.entity_version_id.as_str()))
-                    .copied()
-            })
-            .filter(|position| filter.matches(&index.units[*position]))
-            .take(candidates)
-            .collect()
+    let options = HybridOptions {
+        query: arguments.query.clone(),
+        task,
+        space: if retrieval == Retrieval::Lexical {
+            None
+        } else {
+            space_id
+        },
+        filter,
+        limit: arguments.limit,
+        retrieval,
+        compress,
+        graph: !arguments.no_graph,
     };
 
-    let mut lists = Vec::new();
-    if !dense_indices.is_empty() {
-        lists.push(RankedList {
-            source: "dense".into(),
-            weight: 1.0,
-            indices: dense_indices,
-        });
+    let mut local_embedder = None;
+    if let Some(space_id) = &options.space {
+        let space = db
+            .get_space(space_id)?
+            .with_context(|| format!("embedding space {space_id} is not stored"))?;
+        // The stored semantic contract's model field is itself a resolvable
+        // reference, so the matching query embedder reconstructs
+        // automatically.
+        let config = EmbeddingConfig {
+            model: space.identity.model.model.clone(),
+            cache_dir: arguments.cache_dir.clone(),
+            execution_provider: arguments.execution_provider.clone(),
+            ..EmbeddingConfig::default()
+        };
+        local_embedder = Some(codeindex_embedding::embedder_from_config(&config)?);
     }
-    if !compressed_indices.is_empty() {
-        lists.push(RankedList {
-            source: "dense-compressed".into(),
-            weight: 0.7,
-            indices: compressed_indices,
-        });
-    }
-    if !lexical_indices.is_empty() {
-        lists.push(RankedList {
-            source: "lexical".into(),
-            weight: 1.0,
-            indices: lexical_indices,
-        });
-    }
-    let mut fused = reciprocal_rank_fusion(&lists, 60);
 
-    // Relation-graph expansion: 1-hop callers/callees of the top seeds join
-    // as a low-weight list and everything re-fuses. This reaches targets
-    // whose own text never matches the query.
-    if !arguments.no_graph && !index.relations.is_empty() && !fused.is_empty() {
-        let seeds: Vec<usize> = fused.iter().take(10).map(|hit| hit.index).collect();
-        let expanded: Vec<usize> = index
-            .expand_by_relations(&seeds, candidates)
-            .into_iter()
-            .filter(|position| filter.matches(&index.units[*position]))
-            .collect();
-        if !expanded.is_empty() {
-            lists.push(RankedList {
-                source: "graph".into(),
-                weight: 0.5,
-                indices: expanded,
-            });
-            fused = reciprocal_rank_fusion(&lists, 60);
-        }
-    }
+    // `mut` is exercised only by the cfg-gated rerank arm below.
+    #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
+    let mut outcome =
+        pipeline::hybrid_search(&db, &index, local_embedder.as_deref_mut(), &options)?;
 
     // Second stage: cross-encoder judgement of the fused head.
     #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
@@ -663,15 +785,16 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         #[cfg(feature = "candle")]
         {
             use codeindex_embedding::rerank::{Qwen3Reranker, Reranker as _};
-            let head = arguments.rerank_candidates.min(fused.len());
-            let instruction = task
+            let head = arguments.rerank_candidates.min(outcome.fused.len());
+            let instruction = options
+                .task
                 .as_ref()
                 .map(|task| task.instruction.clone())
                 .unwrap_or_else(|| {
                     "Given a code search query, retrieve relevant code implementations".to_string()
                 });
             let mut judged: Vec<(usize, &str)> = Vec::new();
-            for hit in fused.iter().take(head) {
+            for hit in outcome.fused.iter().take(head) {
                 let unit = &index.units[hit.index];
                 let text = unit
                     .representations
@@ -684,15 +807,21 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
                 }
             }
             if !judged.is_empty() {
+                let config = EmbeddingConfig {
+                    model: String::new(),
+                    cache_dir: arguments.cache_dir.clone(),
+                    execution_provider: arguments.execution_provider.clone(),
+                    ..EmbeddingConfig::default()
+                };
                 let mut reranker = Qwen3Reranker::from_reference(&arguments.rerank_model, &config)?;
                 let documents: Vec<&str> = judged.iter().map(|(_, text)| *text).collect();
                 let scores = reranker.rerank(&instruction, &arguments.query, &documents)?;
                 for ((position, _), score) in judged.iter().zip(scores) {
                     rerank_scores.insert(*position, score);
                 }
-                // Judged candidates re-sort by relevance; unjudged keep their
-                // fused order below them.
-                fused.sort_by(|left, right| {
+                // Judged candidates re-sort by relevance; unjudged keep
+                // their fused order below them.
+                outcome.fused.sort_by(|left, right| {
                     match (
                         rerank_scores.get(&left.index),
                         rerank_scores.get(&right.index),
@@ -707,74 +836,221 @@ fn search_command(arguments: SearchArgs) -> Result<ExitCode> {
         }
     }
 
-    let matched = fused.len();
-    let hits: Vec<SearchHitOut> = fused
-        .iter()
-        .take(arguments.limit)
-        .map(|hit| {
-            let unit = &index.units[hit.index];
-            SearchHitOut {
-                selector: codeindex_query::unit_id(unit),
-                score: rerank_scores.get(&hit.index).copied().unwrap_or(hit.score),
-                rerank_score: rerank_scores.get(&hit.index).copied(),
-                sources: hit
-                    .contributions
-                    .iter()
-                    .map(|(source, rank)| format!("{source}#{rank}"))
-                    .collect(),
-                project: unit.project_label.clone(),
-                path: unit.relative_path.clone(),
-                lines: [unit.start_line, unit.end_line],
-                language: unit.language_id.clone(),
-                kind: unit.kind.clone(),
-                name: unit.name.clone(),
-                scope: unit.scope.clone(),
-            }
-        })
-        .collect();
+    Ok(pipeline::shape_results(
+        &index,
+        &outcome,
+        &options,
+        &rerank_scores,
+    ))
+}
+
+fn add_command(arguments: AddArgs) -> Result<ExitCode> {
+    let path = match &arguments.path {
+        Some(path) => path.clone(),
+        None => std::env::current_dir()?,
+    };
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("{} does not exist", path.display()))?;
+    // Adding from inside an existing project registers the enclosing root.
+    let root = match codeindex_config::discover(&path)? {
+        Some(context) => context.root,
+        None => path,
+    };
+    let config_path = root.join(codeindex_config::CONFIG_FILE);
+    if !config_path.exists() {
+        let label = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".into());
+        std::fs::write(&config_path, codeindex_config::starter_config(&label))?;
+        eprintln!("created {}", config_path.display());
+    }
+
+    if arguments.no_daemon {
+        let context = codeindex_config::discover(&root)?
+            .context("the project root just written failed discovery")?;
+        codeindex_config::validate_root_config(&context.config)?;
+        let mut registry = codeindex_config::Registry::load()?;
+        let project = registry.register(&root, &context.label(), context.db_path())?;
+        registry.save()?;
+        let overrides = codeindex_config::collect_overrides(&root)?;
+        let mut embedder_for =
+            |model: &str| -> Result<Box<dyn codeindex_embedding::EmbeddingBackend>> {
+                codeindex_embedding::embedder_from_config(
+                    &codeindex_embedding::config::EmbeddingConfig {
+                        model: model.to_string(),
+                        ..Default::default()
+                    },
+                )
+            };
+        let summary = codeindex_daemon::pipeline::run_index_job(
+            &project.db,
+            &project.label,
+            &root,
+            &context.config,
+            &overrides,
+            &mut embedder_for,
+            |phase, detail| eprintln!("{phase}: {detail}"),
+        )?;
+        print_value(
+            arguments.json,
+            "add",
+            &serde_json::json!({
+                "label": project.label,
+                "root": project.root,
+                "db": project.db,
+                "units": summary.units,
+                "embedded": summary.embedded_spaces,
+            }),
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut connection = codeindex_daemon::client::Connection::ensure()?;
+    let result = connection.call(
+        "project.add",
+        &codeindex_daemon::protocol::AddParams { root },
+    )?;
+    let result: codeindex_daemon::protocol::AddResult = serde_json::from_value(result)?;
+    print_value(arguments.json, "add", &result)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn remove_command(arguments: RemoveArgs) -> Result<ExitCode> {
+    if let Some(mut connection) = codeindex_daemon::client::Connection::attach()? {
+        let result = connection.call(
+            "project.remove",
+            &codeindex_daemon::protocol::RemoveParams {
+                needle: arguments.needle.clone(),
+                purge: arguments.purge,
+            },
+        )?;
+        let result: codeindex_daemon::protocol::RemoveResult = serde_json::from_value(result)?;
+        print_value(arguments.json, "remove", &result)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // No daemon running: edit the registry directly with the same
+    // owned-state purge rule the daemon applies.
+    let mut registry = codeindex_config::Registry::load()?;
+    let removed = registry.remove(&arguments.needle)?;
+    registry.save()?;
+    let mut purged = None;
+    if arguments.purge {
+        let default_dir = codeindex_config::default_db_path(&removed.root)
+            .parent()
+            .map(Path::to_path_buf);
+        if let Some(dir) = default_dir
+            && removed.db.starts_with(&dir)
+            && dir.starts_with(codeindex_config::data_root())
+            && dir.exists()
+        {
+            std::fs::remove_dir_all(&dir)?;
+            purged = Some(dir);
+        }
+    }
     print_value(
-        arguments.database.json,
-        "search",
-        &SearchResultsOut {
-            query: arguments.query.clone(),
-            compressed_query,
-            space: arguments.space.clone(),
-            task: task.clone(),
-            matched,
-            hits,
+        arguments.json,
+        "remove",
+        &codeindex_daemon::protocol::RemoveResult {
+            label: removed.label,
+            root: removed.root,
+            purged,
         },
     )?;
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResultsOut {
-    query: String,
-    /// The compressed query variant fused in, when one was derived.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compressed_query: Option<String>,
-    space: String,
-    /// The exact task rendered into the query, for reproducibility.
-    task: Option<codeindex_core::EmbeddingTask>,
-    matched: usize,
-    hits: Vec<SearchHitOut>,
+fn list_command(json: bool) -> Result<ExitCode> {
+    status_command(json)
 }
 
-#[derive(Debug, Serialize)]
-struct SearchHitOut {
-    selector: String,
-    score: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rerank_score: Option<f32>,
-    /// `source#rank` contributions from each first-stage list.
-    sources: Vec<String>,
-    project: String,
-    path: String,
-    lines: [usize; 2],
-    language: String,
-    kind: String,
-    name: String,
-    scope: Option<String>,
+fn status_command(json: bool) -> Result<ExitCode> {
+    if let Some(mut connection) = codeindex_daemon::client::Connection::attach()? {
+        let value = connection.call("daemon.status", &serde_json::json!({}))?;
+        let status: codeindex_daemon::protocol::StatusResult = serde_json::from_value(value)?;
+        print_value(json, "status", &status)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Daemon not running: report registry contents directly.
+    let registry = codeindex_config::Registry::load()?;
+    let mut projects = Vec::new();
+    for project in &registry.projects {
+        let (units, spaces) = if project.db.exists() {
+            match open_or_create(&project.db) {
+                Ok(db) => (
+                    db.count_units().ok(),
+                    db.list_spaces()
+                        .map(|spaces| {
+                            spaces
+                                .into_iter()
+                                .map(|space| space.identity.id.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                Err(_) => (None, Vec::new()),
+            }
+        } else {
+            (None, Vec::new())
+        };
+        projects.push(codeindex_daemon::protocol::ProjectSummary {
+            label: project.label.clone(),
+            root: project.root.clone(),
+            db: project.db.clone(),
+            units,
+            spaces,
+            job: None,
+        });
+    }
+    if !json {
+        eprintln!("daemon: not running (state read directly from the registry)");
+    }
+    print_value(
+        json,
+        "status",
+        &serde_json::json!({ "daemon": "not-running", "projects": projects }),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn reindex_command(arguments: ReindexArgs) -> Result<ExitCode> {
+    let needle = match &arguments.needle {
+        Some(needle) => needle.clone(),
+        None => {
+            let cwd = std::env::current_dir()?;
+            codeindex_config::discover(&cwd)?
+                .map(|context| context.root.to_string_lossy().into_owned())
+                .with_context(|| {
+                    format!("no .codeindex.toml found walking up from {}", cwd.display())
+                })?
+        }
+    };
+    let mut connection = codeindex_daemon::client::Connection::ensure()?;
+    let result = connection.call(
+        "project.reindex",
+        &codeindex_daemon::protocol::NeedleParams { needle },
+    )?;
+    print_value(arguments.json, "reindex", &result)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn daemon_command(command: DaemonCommand) -> Result<ExitCode> {
+    match command {
+        DaemonCommand::Start => {
+            let mut connection = codeindex_daemon::client::Connection::ensure()?;
+            let ping = connection.call("daemon.ping", &serde_json::json!({}))?;
+            println!("daemon running: {ping}");
+            Ok(ExitCode::SUCCESS)
+        }
+        DaemonCommand::Stop => {
+            println!("{}", codeindex_daemon::client::stop()?);
+            Ok(ExitCode::SUCCESS)
+        }
+        DaemonCommand::Status => {
+            println!("{}", codeindex_daemon::client::lifecycle_status()?);
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn models_resolve(arguments: ModelResolveArgs) -> Result<ExitCode> {
