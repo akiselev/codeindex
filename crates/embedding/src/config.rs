@@ -28,6 +28,10 @@ pub struct ManagedModel {
     pub dimensions: usize,
     pub pooling: &'static str,
     pub max_length: usize,
+    /// Literal prefix rendered before query text (`""` = none).
+    pub query_prefix: &'static str,
+    /// Literal prefix rendered before document text (`""` = none).
+    pub document_prefix: &'static str,
     pub files: &'static [ManagedFile],
 }
 
@@ -47,6 +51,10 @@ pub const MANAGED_MODELS: &[ManagedModel] = &[ManagedModel {
     dimensions: 768,
     pooling: "mean",
     max_length: 2048,
+    // CodeRankEmbed is asymmetric: queries require this exact prefix
+    // (see nomic-ai/CodeRankEmbed model card); documents embed raw.
+    query_prefix: "Represent this query for searching relevant code: ",
+    document_prefix: "",
     files: &[
         ManagedFile {
             path: "onnx/model.onnx",
@@ -116,7 +124,10 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             backend: "fastembed".into(),
-            model: "CodeRankEmbed".into(),
+            // Deliberately empty: there is no default model. Callers must
+            // pick an explicit reference (`hf:owner/name`, `dir:/path`,
+            // `fastembed:Name`); an empty value fails with guidance.
+            model: String::new(),
             cache_dir: None,
             batch_size: 256,
             max_batch_chars: 200_000,

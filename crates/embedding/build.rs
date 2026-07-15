@@ -7,13 +7,23 @@ fn main() {
     for (package, var) in [
         ("fastembed", "CODEINDEX_FASTEMBED_VERSION"),
         ("ort", "CODEINDEX_ORT_VERSION"),
+        ("candle-core", "CODEINDEX_CANDLE_VERSION"),
     ] {
-        let version = locked_version(&text, package).unwrap_or_else(|| "unknown".to_string());
+        let versions = locked_versions(&text, package);
+        let version = if versions.is_empty() {
+            "unknown".to_string()
+        } else {
+            // With more than one resolved version a textual scan cannot tell
+            // which one this crate links; report all of them so the persisted
+            // identity is never silently wrong.
+            versions.join("+")
+        };
         println!("cargo:rustc-env={var}={version}");
     }
 }
 
-fn locked_version(lock: &str, package: &str) -> Option<String> {
+fn locked_versions(lock: &str, package: &str) -> Vec<String> {
+    let mut versions = Vec::new();
     let mut in_package = false;
     for line in lock.lines() {
         if line == "[[package]]" {
@@ -21,8 +31,12 @@ fn locked_version(lock: &str, package: &str) -> Option<String> {
         } else if line == format!("name = \"{package}\"") {
             in_package = true;
         } else if in_package && let Some(version) = line.strip_prefix("version = \"") {
-            return Some(version.trim_end_matches('"').to_string());
+            let version = version.trim_end_matches('"').to_string();
+            if !versions.contains(&version) {
+                versions.push(version);
+            }
+            in_package = false;
         }
     }
-    None
+    versions
 }
