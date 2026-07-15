@@ -17,9 +17,21 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.5.54", features = ["derive"] }
+codeindex-core = { path = "../core" }
+codeindex-embedding = { path = "../embedding", default-features = false }
 codeindex-indexer = { path = "../indexer" }
+codeindex-lsp = { path = "../lsp" }
+codeindex-query = { path = "../query" }
+codeindex-search = { path = "../search" }
 codeindex-sqlite = { path = "../sqlite" }
 codeindex-tree-sitter = { path = "../tree-sitter" }
 ctrlc = { version = "3.5.1", features = ["termination"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+
+[features]
+default = ["fastembed"]
+fastembed = ["codeindex-embedding/fastembed"]
+candle = ["codeindex-embedding/candle"]
+candle-cuda = ["candle", "codeindex-embedding/candle-cuda"]
+candle-metal = ["candle", "codeindex-embedding/candle-metal"]
