@@ -492,6 +492,34 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_document_removes_its_units_on_reindex() {
+        let mut source = MemorySource::new("memory://delete");
+        source.insert("a.rs", "fn alpha(a: i32) -> i32 { let x = a + 1; x * 2 }");
+        source.insert("b.rs", "fn beta(b: i32) -> i32 { let y = b - 1; y * 3 }");
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        let stats = index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(stats[0].total_units, 2);
+
+        source.remove("b.rs");
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        let stats = index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(stats[0].removed, 1, "the deleted document must be reported");
+        assert_eq!(
+            stats[0].total_units, 1,
+            "the deleted document's unit must go"
+        );
+        let project_id = db.get_project("main").unwrap().unwrap().id;
+        assert_eq!(db.list_files(project_id).unwrap().len(), 1);
+    }
+
+    #[test]
     fn body_and_name_erased_channels_are_materialized() {
         let mut source = MemorySource::new("memory://representations");
         source.insert(

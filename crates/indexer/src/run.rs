@@ -539,10 +539,49 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
                         action,
                     });
                 }
+                // Live documents the provider no longer reports are deletions.
+                // Without these rows the publish transaction has nothing to
+                // remove and deleted files silently survive reindexing.
+                let observed: HashSet<&str> = documents
+                    .iter()
+                    .map(|document| document.id.as_str())
+                    .collect();
+                let mut deleted_ids: Vec<&String> = live_files
+                    .keys()
+                    .filter(|id| !observed.contains(id.as_str()))
+                    .collect();
+                deleted_ids.sort();
+                for id in deleted_ids {
+                    let file = &live_files[id];
+                    let fingerprint = sha256_hex(&serde_json::to_string(&serde_json::json!({
+                        "config": config_fingerprint,
+                        "provider": project.provider.provider_fingerprint(),
+                        "id": id,
+                        "deleted": true,
+                    }))?);
+                    observations.push(ManifestDocument {
+                        source_document_id: id.clone(),
+                        relative_path: file.relative_path.clone(),
+                        language_id: file.language_id.clone(),
+                        source_revision_json: serde_json::to_string(&file.source_revision)?,
+                        observed_source_hash: String::new(),
+                        input_fingerprint: fingerprint,
+                        action: DocumentAction::Delete,
+                    });
+                }
                 if unstable {
                     break;
                 }
-                let digest = manifest_digest(&observations);
+                // The manifest digest covers surviving documents only; the
+                // publish transaction recomputes it the same way (delete rows
+                // are journaled but excluded from the digest).
+                let digest = manifest_digest(
+                    &observations
+                        .iter()
+                        .filter(|document| document.action != DocumentAction::Delete)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
                 refreshes.push((project.label.clone(), documents, observations, digest));
             }
             if unstable {

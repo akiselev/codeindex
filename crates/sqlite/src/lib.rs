@@ -8,8 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use codeindex_core::{
-    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, ExecutionInfo,
-    ModelContract, Pooling, RepresentationKind,
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, Pooling,
+    RepresentationKind,
 };
 use codeindex_storage::{
     EmbeddingSpaceSnapshot, IndexSnapshot, ProjectRecord, RepresentationRef, UnitRecord,
@@ -17,9 +17,9 @@ use codeindex_storage::{
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 pub use models::{
-    CodeUnit, EmbeddingModelRecord, EmbeddingSpaceRecord, FileId, FileRecord, ModelId, NewCodeUnit,
-    NewFile, NewRepresentation, Project, ProjectId, StagedDocumentPayload, StagedReference, UnitId,
-    blob_to_vector, vector_to_blob,
+    CodeUnit, EmbeddingModelRecord, EmbeddingSpaceRecord, ExecutionInfo, FileId, FileRecord,
+    ModelContract, ModelId, NewCodeUnit, NewFile, NewRepresentation, Project, ProjectId,
+    StagedDocumentPayload, StagedReference, UnitId, blob_to_vector, vector_to_blob,
 };
 
 pub use codeindex_storage as storage;
@@ -689,6 +689,26 @@ impl Db {
         }
         transaction.commit()?;
         Ok(inserted)
+    }
+
+    /// Every stored vector of one space as `(content_hash, vector)`,
+    /// hash-ordered. Read API for drift gates and export tooling.
+    pub fn embeddings_for_space(
+        &self,
+        space_id: &EmbeddingSpaceId,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, vector_blob FROM embeddings
+             WHERE space_id = ?1 ORDER BY content_hash",
+        )?;
+        Ok(stmt
+            .query_map([space_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    blob_to_vector(&row.get::<_, Vec<u8>>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn count_embeddings(&self, space_id: &EmbeddingSpaceId) -> Result<i64> {
