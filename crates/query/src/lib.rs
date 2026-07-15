@@ -225,6 +225,34 @@ pub fn rank_candidates<'a>(
     scored
 }
 
+/// Built-in retrieval intents (FEEDBACK.md §1): stable ids agents can pass
+/// as a task preset instead of hand-writing instructions. Project configs
+/// may extend or override these via `[tasks.<id>]`.
+pub const TASK_PRESETS: &[(&str, &str)] = &[
+    (
+        "code-search",
+        "Given a code search query, retrieve relevant code implementations",
+    ),
+    (
+        "locate-edit-targets",
+        "Given a software change request, retrieve code regions likely to require editing",
+    ),
+    (
+        "explain-behavior",
+        "Given a question about repository behavior, retrieve code that provides evidence for \
+         the answer",
+    ),
+    (
+        "find-analogues",
+        "Given a code fragment, retrieve functionally equivalent implementations",
+    ),
+    (
+        "diagnose-failure",
+        "Given a failure report, retrieve implementation, tests, configuration, and \
+         error-handling paths relevant to diagnosing it",
+    ),
+];
+
 /// Function words dropped by [`compress_query`]. Deliberately small and
 /// English-only: the goal is shedding narrative filler, not linguistics.
 const QUERY_STOPWORDS: &[&str] = &[
