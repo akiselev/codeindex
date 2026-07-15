@@ -82,13 +82,23 @@ impl DaemonState {
     }
 
     /// Resolve a project by explicit needle (label or path) or by working
-    /// directory containment.
+    /// directory containment. A miss reloads the registry from disk first:
+    /// a `--no-daemon add` may have registered the project behind the
+    /// daemon's back.
     pub fn resolve_project(
         &self,
         needle: Option<&str>,
         cwd: Option<&Path>,
     ) -> Result<RegisteredProject> {
-        let registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock().expect("registry lock");
+        let missing = match (needle, cwd) {
+            (Some(needle), _) => registry.find(needle).is_none(),
+            (None, Some(cwd)) => registry.find(&cwd.to_string_lossy()).is_none(),
+            (None, None) => registry.projects.is_empty(),
+        };
+        if missing && let Ok(reloaded) = Registry::load_from(&self.registry_path) {
+            *registry = reloaded;
+        }
         if let Some(needle) = needle {
             return registry
                 .find(needle)
