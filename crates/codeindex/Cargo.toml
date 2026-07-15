@@ -14,6 +14,7 @@ publish = false
 codeindex-core = { path = "../core" }
 codeindex-embedding = { path = "../embedding", default-features = false }
 codeindex-indexer = { path = "../indexer" }
+codeindex-lsp = { path = "../lsp" }
 codeindex-query = { path = "../query" }
 codeindex-search = { path = "../search" }
 codeindex-sqlite = { path = "../sqlite" }
@@ -23,6 +24,9 @@ codeindex-tree-sitter = { path = "../tree-sitter" }
 [features]
 default = []
 fastembed = ["codeindex-embedding/fastembed"]
+candle = ["codeindex-embedding/candle"]
+candle-cuda = ["candle", "codeindex-embedding/candle-cuda"]
+candle-metal = ["candle", "codeindex-embedding/candle-metal"]
 accel = ["fastembed", "codeindex-embedding/accel"]
 cuda = ["accel", "codeindex-embedding/cuda"]
 directml = ["accel", "codeindex-embedding/directml"]

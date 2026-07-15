@@ -1,0 +1,23 @@
+[package]
+name = "codeindex-lsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Language-server-backed relation extraction and type-enriched representations for codeindex"
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+codeindex-core = { path = "../core" }
+codeindex-sqlite = { path = "../sqlite" }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+[dev-dependencies]
+codeindex-indexer = { path = "../indexer" }
+tempfile = "3.27.0"
