@@ -6,8 +6,9 @@ use rusqlite::Connection;
 /// `projects.role` column; epoch 5 split model identity into a semantic
 /// contract (`embedding_models`) plus append-only execution provenance
 /// (`model_executions`) and replaced `input_transform` with a typed
-/// document-side contract; epoch 6 added analyzer-produced `relations`.
-pub const SCHEMA_VERSION: i64 = 6;
+/// document-side contract; epoch 6 added analyzer-produced `relations`;
+/// epoch 7 added the `lexical_index` FTS5 table for hybrid retrieval.
+pub const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = r#"
 CREATE TABLE settings(
@@ -219,6 +220,15 @@ CREATE TABLE relations(
 CREATE INDEX idx_relations_generation ON relations(generation);
 CREATE INDEX idx_relations_from ON relations(from_entity_id);
 CREATE INDEX idx_relations_to ON relations(to_entity_id);
+
+-- Lexical retrieval over unit metadata and implementation text. rowid is
+-- the code_units id; maintained explicitly by publication (FTS tables do
+-- not participate in foreign-key cascades). tokenchars keeps identifiers
+-- with underscores whole.
+CREATE VIRTUAL TABLE lexical_index USING fts5(
+  name, scope, path, content,
+  tokenize = "unicode61 tokenchars '_'"
+);
 
 CREATE TABLE references_raw(
   caller_unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,

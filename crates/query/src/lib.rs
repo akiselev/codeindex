@@ -225,6 +225,55 @@ pub fn rank_candidates<'a>(
     scored
 }
 
+/// One retrieval source's ranked unit indices for fusion.
+pub struct RankedList {
+    /// Source label recorded in contributions (e.g. `dense`, `lexical`).
+    pub source: String,
+    pub weight: f32,
+    /// Unit indices, best first.
+    pub indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedIndex {
+    pub index: usize,
+    pub score: f32,
+    /// `(source, 1-based rank)` for every list that contributed.
+    pub contributions: Vec<(String, usize)>,
+}
+
+/// Weighted reciprocal-rank fusion across heterogeneous retrieval sources
+/// (dense spaces, lexical BM25, …). Ranks are combined — never raw scores,
+/// which are incomparable across sources. Deterministic: ties break by unit
+/// index.
+pub fn reciprocal_rank_fusion(lists: &[RankedList], rrf_k: usize) -> Vec<FusedIndex> {
+    let mut fused: std::collections::HashMap<usize, (f32, Vec<(String, usize)>)> =
+        std::collections::HashMap::new();
+    for list in lists {
+        for (zero_rank, &index) in list.indices.iter().enumerate() {
+            let rank = zero_rank + 1;
+            let entry = fused.entry(index).or_default();
+            entry.0 += list.weight / (rrf_k + rank) as f32;
+            entry.1.push((list.source.clone(), rank));
+        }
+    }
+    let mut hits: Vec<FusedIndex> = fused
+        .into_iter()
+        .map(|(index, (score, contributions))| FusedIndex {
+            index,
+            score,
+            contributions,
+        })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(left.index.cmp(&right.index))
+    });
+    hits
+}
+
 /// Field-by-field differences between two semantic model contracts, derived
 /// mechanically from their serialized form so newly added contract fields can
 /// never be silently omitted from mismatch diagnostics.
@@ -342,6 +391,32 @@ mod tests {
         assert_eq!(only.tests_policy(), Some(TestsPolicy::Only));
         assert!(only.matches(&test_unit));
         assert!(!only.matches(&plain));
+    }
+
+    #[test]
+    fn rrf_fuses_ranked_lists_deterministically() {
+        let fused = reciprocal_rank_fusion(
+            &[
+                RankedList {
+                    source: "dense".into(),
+                    weight: 1.0,
+                    indices: vec![7, 3, 9],
+                },
+                RankedList {
+                    source: "lexical".into(),
+                    weight: 1.0,
+                    indices: vec![3, 11],
+                },
+            ],
+            60,
+        );
+        // 3 appears in both lists (ranks 2 and 1) and must win.
+        assert_eq!(fused[0].index, 3);
+        assert_eq!(fused[0].contributions.len(), 2);
+        // 7 (dense#1) beats 11 (lexical#2) and 9 (dense#3).
+        assert_eq!(fused[1].index, 7);
+        let expected = 1.0 / 62.0 + 1.0 / 61.0;
+        assert!((fused[0].score - expected).abs() < 1e-6);
     }
 
     #[test]

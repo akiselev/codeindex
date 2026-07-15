@@ -259,6 +259,15 @@ impl Db {
                     DocumentAction::Upsert | DocumentAction::Delete
                 ) {
                     let project_id = project_ids[&document.project_label];
+                    // FTS tables do not cascade; clear lexical rows for the
+                    // document's units before the file delete removes them.
+                    transaction.execute(
+                        "DELETE FROM lexical_index WHERE rowid IN
+                           (SELECT u.id FROM code_units u
+                            JOIN files f ON f.id = u.file_id
+                            WHERE f.project_id = ?1 AND f.source_document_id = ?2)",
+                        params![project_id, document.source_document_id],
+                    )?;
                     transaction.execute(
                         "DELETE FROM files WHERE project_id = ?1 AND source_document_id = ?2",
                         params![project_id, document.source_document_id],
@@ -319,7 +328,13 @@ impl Db {
                     ],
                 )?;
                 let file_id = transaction.last_insert_rowid();
-                let unit_ids = insert_units(&transaction, project_id, file_id, &payload.units)?;
+                let unit_ids = insert_units(
+                    &transaction,
+                    project_id,
+                    file_id,
+                    &payload.file.relative_path,
+                    &payload.units,
+                )?;
                 for reference in &payload.references {
                     let caller = *unit_ids
                         .get(reference.caller_unit_ordinal)
@@ -552,6 +567,7 @@ fn insert_units(
     transaction: &rusqlite::Transaction<'_>,
     project_id: i64,
     file_id: i64,
+    relative_path: &str,
     units: &[crate::NewCodeUnit],
 ) -> Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(units.len());
@@ -606,6 +622,23 @@ fn insert_units(
                 ],
             )?;
         }
+        let content = unit
+            .representations
+            .iter()
+            .find(|representation| representation.kind == RepresentationKind::Implementation)
+            .and_then(|representation| representation.content.as_deref())
+            .unwrap_or("");
+        transaction.execute(
+            "INSERT INTO lexical_index(rowid, name, scope, path, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                unit_id,
+                unit.name,
+                unit.scope.as_deref().unwrap_or(""),
+                relative_path,
+                content
+            ],
+        )?;
         ids.push(unit_id);
     }
     Ok(ids)
