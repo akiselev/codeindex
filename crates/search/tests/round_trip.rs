@@ -148,6 +148,56 @@ fn build_index() -> (SearchIndex, HashEmbedder, HashEmbedder) {
     )
 }
 
+fn call(from: &str, to: &str) -> codeindex_search::storage::RelationRecord {
+    codeindex_search::storage::RelationRecord {
+        from_entity_id: EntityId::new(format!("ent-{from}")),
+        to_entity_id: Some(EntityId::new(format!("ent-{to}"))),
+        to_symbol: to.into(),
+        kind: "calls".into(),
+        resolution: "exact".into(),
+        provenance: "lsp:test".into(),
+    }
+}
+
+#[test]
+fn relations_expand_seeds_one_hop_in_both_directions() {
+    let (mut index, _, _) = build_index();
+    // parse_flags -> render_table, checksum -> parse_flags. Unit order in the
+    // fixture: 0=parse_flags, 1=render_table, 2=checksum.
+    index.relations = vec![
+        call("parse_flags", "render_table"),
+        call("checksum", "parse_flags"),
+    ];
+
+    // Seeding with parse_flags reaches its callee AND its caller.
+    assert_eq!(index.expand_by_relations(&[0], 10), vec![1, 2]);
+    // Seeds themselves are never re-emitted, and the cap is honored.
+    assert_eq!(index.expand_by_relations(&[0, 1], 10), vec![2]);
+    assert_eq!(index.expand_by_relations(&[0], 1), vec![1]);
+    // Seeding the callee side walks the edge backwards to the caller.
+    assert_eq!(index.expand_by_relations(&[1], 10), vec![0]);
+    assert!(index.expand_by_relations(&[], 10).is_empty());
+
+    // Unresolved targets (to_entity_id = None) are ignored gracefully.
+    index
+        .relations
+        .push(codeindex_search::storage::RelationRecord {
+            from_entity_id: EntityId::new("ent-render_table"),
+            to_entity_id: None,
+            to_symbol: "std::fmt::Display".into(),
+            kind: "calls".into(),
+            resolution: "heuristic".into(),
+            provenance: "lsp:test".into(),
+        });
+    assert_eq!(index.expand_by_relations(&[1], 10), vec![0]);
+
+    // Corroboration outranks discovery order: two call sites reaching
+    // `checksum` beat the single caller edge that was discovered first.
+    index.relations.push(call("render_table", "checksum"));
+    index.relations.push(call("render_table", "checksum"));
+    assert_eq!(index.expand_by_relations(&[1], 10), vec![2, 0]);
+}
+
 #[test]
 fn load_populates_independent_spaces() {
     let (index, _, _) = build_index();
