@@ -53,8 +53,18 @@ impl Connection {
         let daemon = Daemon::embedded(spec()?, spawn_recipe()?)
             .map_err(|error| anyhow!("configuring daemon: {error}"))?;
         let stream = runtime.block_on(async {
-            let instance = daemon.ensure().await?;
-            instance.connect().await
+            match ensure_connect(&daemon).await {
+                // daemonkit 0.1.0 cannot replace a generation wedged in
+                // QUIESCING (an abandoned drain leaves it there forever;
+                // fixed upstream on the first-consumer-hardening branch).
+                // Consumer-side recovery: force-stop the wedged instance
+                // and ensure again.
+                Err(daemonkit::Error::BusyQuiescing) => {
+                    let _ = daemon.stop().await;
+                    ensure_connect(&daemon).await
+                }
+                other => other,
+            }
         });
         let stream = stream.map_err(startup_error)?;
         Ok(Connection {
@@ -139,6 +149,13 @@ pub fn lifecycle_status() -> Result<String> {
         .block_on(client.status())
         .map_err(|error| anyhow!("querying daemon status: {error}"))?;
     Ok(format!("{status:?}"))
+}
+
+async fn ensure_connect(
+    daemon: &Daemon<daemonkit::Embedded>,
+) -> Result<daemonkit::AuthenticatedStream, daemonkit::Error> {
+    let instance = daemon.ensure().await?;
+    instance.connect().await
 }
 
 fn client_runtime() -> Result<tokio::runtime::Runtime> {

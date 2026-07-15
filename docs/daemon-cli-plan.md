@@ -1,6 +1,6 @@
 # Daemon architecture and final CLI design
 
-Status: proposed (2026-07-15). Companion to `docs/rearchitecture-plan.md`;
+Status: M-daemon-1 implemented (2026-07-15) — registry, add/remove/list/status/reindex, daemon-routed search with per-role model lanes, .codeindex.toml discovery. M2+: fs-watch, LSP pool, folder-override fingerprinting, MCP. Companion to `docs/rearchitecture-plan.md`;
 this document designs the end-state user/agent interface: a single stateful
 background daemon owning indexing, embedding, LSP servers, and query
 serving, with a thin CLI that resolves projects by walking up to

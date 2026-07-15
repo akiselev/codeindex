@@ -211,7 +211,9 @@ impl DaemonState {
         Ok(RemoteEmbedder {
             contract: handle.contract.clone(),
             execution: handle.execution.clone(),
-            sender: handle.sender.clone(),
+            query_sender: handle.query_sender.clone(),
+            bulk: handle.bulk.clone(),
+            model: handle.model.clone(),
         })
     }
 }
@@ -283,7 +285,15 @@ impl ProjectHandle {
 struct EmbedderHandle {
     contract: ModelContract,
     execution: ExecutionInfo,
-    sender: mpsc::Sender<EmbedJob>,
+    /// Interactive lane, spawned eagerly (it also provides the contract).
+    query_sender: mpsc::Sender<EmbedJob>,
+    /// Bulk lane, spawned on first document work: a second backend
+    /// instance (~weights-sized RAM) so a query's forward pass never
+    /// queues behind a document's. Preemption cannot help here — a single
+    /// 10k-char function costs a 30-80s forward pass on CPU, and nothing
+    /// interrupts a forward pass.
+    bulk: Arc<Mutex<Option<mpsc::Sender<EmbedJob>>>>,
+    model: String,
 }
 
 struct EmbedJob {
@@ -294,14 +304,18 @@ struct EmbedJob {
     reply: mpsc::SyncSender<Result<Vec<Vec<f32>>, String>>,
 }
 
-/// Channel-backed [`EmbeddingBackend`] whose model lives on a dedicated
-/// worker thread. Cloning is cheap; concurrent users serialize on the
-/// worker's queue, which matches the batch=1 execution model underneath.
+/// Channel-backed [`EmbeddingBackend`] backed by per-role worker lanes.
+/// Query-role requests go to the interactive instance; document-role
+/// requests lazily spawn and use a separate bulk instance, so searches
+/// stay at idle latency while projects embed (measured: any shared-
+/// instance scheme left queries waiting out one 30-80s forward pass).
 #[derive(Clone)]
 pub struct RemoteEmbedder {
     contract: ModelContract,
     execution: ExecutionInfo,
-    sender: mpsc::Sender<EmbedJob>,
+    query_sender: mpsc::Sender<EmbedJob>,
+    bulk: Arc<Mutex<Option<mpsc::Sender<EmbedJob>>>>,
+    model: String,
 }
 
 impl EmbeddingBackend for RemoteEmbedder {
@@ -315,8 +329,21 @@ impl EmbeddingBackend for RemoteEmbedder {
 
     fn embed(&mut self, request: &EmbedRequest<'_>) -> Result<Vec<Vec<f32>>> {
         let (reply, receive) = mpsc::sync_channel(1);
-        self.sender
-            .send(EmbedJob {
+        let lane = match request.role {
+            codeindex_embedding::EmbeddingRole::Query => self.query_sender.clone(),
+            codeindex_embedding::EmbeddingRole::Document => {
+                let mut slot = self.bulk.lock().expect("bulk lane lock");
+                match slot.as_ref() {
+                    Some(sender) => sender.clone(),
+                    None => {
+                        let sender = spawn_lane(&self.model)?;
+                        *slot = Some(sender.clone());
+                        sender
+                    }
+                }
+            }
+        };
+        lane.send(EmbedJob {
                 role: request.role,
                 task: request.task.cloned(),
                 document_prompt: request.document_prompt.map(str::to_owned),
@@ -332,6 +359,26 @@ impl EmbeddingBackend for RemoteEmbedder {
 }
 
 fn spawn_embed_worker(model: &str) -> Result<EmbedderHandle> {
+    let (query_sender, contract, execution) = spawn_lane_with_identity(model)?;
+    Ok(EmbedderHandle {
+        contract,
+        execution,
+        query_sender,
+        bulk: Arc::new(Mutex::new(None)),
+        model: model.to_string(),
+    })
+}
+
+/// One worker lane: a thread owning its own backend instance, serving
+/// jobs FIFO. No scheduling cleverness — lanes are isolated by role.
+fn spawn_lane(model: &str) -> Result<mpsc::Sender<EmbedJob>> {
+    let (sender, _, _) = spawn_lane_with_identity(model)?;
+    Ok(sender)
+}
+
+fn spawn_lane_with_identity(
+    model: &str,
+) -> Result<(mpsc::Sender<EmbedJob>, ModelContract, ExecutionInfo)> {
     let (sender, receiver) = mpsc::channel::<EmbedJob>();
     let (ready_sender, ready_receiver) =
         mpsc::sync_channel::<Result<(ModelContract, ExecutionInfo), String>>(1);
@@ -377,9 +424,5 @@ fn spawn_embed_worker(model: &str) -> Result<EmbedderHandle> {
         .recv_timeout(Duration::from_secs(30 * 60))
         .map_err(|_| anyhow!("embedding worker for {model} did not become ready"))?;
     let (contract, execution) = ready.map_err(|message| anyhow!(message))?;
-    Ok(EmbedderHandle {
-        contract,
-        execution,
-        sender,
-    })
+    Ok((sender, contract, execution))
 }
