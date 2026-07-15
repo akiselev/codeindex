@@ -121,3 +121,34 @@ lexical-blind-spot distractors and adds per-source explainability, and the
 reranker delivers the score discrimination it was added for. Next lever by
 this data: candidate recall for narrative queries (query compression
 presets, relation-graph expansion of seeds).
+
+## Addendum 2026-07-15 (2): query compression + relation-graph expansion
+
+The two recall levers named above are now implemented and fused as extra
+RRF lists: `--compress auto|off|always` derives a stopword-stripped
+variant of paragraph-length queries (weight 0.7, never replaces the
+original), and relation-graph expansion (default-on when `lsp-enrich`
+relations exist, `--no-graph` to disable) adds 1-hop callers/callees of
+the top-10 fused seeds as a `graph` list (weight 0.5), neighbors ranked
+by how many seed edges corroborate them.
+
+- **S13 app-factory, compression**: the 47-word paragraph compresses to
+  19 salient terms; `find_best_app` holds fused #3 with all three lists
+  agreeing (`dense#8, dense-compressed#10, lexical#10`) and a reinforced
+  score. No rank damage anywhere in the top-6 — the compressed list acts
+  as corroboration, which is the safety property that justifies auto-on.
+- **fd `--exec` pipeline, graph expansion** (fd enriched live:
+  100 exact `calls` edges from rust-analyzer): the narrative query "how
+  does fd build the child commands and decide the final exit code" gets
+  `handle_cmd_error` — the child-failure → exit-code mapper, stuck at
+  dense#16/lexical#23, absent from the no-graph top-8 — lifted to fused
+  **#2** via `graph#2` (multiple seed call sites corroborate it).
+  `exec/command.rs:push` enters top-15 the same way, and
+  `merge_exitcodes` enters the candidate pool (visible to the reranker)
+  purely through graph edges, with zero dense or lexical signal.
+
+Operational finding while rebuilding the self-corpus: `lsp-enrich`'s
+readiness probe (first hover, 60 s retry window) silently expired on a
+loaded machine and the pass "succeeded" with 1 signature / 0 relations.
+The window is now 5 minutes and expiry prints a loud warning. The real
+fix is the warm LSP pool in `docs/daemon-cli-plan.md`.
