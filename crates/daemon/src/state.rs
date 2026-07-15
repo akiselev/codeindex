@@ -344,13 +344,13 @@ impl EmbeddingBackend for RemoteEmbedder {
             }
         };
         lane.send(EmbedJob {
-                role: request.role,
-                task: request.task.cloned(),
-                document_prompt: request.document_prompt.map(str::to_owned),
-                inputs: request.inputs.iter().map(|s| (*s).to_owned()).collect(),
-                reply,
-            })
-            .map_err(|_| anyhow!("embedding worker exited"))?;
+            role: request.role,
+            task: request.task.cloned(),
+            document_prompt: request.document_prompt.map(str::to_owned),
+            inputs: request.inputs.iter().map(|s| (*s).to_owned()).collect(),
+            reply,
+        })
+        .map_err(|_| anyhow!("embedding worker exited"))?;
         receive
             .recv()
             .map_err(|_| anyhow!("embedding worker dropped the reply channel"))?
