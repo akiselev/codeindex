@@ -54,6 +54,43 @@ pub fn unit_line(unit: &impl UnitView) -> String {
     )
 }
 
+/// Whether test entities participate in a query. Trivial test chunks
+/// dominate degraded rankings (see evals/2026-07-14-qwen3-scenarios.md), so
+/// consumers typically exclude them unless the intent is about tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestsPolicy {
+    Include,
+    Exclude,
+    Only,
+}
+
+/// Heuristic test detection over the extracted metadata: the frontend's
+/// `test` kind, the `tests` scope assigned to `cfg(test)` items,
+/// conventional test-file paths, and test-prefixed/suffixed names.
+pub fn looks_like_test(unit: &impl UnitView) -> bool {
+    if unit.kind() == "test" || unit.scope() == Some("tests") {
+        return true;
+    }
+    let path = unit.relative_path();
+    if path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.ends_with("_test.go")
+        || path.ends_with("_test.py")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".test.js")
+        || path.ends_with("_spec.rb")
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|file| file.starts_with("test_"))
+    {
+        return true;
+    }
+    let name = unit.name();
+    name.starts_with("test_") || name.ends_with("_test")
+}
+
 #[derive(Default)]
 pub struct WhereFilter {
     clauses: Vec<String>,
@@ -64,6 +101,7 @@ pub struct WhereFilter {
     scope: Vec<GlobMatcher>,
     path: Vec<GlobMatcher>,
     min_nodes: Option<usize>,
+    tests: Option<TestsPolicy>,
 }
 
 impl WhereFilter {
@@ -89,8 +127,16 @@ impl WhereFilter {
                             format!("min_nodes wants an integer, got {value:?}")
                         })?);
                 }
+                "tests" => {
+                    filter.tests = Some(match value {
+                        "include" => TestsPolicy::Include,
+                        "exclude" => TestsPolicy::Exclude,
+                        "only" => TestsPolicy::Only,
+                        other => bail!("tests wants include|exclude|only, got {other:?}"),
+                    });
+                }
                 _ => bail!(
-                    "unknown --where key {key:?} (supported: project, language, kind, name, scope, path, min_nodes)"
+                    "unknown --where key {key:?} (supported: project, language, kind, name, scope, path, min_nodes, tests)"
                 ),
             }
             filter.clauses.push(clause.to_owned());
@@ -117,6 +163,22 @@ impl WhereFilter {
             && self
                 .min_nodes
                 .is_none_or(|minimum| unit.body_node_count() >= minimum)
+            && match self.tests.unwrap_or(TestsPolicy::Include) {
+                TestsPolicy::Include => true,
+                TestsPolicy::Exclude => !looks_like_test(unit),
+                TestsPolicy::Only => looks_like_test(unit),
+            }
+    }
+
+    /// The explicit `tests=` clause, when one was given. Consumers apply
+    /// their own default (the CLI excludes tests) only when this is unset.
+    pub fn tests_policy(&self) -> Option<TestsPolicy> {
+        self.tests
+    }
+
+    /// Set the tests policy without an explicit `tests=` clause.
+    pub fn set_tests_policy(&mut self, policy: TestsPolicy) {
+        self.tests = Some(policy);
     }
 
     pub fn clauses(&self) -> &[String] {
@@ -258,6 +320,28 @@ mod tests {
                 .unwrap()
                 .matches(&value)
         );
+    }
+
+    #[test]
+    fn test_likeness_and_policy_filtering() {
+        let mut test_unit = unit("src/walk.rs");
+        test_unit.scope = Some("tests".into());
+        let plain = unit("src/walk.rs");
+        assert!(looks_like_test(&test_unit));
+        assert!(!looks_like_test(&plain));
+        let by_path = unit("tests/integration.rs");
+        assert!(looks_like_test(&by_path));
+
+        let mut filter = WhereFilter::parse(None).unwrap();
+        assert!(filter.matches(&test_unit), "default includes tests");
+        filter.set_tests_policy(TestsPolicy::Exclude);
+        assert!(!filter.matches(&test_unit));
+        assert!(filter.matches(&plain));
+
+        let only = WhereFilter::parse(Some("tests=only")).unwrap();
+        assert_eq!(only.tests_policy(), Some(TestsPolicy::Only));
+        assert!(only.matches(&test_unit));
+        assert!(!only.matches(&plain));
     }
 
     #[test]
