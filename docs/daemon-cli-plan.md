@@ -28,20 +28,23 @@ when the stored relations are stale.
 
 ## 2. Process model
 
-One **user-level daemon** (`codeindex daemon`), many registered project
+One **user-level daemon** (`codeindex daemon`, hosted by the same binary), many registered project
 roots. Not one daemon per project: models are the expensive resident state
 and are shared across projects; SQLite write serialization stays
 per-project (one DB per root, as today).
 
-- **Socket**: `$XDG_RUNTIME_DIR/codeindex/daemon.sock` (fallback
-  `~/.cache/codeindex/daemon.sock`), mode 0600. JSON-RPC 2.0 with
-  `Content-Length` framing — the same framing as LSP, reusing
-  `codeindex-lsp`'s client/server plumbing, and trivially bridgeable to
+- **Lifecycle runtime**: daemonkit (`Daemon::embedded` in the parent,
+  `Bootstrap::detect()` + `run_embedded_fn` in the same binary's daemon
+  path). daemonkit owns instance identity, keyed private state, startup
+  serialization, endpoint discovery, socket authentication, and shutdown;
+  codeindex owns only the application protocol on the authenticated
+  streams it is handed.
+- **Protocol**: JSON-RPC 2.0 with `Content-Length` framing over the
+  authenticated stream — the same framing as LSP, trivially bridgeable to
   MCP for agents.
-- **Autostart**: any CLI command that needs the daemon spawns it if the
-  socket is absent (double-checked with a lock file), detached; explicit
-  `codeindex daemon start|stop|status|logs` for control. Optional systemd
-  user unit shipped in `contrib/`.
+- **Autostart**: `Daemon::ensure()` attaches to a live compatible instance
+  or transactionally starts one; explicit `codeindex daemon
+  start|stop|status` for control.
 - **Registry**: `~/.local/share/codeindex/registry.json` — the list of
   added roots with their DB paths and watch state. The daemon rebuilds all
   runtime state from the registry + per-project DBs at startup; the
@@ -51,37 +54,47 @@ per-project (one DB per root, as today).
   drain-and-exec is fine). Schema-epoch mismatches surface per project as
   status, never crash the daemon.
 
-## 3. Project resolution: `.codeindex`
+## 3. Project resolution: `.codeindex.toml`
 
-Every registered root contains a `.codeindex/` directory:
+There is exactly one config file name — `.codeindex.toml` — and no state
+directory in the tree. The file is both the project marker and the
+configuration; the database lives outside the repository:
 
 ```text
 myrepo/
-  .codeindex/
-    config.toml        # root configuration
-    index.db           # the project database (gitignore this)
+  .codeindex.toml      # project root: marker + root configuration
   src/
     .codeindex.toml    # optional per-folder override (committed)
   vendor/
     .codeindex.toml    # e.g. index = false
+
+~/.local/share/codeindex/
+  registry.json                  # registered roots -> project state
+  projects/<key>/index.db        # per-project database (key = root path hash)
 ```
 
-- **Resolution**: commands run from any CWD walk up to the nearest
-  `.codeindex/` (exactly like `git` finds `.git`). `--project <path|label>`
-  overrides. Agents therefore never pass paths explicitly.
-- **Layered config**: `config.toml` at the root, plus `.codeindex.toml`
-  override files in subdirectories. Effective config for a file = root
-  config merged with every override on the path from root to the file,
-  nearest-wins per key. Overrides may only *narrow or tune* (exclude,
-  language set, retention, chunking thresholds, test policy, LSP server
-  choice); identity-level keys (space definitions, models) are root-only so
-  one project cannot fragment into incompatible vector spaces.
+- **Resolution**: commands walk up from the CWD collecting every
+  `.codeindex.toml` on the ancestor path. The **topmost** file found is the
+  project root; the files below it form the override chain. A file with
+  `root = true` stops the upward walk early (nested independent projects,
+  EditorConfig-style). Nearest-file-wins would misanchor a project at a
+  subfolder override like `vendor/`, which is why the walk continues to the
+  filesystem root. `--project <path|label>` overrides discovery.
+- **Layered config**: effective config for a file = root config merged with
+  every override on the path from root to the file, nearest-wins per key.
+  Overrides may only *narrow or tune* (exclude, language set, retention,
+  chunking thresholds, test policy, LSP server choice); identity-level keys
+  (space definitions, models) are root-only so one project cannot fragment
+  into incompatible vector spaces.
 - The override chain is hashed into the per-document input fingerprint, so
   editing a folder's `.codeindex.toml` invalidates exactly that subtree's
   staged work — the journal machinery already supports this via
   `config_fingerprint`.
+- **No repository pollution**: the database (and its WAL/SHM siblings) never
+  sit in the tree, so there is nothing to gitignore. `[storage] path` in the
+  root `.codeindex.toml` opts back into an explicit location.
 
-### config.toml sketch
+### root `.codeindex.toml` sketch
 
 ```toml
 [index]
@@ -155,8 +168,8 @@ Thin client over the socket; every command works from anywhere inside a
 registered root.
 
 ```text
-codeindex add [path]              # register root, create .codeindex/, start indexing
-codeindex remove [path|label]     # unregister (keeps .codeindex unless --purge)
+codeindex add [path]              # register root, create .codeindex.toml, start indexing
+codeindex remove [path|label]     # unregister (keeps .codeindex.toml; --purge deletes the db)
 codeindex list                    # registered roots + generation/freshness
 codeindex status [--watch]        # per-project: index, spaces, LSP, queue depth
 
@@ -188,6 +201,10 @@ codeindex daemon start|stop|status|logs [--mcp]
   transaction (existing invariant); the warm index swaps on generation
   advance.
 - `add` is idempotent; `remove` never deletes user data without `--purge`.
+- The daemon itself is owned by a lifecycle runtime (daemonkit): instance
+  identity, cross-process startup locks, authenticated sockets, bootstrap
+  transaction, graceful shutdown, and stale-state repair come from the
+  runtime rather than hand-rolled pid/socket files.
 
 ## 7. Migration plan
 
