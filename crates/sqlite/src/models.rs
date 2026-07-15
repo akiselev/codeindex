@@ -4,7 +4,7 @@ use codeindex_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use codeindex_core::ModelIdentity;
+pub use codeindex_core::{ExecutionInfo, ModelContract};
 
 pub type ProjectId = i64;
 pub type FileId = i64;
@@ -18,7 +18,6 @@ pub struct Project {
     /// Provider-defined project locator. The historical name is retained for API
     /// compatibility; values such as `memory://project` are valid.
     pub source_dir: String,
-    pub role: Option<String>,
     pub last_index_run_id: Option<i64>,
 }
 
@@ -165,7 +164,7 @@ impl NewCodeUnit {
 #[derive(Debug, Clone)]
 pub struct EmbeddingModelRecord {
     pub id: ModelId,
-    pub identity: ModelIdentity,
+    pub contract: ModelContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

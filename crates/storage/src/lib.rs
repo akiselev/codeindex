@@ -9,8 +9,6 @@
 //! snapshot can carry different models for implementation, documentation,
 //! usage, or any custom representation channel.
 
-use std::collections::HashMap;
-
 use codeindex_core::{
     EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, RepresentationKind,
     RepresentationOrigin, SourceSpan,
@@ -27,6 +25,27 @@ pub struct IndexSnapshot {
     pub projects: Vec<ProjectRecord>,
     pub units: Vec<UnitRecord>,
     pub spaces: Vec<EmbeddingSpaceSnapshot>,
+    /// Typed relations between entities (calls, references, implements, …),
+    /// produced by resolved analyzers such as LSP servers after publication.
+    #[serde(default)]
+    pub relations: Vec<RelationRecord>,
+}
+
+/// One typed, provenance-carrying edge between entities. `to_entity_id` is
+/// unset when the target resolves outside the indexed corpus; `to_symbol`
+/// always carries the analyzer's name for the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationRecord {
+    pub from_entity_id: EntityId,
+    pub to_entity_id: Option<EntityId>,
+    pub to_symbol: String,
+    /// Documented vocabulary: `calls`, `references`, `implements`, `type-of`,
+    /// `defines`. Producers may add kinds; consumers must tolerate unknowns.
+    pub kind: String,
+    /// `exact` (resolved by a compiler-grade tool) or `heuristic`.
+    pub resolution: String,
+    /// Producer identity, e.g. `lsp:rust-analyzer`.
+    pub provenance: String,
 }
 
 impl IndexSnapshot {
@@ -46,7 +65,6 @@ impl IndexSnapshot {
 pub struct ProjectRecord {
     pub label: String,
     pub source_dir: String,
-    pub role: Option<String>,
     /// The run that most recently reconciled this project.
     #[serde(default)]
     pub last_index_run_id: Option<u64>,
@@ -66,6 +84,9 @@ pub struct UnitRecord {
     pub scope: Option<String>,
     pub span: SourceSpan,
     pub body_node_count: usize,
+    /// Hash of the normalized body text, as used by the entity identity
+    /// matcher.
+    pub normalized_body_hash: String,
     pub representations: Vec<RepresentationRef>,
 }
 
@@ -102,35 +123,24 @@ pub struct EmbeddingSpaceSnapshot {
     pub vectors: Vec<(String, Vec<f32>)>,
 }
 
-impl EmbeddingSpaceSnapshot {
-    pub fn by_hash(&self) -> HashMap<&str, &[f32]> {
-        self.vectors
-            .iter()
-            .map(|(hash, vector)| (hash.as_str(), vector.as_slice()))
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use codeindex_core::{ModelIdentity, RepresentationOrigin};
+    use codeindex_core::{ModelContract, Pooling, PromptContract, RepresentationOrigin};
 
     use super::*;
 
-    fn model(name: &str, dimensions: usize) -> ModelIdentity {
-        ModelIdentity {
-            backend: "hash".into(),
-            backend_version: "0".into(),
-            runtime_version: None,
+    fn model(name: &str, dimensions: usize) -> ModelContract {
+        ModelContract {
             model: name.into(),
             revision: None,
-            dimensions,
-            tokenizer_hash: None,
             model_hash: None,
+            tokenizer_hash: None,
+            pooling: Pooling::Mean,
             normalize: true,
-            execution_provider: "cpu".into(),
+            native_dimensions: dimensions,
+            max_sequence_length: 512,
+            prompts: PromptContract::Symmetric,
             quantization: None,
-            cache_path: None,
         }
     }
 
@@ -138,10 +148,10 @@ mod tests {
     fn snapshot_json_round_trips_multiple_spaces() {
         let snapshot = IndexSnapshot {
             published_generation: 1,
+            relations: Vec::new(),
             projects: vec![ProjectRecord {
                 label: "main".into(),
                 source_dir: "memory://fixture".into(),
-                role: None,
                 last_index_run_id: Some(1),
             }],
             units: vec![UnitRecord {
@@ -156,6 +166,7 @@ mod tests {
                 scope: None,
                 span: SourceSpan::new(0, 10, 1, 1),
                 body_node_count: 3,
+                normalized_body_hash: "body-hash".into(),
                 representations: vec![RepresentationRef {
                     kind: RepresentationKind::Implementation,
                     content_hash: "h".into(),

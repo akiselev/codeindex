@@ -12,19 +12,33 @@ use sha2::{Digest, Sha256};
 use crate::config::{
     CustomModelConfig, EmbeddingConfig, ManagedModel, ProviderMode, managed_model,
 };
-use crate::embed::Embedder;
-use codeindex_core::ModelIdentity;
+use crate::embed::{EmbedRequest, EmbeddingBackend, render_inputs};
+use codeindex_core::{ExecutionInfo, ModelContract, Pooling as ContractPooling, PromptContract};
 
 /// Local ONNX inference through the `fastembed` crate. Downloads the model
 /// into the cache directory on first use; no API credentials involved.
 pub struct FastembedBackend {
-    identity: ModelIdentity,
+    contract: ModelContract,
+    execution: ExecutionInfo,
     model: TextEmbedding,
-    max_sequence_length: usize,
-    /// Encodes with truncation disabled, so a length past `max_sequence_length`
-    /// is reported in full instead of clamped. Built once by cloning the
-    /// inference tokenizer (avoids naming the `tokenizers` type directly).
+    /// Encodes with truncation disabled, so a length past the contract's
+    /// `max_sequence_length` is reported in full instead of clamped. Built
+    /// once by cloning the inference tokenizer (avoids naming the
+    /// `tokenizers` type directly).
     untruncated_len: LenCounter,
+}
+
+/// Prompt contract from a pair of literal role prefixes; both empty means the
+/// model is symmetric.
+fn prefix_prompts(query_prefix: &str, document_prefix: &str) -> PromptContract {
+    if query_prefix.is_empty() && document_prefix.is_empty() {
+        PromptContract::Symmetric
+    } else {
+        PromptContract::RolePrefixes {
+            query: query_prefix.to_string(),
+            document: document_prefix.to_string(),
+        }
+    }
 }
 
 /// Counts a text's tokens with truncation disabled; `None` if encoding fails.
@@ -35,7 +49,11 @@ type LenCounter = Box<dyn Fn(&str) -> Option<usize> + Send + Sync>;
 /// truncation config untouched.
 fn untruncated_len_fn(model: &TextEmbedding) -> LenCounter {
     let mut tokenizer = model.tokenizer.clone();
-    let _ = tokenizer.with_truncation(None);
+    if tokenizer.with_truncation(None).is_err() {
+        // Truncation could not be disabled: report no count rather than a
+        // silently clamped one.
+        return Box::new(|_| None);
+    }
     Box::new(move |text| tokenizer.encode(text, true).ok().map(|e| e.len()))
 }
 
@@ -87,8 +105,8 @@ fn load_custom_model(
         special_tokens_map_file: read_custom_file(custom, Path::new(SPECIAL_TOKENS_MAP_FILE))?,
         tokenizer_config_file: read_custom_file(custom, Path::new(TOKENIZER_CONFIG_FILE))?,
     };
-    let pooling = match custom.pooling.as_str() {
-        "cls" => Pooling::Cls,
+    let pooling = match parse_supported_pooling(&custom.pooling, &custom.dir)? {
+        ContractPooling::Cls => Pooling::Cls,
         _ => Pooling::Mean,
     };
     let model = UserDefinedEmbeddingModel::new(
@@ -133,39 +151,55 @@ impl FastembedBackend {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
         // Resolve the execution provider once; `provider` is what actually
         // took effect (never the requested accelerator when it fell back to
-        // CPU) and is what the model identity records.
+        // CPU) and is what the execution provenance records.
         let (execution_providers, provider) = resolve_providers(config)?;
+        let execution = |cache_path: String| ExecutionInfo {
+            backend: "fastembed".into(),
+            backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
+            runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
+            execution_provider: provider.clone(),
+            cache_path: Some(cache_path),
+        };
 
         if let Some(custom) = &config.custom {
+            if config.quantized {
+                bail!(
+                    "`quantized: true` has no effect on a custom model; point `custom` at a \
+                     quantized ONNX export instead"
+                );
+            }
+            let pooling = parse_supported_pooling(&custom.pooling, &custom.dir)?;
             let (tokenizer_hash, model_hash) = custom_artifact_hashes(custom)?;
             let model = load_custom_model(custom, execution_providers)?;
             let untruncated_len = untruncated_len_fn(&model);
             return Ok(Self {
-                identity: ModelIdentity {
-                    backend: "fastembed".into(),
-                    backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
-                    runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
+                contract: ModelContract {
                     model: config.model.clone(),
-                    revision: Some(format!(
-                        "custom:{} pooling={} max_length={}",
-                        custom.dir.join(&custom.onnx_file).display(),
-                        custom.pooling,
-                        custom.max_length
-                    )),
-                    dimensions: custom.dimensions,
-                    tokenizer_hash: Some(tokenizer_hash),
+                    // Path-independent: tokenizer_hash/model_hash pin the exact
+                    // artifact bytes, so the mount point must not enter identity.
+                    revision: Some(format!("custom:{}", custom.onnx_file.display())),
                     model_hash: Some(model_hash),
+                    tokenizer_hash: Some(tokenizer_hash),
+                    pooling,
                     normalize: config.normalize,
-                    execution_provider: provider,
+                    native_dimensions: custom.dimensions,
+                    max_sequence_length: custom.max_length,
+                    prompts: PromptContract::Symmetric,
                     quantization: None,
-                    cache_path: Some(custom.dir.to_string_lossy().into_owned()),
                 },
+                execution: execution(custom.dir.to_string_lossy().into_owned()),
                 model,
-                max_sequence_length: custom.max_length,
                 untruncated_len,
             });
         }
         if let Some(managed) = managed_model(&config.model) {
+            if config.quantized {
+                bail!(
+                    "`quantized: true` is not supported for managed model {}: only an fp32 \
+                     artifact is pinned",
+                    managed.name
+                );
+            }
             // A managed model with no explicit `custom` block: materialize the
             // pinned files into the cache (download + verify on first use) and
             // load them through the same custom ONNX path.
@@ -179,28 +213,25 @@ impl FastembedBackend {
                 pooling: managed.pooling.to_string(),
                 max_length: managed.max_length,
             };
+            let pooling = parse_supported_pooling(&custom.pooling, &dir)?;
             let (tokenizer_hash, model_hash) = custom_artifact_hashes(&custom)?;
             let model = load_custom_model(&custom, execution_providers)?;
             let untruncated_len = untruncated_len_fn(&model);
             return Ok(Self {
-                identity: ModelIdentity {
-                    backend: "fastembed".into(),
-                    backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
-                    runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
+                contract: ModelContract {
                     model: config.model.clone(),
-                    // Path-independent so the identity is stable across machines,
-                    // unlike an explicit custom block's absolute-path revision.
                     revision: Some(format!("managed:{}@{}", managed.repo, managed.revision)),
-                    dimensions: managed.dimensions,
-                    tokenizer_hash: Some(tokenizer_hash),
                     model_hash: Some(model_hash),
+                    tokenizer_hash: Some(tokenizer_hash),
+                    pooling,
                     normalize: config.normalize,
-                    execution_provider: provider,
+                    native_dimensions: managed.dimensions,
+                    max_sequence_length: managed.max_length,
+                    prompts: prefix_prompts(managed.query_prefix, managed.document_prefix),
                     quantization: None,
-                    cache_path: Some(dir.to_string_lossy().into_owned()),
                 },
+                execution: execution(dir.to_string_lossy().into_owned()),
                 model,
-                max_sequence_length: managed.max_length,
                 untruncated_len,
             });
         }
@@ -210,12 +241,7 @@ impl FastembedBackend {
         let dimensions = info.dim;
         let model_code = info.model_code.clone();
 
-        let cache_dir = match &config.cache_dir {
-            Some(dir) => dir.clone(),
-            None => std::env::var_os("FASTEMBED_CACHE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(default_cache_dir),
-        };
+        let cache_dir = resolve_cache_dir(config);
         let options = TextInitOptions::new(model_name)
             .with_show_download_progress(true)
             .with_cache_dir(cache_dir.clone())
@@ -225,24 +251,83 @@ impl FastembedBackend {
         let untruncated_len = untruncated_len_fn(&model);
 
         Ok(Self {
-            identity: ModelIdentity {
+            contract: ModelContract {
+                model: config.model.clone(),
+                revision: Some(model_code),
+                model_hash: None,
+                tokenizer_hash: None,
+                // Catalog models carry their pooling inside fastembed's own
+                // per-model configuration; it is not independently known here.
+                pooling: ContractPooling::ModelDefined,
+                normalize: config.normalize,
+                native_dimensions: dimensions,
+                max_sequence_length: CATALOG_MAX_LENGTH,
+                prompts: PromptContract::Symmetric,
+                quantization: config.quantized.then(|| "quantized".to_string()),
+            },
+            execution: execution(cache_dir.to_string_lossy().into_owned()),
+            model,
+            untruncated_len,
+        })
+    }
+}
+
+impl FastembedBackend {
+    /// Run a generically resolved ONNX model (see `crate::resolve`) through
+    /// fastembed's user-defined path, keeping the resolved semantic contract
+    /// (prompts included) rather than synthesizing a custom one. The required
+    /// files must already be materialized in `dir`.
+    pub fn from_resolved(
+        contract: ModelContract,
+        dir: &Path,
+        onnx_file: &str,
+        config: &EmbeddingConfig,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            matches!(
+                contract.pooling,
+                ContractPooling::Mean | ContractPooling::Cls
+            ),
+            "model {} uses {} pooling, which the fastembed/ONNX backend cannot execute; this \
+             model needs the candle backend",
+            contract.model,
+            contract.pooling.as_str()
+        );
+        let (execution_providers, provider) = resolve_providers(config)?;
+        let custom = CustomModelConfig {
+            dir: dir.to_path_buf(),
+            onnx_file: PathBuf::from(onnx_file),
+            dimensions: contract.native_dimensions,
+            pooling: contract.pooling.as_str().to_string(),
+            max_length: contract.max_sequence_length,
+        };
+        let model = load_custom_model(&custom, execution_providers)?;
+        let untruncated_len = untruncated_len_fn(&model);
+        Ok(Self {
+            execution: ExecutionInfo {
                 backend: "fastembed".into(),
                 backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
                 runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
-                model: config.model.clone(),
-                revision: Some(model_code),
-                dimensions,
-                tokenizer_hash: None,
-                model_hash: None,
-                normalize: config.normalize,
                 execution_provider: provider,
-                quantization: config.quantized.then(|| "quantized".to_string()),
-                cache_path: Some(cache_dir.to_string_lossy().into_owned()),
+                cache_path: Some(dir.to_string_lossy().into_owned()),
             },
+            contract,
             model,
-            max_sequence_length: CATALOG_MAX_LENGTH,
             untruncated_len,
         })
+    }
+}
+
+/// Parse a configured pooling name into the typed contract value, restricted
+/// to what the fastembed custom-model path can actually execute.
+fn parse_supported_pooling(value: &str, dir: &Path) -> Result<ContractPooling> {
+    match ContractPooling::parse(value) {
+        Some(pooling @ (ContractPooling::Mean | ContractPooling::Cls)) => Ok(pooling),
+        _ => bail!(
+            "unsupported pooling {value:?} for the custom model in {}: the fastembed backend \
+             supports \"mean\" and \"cls\" only",
+            dir.display()
+        ),
     }
 }
 
@@ -342,15 +427,21 @@ fn build_accelerator(_name: &str, _require: bool) -> ProviderResolution {
     ProviderResolution::NotCompiled
 }
 
-/// Directory a managed model's files materialize into: a `custom/<id>` dir
-/// beside fastembed's catalog cache so both share one decombine cache root.
-fn managed_model_dir(config: &EmbeddingConfig, managed: &ManagedModel) -> PathBuf {
-    let catalog = match &config.cache_dir {
+/// The configured cache directory, the `FASTEMBED_CACHE_DIR` override, or the
+/// platform default, in that order.
+fn resolve_cache_dir(config: &EmbeddingConfig) -> PathBuf {
+    match &config.cache_dir {
         Some(dir) => dir.clone(),
         None => std::env::var_os("FASTEMBED_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(default_cache_dir),
-    };
+    }
+}
+
+/// Directory a managed model's files materialize into: a `custom/<id>` dir
+/// beside fastembed's catalog cache so both share one decombine cache root.
+fn managed_model_dir(config: &EmbeddingConfig, managed: &ManagedModel) -> PathBuf {
+    let catalog = resolve_cache_dir(config);
     let root = catalog.parent().map(Path::to_path_buf).unwrap_or(catalog);
     root.join("custom").join(managed.cache_id)
 }
@@ -449,26 +540,38 @@ fn download_and_verify(
     Ok(())
 }
 
+/// Default cache root for fastembed catalog/managed models. New installs use
+/// the codeindex cache; an existing decombine-era cache is read through so
+/// previously downloaded models are not re-fetched.
 fn default_cache_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("decombine").join("models");
+    let roots: &[(&str, &str)] = &[("codeindex", "models"), ("decombine", "models")];
+    let candidate = |base: PathBuf| {
+        for (app, sub) in roots {
+            let dir = base.join(app).join(sub);
+            if dir.exists() {
+                return Some(dir);
+            }
+        }
+        None
+    };
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    match base {
+        Some(base) => {
+            candidate(base.clone()).unwrap_or_else(|| base.join("codeindex").join("models"))
+        }
+        None => PathBuf::from(".codeindex-models"),
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("decombine")
-            .join("models");
-    }
-    PathBuf::from(".decombine-models")
 }
 
-impl Embedder for FastembedBackend {
-    fn identity(&self) -> &ModelIdentity {
-        &self.identity
+impl EmbeddingBackend for FastembedBackend {
+    fn contract(&self) -> &ModelContract {
+        &self.contract
     }
 
-    fn max_sequence_length(&self) -> usize {
-        self.max_sequence_length
+    fn execution(&self) -> &ExecutionInfo {
+        &self.execution
     }
 
     fn count_tokens(&self, text: &str) -> Option<usize> {
@@ -485,11 +588,12 @@ impl Embedder for FastembedBackend {
         (self.untruncated_len)(text)
     }
 
-    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed(&mut self, request: &EmbedRequest<'_>) -> Result<Vec<Vec<f32>>> {
+        let rendered = render_inputs(&self.contract, request)?;
         // The caller packs batches to a padded-memory budget; pass each
         // through as a single fastembed batch so that budget is authoritative.
         self.model
-            .embed(inputs, Some(inputs.len().max(1)))
+            .embed(rendered, Some(request.inputs.len().max(1)))
             .context("fastembed inference failed")
     }
 }

@@ -2,16 +2,14 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Schema epoch. Older pre-release prototypes are intentionally rejected rather
-/// than migrated.
-pub const SCHEMA_VERSION: i64 = 3;
+/// than migrated. Epoch 4 dropped the unused `metadata` table and
+/// `projects.role` column; epoch 5 split model identity into a semantic
+/// contract (`embedding_models`) plus append-only execution provenance
+/// (`model_executions`) and replaced `input_transform` with a typed
+/// document-side contract; epoch 6 added analyzer-produced `relations`.
+pub const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r#"
-CREATE TABLE metadata(
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  schema_version INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE settings(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -89,7 +87,6 @@ CREATE TABLE projects(
   id INTEGER PRIMARY KEY,
   label TEXT NOT NULL UNIQUE,
   source_dir TEXT NOT NULL,
-  role TEXT,
   created_at TEXT NOT NULL,
   last_index_run_id INTEGER REFERENCES index_runs(id)
 );
@@ -153,31 +150,46 @@ CREATE TABLE representations(
 );
 CREATE INDEX idx_repr_channel_hash ON representations(kind, content_hash);
 
+-- Semantic model contracts: every column changes vector meaning. Execution
+-- environment lives in model_executions and is never part of identity.
 CREATE TABLE embedding_models(
   id INTEGER PRIMARY KEY,
+  model TEXT NOT NULL,
+  revision TEXT,
+  model_hash TEXT,
+  tokenizer_hash TEXT,
+  pooling TEXT NOT NULL,
+  normalize INTEGER NOT NULL,
+  native_dimensions INTEGER NOT NULL CHECK (native_dimensions > 0),
+  max_sequence_length INTEGER NOT NULL,
+  prompts_json TEXT NOT NULL,
+  quantization TEXT,
+  UNIQUE (
+    model, revision, model_hash, tokenizer_hash, pooling, normalize,
+    native_dimensions, max_sequence_length, prompts_json, quantization
+  )
+);
+
+-- Append-only record of the environments a model has executed in.
+-- Diagnostics only; never compared for space compatibility.
+CREATE TABLE model_executions(
+  id INTEGER PRIMARY KEY,
+  model_id INTEGER NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
   backend TEXT NOT NULL,
   backend_version TEXT NOT NULL,
   runtime_version TEXT,
-  model TEXT NOT NULL,
-  revision TEXT,
-  dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-  tokenizer_hash TEXT,
-  model_hash TEXT,
-  normalize INTEGER NOT NULL,
   execution_provider TEXT NOT NULL,
-  quantization TEXT,
   cache_path TEXT,
-  UNIQUE (
-    backend, backend_version, model, revision, dimensions,
-    tokenizer_hash, model_hash, normalize, execution_provider, quantization
-  )
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
 );
+CREATE INDEX idx_model_executions_model ON model_executions(model_id);
 
 CREATE TABLE embedding_spaces(
   space_id TEXT PRIMARY KEY,
   model_id INTEGER NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
   channel TEXT NOT NULL,
-  input_transform TEXT NOT NULL,
+  document_side_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 CREATE INDEX idx_spaces_channel ON embedding_spaces(channel);
@@ -191,6 +203,22 @@ CREATE TABLE embeddings(
   created_at TEXT NOT NULL,
   PRIMARY KEY (space_id, content_hash)
 );
+
+-- Typed, provenance-carrying relations produced by resolved analyzers (LSP,
+-- SCIP) after publication, keyed by the generation they describe.
+CREATE TABLE relations(
+  id INTEGER PRIMARY KEY,
+  generation INTEGER NOT NULL,
+  from_entity_id TEXT NOT NULL,
+  to_entity_id TEXT,
+  to_symbol TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  resolution TEXT NOT NULL CHECK(resolution IN ('exact','heuristic')),
+  provenance TEXT NOT NULL
+);
+CREATE INDEX idx_relations_generation ON relations(generation);
+CREATE INDEX idx_relations_from ON relations(from_entity_id);
+CREATE INDEX idx_relations_to ON relations(to_entity_id);
 
 CREATE TABLE references_raw(
   caller_unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,
@@ -237,10 +265,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         );
     }
     conn.execute_batch(&format!(
-        "BEGIN;\n{SCHEMA}\n\
-         INSERT INTO metadata(id, schema_version, created_at) \
-         VALUES (1, {SCHEMA_VERSION}, datetime('now'));\n\
-         PRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+        "BEGIN;\n{SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
     ))
     .context("applying initial schema")?;
     Ok(())

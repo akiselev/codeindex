@@ -8,10 +8,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context as _, Result, bail};
 use codeindex_core::{
-    EmbeddingSpaceId, EmbeddingSpaceIdentity, EntityId, EntityVersionId, RepresentationKind,
+    EmbeddingSpaceId, EmbeddingSpaceIdentity, EmbeddingTask, EntityId, EntityVersionId,
+    RepresentationKind,
 };
-use codeindex_embedding::{Embedder, normalize_in_place};
-use codeindex_query::{UnitView, WhereFilter, identity_diff, rank_candidates, unit_id};
+use codeindex_embedding::{
+    EmbedRequest, EmbeddingBackend, apply_output_dimensions, normalize_in_place,
+};
+use codeindex_query::{UnitView, WhereFilter, contract_diff, rank_candidates, unit_id};
 use codeindex_storage::{IndexSnapshot, ProjectRecord, RepresentationRef};
 
 pub use codeindex_storage as storage;
@@ -112,6 +115,8 @@ pub struct SearchIndex {
     pub units: Vec<CodeUnitRef>,
     /// Deterministic by space id.
     pub spaces: BTreeMap<EmbeddingSpaceId, SearchSpace>,
+    /// Typed analyzer-produced relations between entities.
+    pub relations: Vec<codeindex_storage::RelationRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,15 +152,12 @@ impl SearchIndex {
     /// data returns an error rather than panicking inside the vector store.
     pub fn from_snapshot(snapshot: IndexSnapshot) -> Result<SearchIndex> {
         let projects = snapshot.projects;
+        let relations = snapshot.relations;
         let units: Vec<CodeUnitRef> = snapshot
             .units
             .into_iter()
             .map(|unit| {
-                let normalized_body_hash = unit
-                    .content_hash(&RepresentationKind::Body)
-                    .or_else(|| unit.content_hash(&RepresentationKind::Implementation))
-                    .unwrap_or_default()
-                    .to_string();
+                let normalized_body_hash = unit.normalized_body_hash.clone();
                 let display_source = unit
                     .content(&RepresentationKind::FullSource)
                     .map(str::to_owned);
@@ -184,20 +186,29 @@ impl SearchIndex {
         let mut spaces = BTreeMap::new();
         for snapshot_space in snapshot.spaces {
             let identity = snapshot_space.identity;
-            if identity.model.dimensions == 0 {
+            let dimensions = identity.effective_dimensions();
+            if dimensions == 0 || identity.model.native_dimensions == 0 {
                 bail!("embedding space {} has zero dimensions", identity.id);
+            }
+            if dimensions > identity.model.native_dimensions {
+                bail!(
+                    "embedding space {} projects to {dimensions} dimensions but its model is \
+                     only {} wide",
+                    identity.id,
+                    identity.model.native_dimensions
+                );
             }
             if spaces.contains_key(&identity.id) {
                 bail!("duplicate embedding space id {}", identity.id);
             }
             let mut by_hash = HashMap::new();
             for (hash, vector) in snapshot_space.vectors {
-                if vector.len() != identity.model.dimensions {
+                if vector.len() != dimensions {
                     bail!(
-                        "embedding space {} vector {hash:?} has {} dimensions, expected {}",
+                        "embedding space {} vector {hash:?} has {} dimensions, expected \
+                         {dimensions}",
                         identity.id,
                         vector.len(),
-                        identity.model.dimensions
                     );
                 }
                 if !vector.iter().all(|value| value.is_finite()) {
@@ -224,7 +235,7 @@ impl SearchIndex {
             spaces.insert(
                 identity.id.clone(),
                 SearchSpace {
-                    vectors: VectorStore::from_unit_vectors(identity.model.dimensions, vectors),
+                    vectors: VectorStore::from_unit_vectors(dimensions, vectors),
                     identity,
                 },
             );
@@ -234,6 +245,7 @@ impl SearchIndex {
             projects,
             units,
             spaces,
+            relations,
         })
     }
 
@@ -241,36 +253,10 @@ impl SearchIndex {
         self.spaces.values().map(|space| &space.identity)
     }
 
-    pub fn spaces_for_channel(
-        &self,
-        channel: &RepresentationKind,
-    ) -> impl Iterator<Item = &EmbeddingSpaceIdentity> {
-        self.spaces
-            .values()
-            .filter(move |space| &space.identity.channel == channel)
-            .map(|space| &space.identity)
-    }
-
     pub fn space(&self, id: &EmbeddingSpaceId) -> Result<&SearchSpace> {
         self.spaces
             .get(id)
             .with_context(|| format!("embedding space {id} is not loaded"))
-    }
-
-    pub fn unique_space_for_channel(
-        &self,
-        channel: &RepresentationKind,
-    ) -> Result<&EmbeddingSpaceIdentity> {
-        let mut matches = self.spaces_for_channel(channel);
-        let first = matches
-            .next()
-            .with_context(|| format!("no embedding space targets channel {channel}"))?;
-        if matches.next().is_some() {
-            bail!(
-                "multiple embedding spaces target channel {channel}; choose an explicit space id"
-            );
-        }
-        Ok(first)
     }
 
     pub fn unit_indices_for_project(&self, label: &str) -> Vec<usize> {
@@ -282,29 +268,58 @@ impl SearchIndex {
             .collect()
     }
 
+    /// Embed `text` as a query — rendered through the model's prompt contract
+    /// with the optional task instruction — and search the space. The task
+    /// never has to match how documents were embedded: one document index
+    /// serves many query intents.
     pub fn search_text(
         &self,
-        embedder: &mut dyn Embedder,
+        embedder: &mut dyn EmbeddingBackend,
         text: &str,
+        task: Option<&EmbeddingTask>,
         space_id: &EmbeddingSpaceId,
         filter: &WhereFilter,
         limit: usize,
     ) -> Result<SearchResults> {
         let space = self.space(space_id)?;
-        let identity = embedder.identity();
-        if identity != &space.identity.model {
+        let contract = embedder.contract();
+        if contract != &space.identity.model {
             bail!(
-                "search queries for space {} must use its model identity; differing fields: {}",
+                "search queries for space {} must use its model contract; differing fields: {}",
                 space_id,
-                identity_diff(&space.identity.model, identity).join(", ")
+                contract_diff(&space.identity.model, contract).join(", ")
             );
         }
-        let mut vectors = embedder.embed(std::slice::from_ref(&text.to_owned()))?;
+        let inputs = [text];
+        let request = EmbedRequest::queries(&inputs, task);
+        let mut vectors = embedder.embed(&request)?;
         let mut query = vectors.pop().context("embedder returned no vector")?;
         if space.identity.model.normalize {
             normalize_in_place(&mut query);
         }
+        apply_output_dimensions(
+            &mut query,
+            space.identity.document_side.output_dimensions,
+            space.identity.model.normalize,
+        )?;
         self.search_vector(&query, space_id, filter, limit)
+    }
+
+    /// Filtered `(unit index, vector)` candidates of one space, optionally
+    /// excluding a query unit.
+    fn candidates<'a>(
+        &'a self,
+        space: &'a SearchSpace,
+        filter: &'a WhereFilter,
+        skip: Option<usize>,
+    ) -> impl Iterator<Item = (usize, &'a [f32])> {
+        (0..self.units.len()).filter_map(move |index| {
+            if Some(index) == skip || !filter.matches(&self.units[index]) {
+                return None;
+            }
+            let row = space.vectors.row_for_unit(index)?;
+            Some((index, space.vectors.vector(row)))
+        })
     }
 
     pub fn search_vector(
@@ -316,14 +331,14 @@ impl SearchIndex {
     ) -> Result<SearchResults> {
         let space = self.space(space_id)?;
         ensure_query_dimensions(query, &space.identity)?;
-        let candidates = (0..self.units.len()).filter_map(|index| {
-            if !filter.matches(&self.units[index]) {
-                return None;
-            }
-            let row = space.vectors.row_for_unit(index)?;
-            Some((index, space.vectors.vector(row)))
-        });
-        Ok(finish(rank_candidates(query, candidates, -1.0), limit))
+        Ok(finish(
+            rank_candidates(
+                query,
+                self.candidates(space, filter, None),
+                f32::NEG_INFINITY,
+            ),
+            limit,
+        ))
     }
 
     pub fn similar_to_unit(
@@ -340,15 +355,12 @@ impl SearchIndex {
             .row_for_unit(query_index)
             .context("query unit has no stored embedding in this space")?;
         let query = space.vectors.vector(query_row).to_vec();
-        let candidates = (0..self.units.len()).filter_map(|index| {
-            if index == query_index || !filter.matches(&self.units[index]) {
-                return None;
-            }
-            let row = space.vectors.row_for_unit(index)?;
-            Some((index, space.vectors.vector(row)))
-        });
         Ok(finish(
-            rank_candidates(&query, candidates, threshold),
+            rank_candidates(
+                &query,
+                self.candidates(space, filter, Some(query_index)),
+                threshold,
+            ),
             limit,
         ))
     }
@@ -375,16 +387,13 @@ impl SearchIndex {
             );
             let space = self.space(query.space_id)?;
             ensure_query_dimensions(query.vector, &space.identity)?;
-            let candidates = (0..self.units.len()).filter_map(|index| {
-                if !filter.matches(&self.units[index]) {
-                    return None;
-                }
-                let row = space.vectors.row_for_unit(index)?;
-                Some((index, space.vectors.vector(row)))
-            });
-            for (zero_rank, scored) in rank_candidates(query.vector, candidates, -1.0)
-                .into_iter()
-                .enumerate()
+            for (zero_rank, scored) in rank_candidates(
+                query.vector,
+                self.candidates(space, filter, None),
+                f32::NEG_INFINITY,
+            )
+            .into_iter()
+            .enumerate()
             {
                 let rank = zero_rank + 1;
                 let contribution = query.weight / (rrf_k + rank) as f32;
@@ -424,11 +433,11 @@ impl SearchIndex {
 
 fn ensure_query_dimensions(query: &[f32], identity: &EmbeddingSpaceIdentity) -> Result<()> {
     anyhow::ensure!(
-        query.len() == identity.model.dimensions,
+        query.len() == identity.effective_dimensions(),
         "query for embedding space {} has {} dimensions, expected {}",
         identity.id,
         query.len(),
-        identity.model.dimensions
+        identity.effective_dimensions()
     );
     anyhow::ensure!(
         query.iter().all(|value| value.is_finite()),

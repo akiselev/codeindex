@@ -5,7 +5,7 @@ use codeindex_core::{
     RepresentationOrigin,
 };
 use codeindex_embedding::embed::hash::HashEmbedder;
-use codeindex_embedding::{Embedder, normalize_in_place};
+use codeindex_embedding::{EmbedRequest, EmbeddingBackend, normalize_in_place};
 use codeindex_query::WhereFilter;
 use codeindex_search::{SearchIndex, SpaceVectorQuery, resolve_selector};
 use codeindex_sqlite::{NewCodeUnit, NewFile, NewRepresentation, open_in_memory};
@@ -97,26 +97,24 @@ fn build_index() -> (SearchIndex, HashEmbedder, HashEmbedder) {
     let code_space = EmbeddingSpaceIdentity::new(
         "code",
         RepresentationKind::Implementation,
-        code_embedder.identity().clone(),
+        code_embedder.contract().clone(),
     );
     let docs_space = EmbeddingSpaceIdentity::new(
         "docs",
         RepresentationKind::Documentation,
-        docs_embedder.identity().clone(),
+        docs_embedder.contract().clone(),
     );
     db.find_or_create_space(&code_space).unwrap();
     db.find_or_create_space(&docs_space).unwrap();
 
-    let bodies: Vec<String> = BODIES
-        .iter()
-        .map(|(_, body, _)| (*body).to_owned())
-        .collect();
-    let docs: Vec<String> = BODIES
-        .iter()
-        .map(|(_, _, docs)| (*docs).to_owned())
-        .collect();
-    let mut code_vectors = code_embedder.embed(&bodies).unwrap();
-    let mut docs_vectors = docs_embedder.embed(&docs).unwrap();
+    let bodies: Vec<&str> = BODIES.iter().map(|(_, body, _)| *body).collect();
+    let docs: Vec<&str> = BODIES.iter().map(|(_, _, docs)| *docs).collect();
+    let mut code_vectors = code_embedder
+        .embed(&EmbedRequest::documents(&bodies, None))
+        .unwrap();
+    let mut docs_vectors = docs_embedder
+        .embed(&EmbedRequest::documents(&docs, None))
+        .unwrap();
     for vector in &mut code_vectors {
         normalize_in_place(vector);
     }
@@ -169,7 +167,7 @@ fn load_populates_independent_spaces() {
             .unwrap()
             .identity
             .model
-            .dimensions,
+            .native_dimensions,
         DIMS * 2
     );
 }
@@ -182,6 +180,7 @@ fn search_text_uses_the_selected_space_model() {
         .search_text(
             &mut code_embedder,
             "parse command line flags",
+            None,
             &EmbeddingSpaceId::new("code"),
             &filter,
             10,
@@ -193,6 +192,7 @@ fn search_text_uses_the_selected_space_model() {
         .search_text(
             &mut docs_embedder,
             "file checksum",
+            None,
             &EmbeddingSpaceId::new("docs"),
             &filter,
             10,
@@ -204,25 +204,26 @@ fn search_text_uses_the_selected_space_model() {
         .search_text(
             &mut code_embedder,
             "anything",
+            None,
             &EmbeddingSpaceId::new("docs"),
             &filter,
             10,
         )
         .unwrap_err()
         .to_string();
-    assert!(error.contains("model identity"));
+    assert!(error.contains("model contract"));
 }
 
 #[test]
 fn weighted_rrf_fuses_incompatible_vector_spaces() {
     let (index, mut code_embedder, mut docs_embedder) = build_index();
     let mut code_query = code_embedder
-        .embed(&["rolling checksum bytes".to_string()])
+        .embed(&EmbedRequest::queries(&["rolling checksum bytes"], None))
         .unwrap()
         .pop()
         .unwrap();
     let mut docs_query = docs_embedder
-        .embed(&["file checksum".to_string()])
+        .embed(&EmbedRequest::queries(&["file checksum"], None))
         .unwrap()
         .pop()
         .unwrap();
@@ -258,4 +259,119 @@ fn selector_round_trips() {
     let (index, _, _) = build_index();
     let id = codeindex_query::unit_id(&index.units[0]);
     assert_eq!(resolve_selector(&index.units, &id).unwrap(), 0);
+}
+
+/// A hash embedder whose contract is instruction-aware (Qwen3-shaped):
+/// queries render through `Instruct:/Query:`, documents embed raw.
+struct InstructionEmbedder {
+    inner: HashEmbedder,
+    contract: codeindex_core::ModelContract,
+}
+
+impl InstructionEmbedder {
+    fn new(dimensions: usize) -> Self {
+        let inner = HashEmbedder::new(dimensions);
+        let mut contract = inner.contract().clone();
+        contract.prompts = codeindex_core::PromptContract::QueryInstruction {
+            query_template: "Instruct: {instruction}\nQuery:{query}".into(),
+            default_instruction: None,
+        };
+        Self { inner, contract }
+    }
+}
+
+impl EmbeddingBackend for InstructionEmbedder {
+    fn contract(&self) -> &codeindex_core::ModelContract {
+        &self.contract
+    }
+    fn execution(&self) -> &codeindex_core::ExecutionInfo {
+        self.inner.execution()
+    }
+    fn embed(&mut self, request: &EmbedRequest<'_>) -> anyhow::Result<Vec<Vec<f32>>> {
+        let rendered = codeindex_embedding::render_inputs(&self.contract, request)?;
+        let rendered_refs: Vec<&str> = rendered.iter().map(|text| text.as_ref()).collect();
+        // Re-issue as an already-rendered symmetric request against the inner
+        // hash model so the instruction actually reaches the vector.
+        self.inner
+            .embed(&EmbedRequest::documents(&rendered_refs, None))
+    }
+}
+
+#[test]
+fn instruction_tasked_queries_hit_an_uninstructed_document_index() {
+    use codeindex_core::EmbeddingTask;
+
+    let db = open_in_memory().unwrap();
+    let project_id = db.upsert_project("main", "memory://fixture").unwrap();
+    let file_id = db
+        .upsert_file(&NewFile {
+            project_id,
+            source_document_id: "lib.rs".into(),
+            source_revision: "r1".into(),
+            relative_path: "lib.rs".into(),
+            language_id: "rust".into(),
+            mtime_ns: 0,
+            size: 0,
+            source_hash: "file".into(),
+        })
+        .unwrap();
+    let units: Vec<NewCodeUnit> = BODIES
+        .iter()
+        .enumerate()
+        .map(|(index, (name, body, docs))| unit(name, body, docs, index + 1))
+        .collect();
+    db.insert_units(file_id, &units).unwrap();
+
+    let mut embedder = InstructionEmbedder::new(DIMS);
+    let space = EmbeddingSpaceIdentity::new(
+        "code",
+        RepresentationKind::Implementation,
+        embedder.contract().clone(),
+    );
+    db.find_or_create_space(&space).unwrap();
+    let bodies: Vec<&str> = BODIES.iter().map(|(_, body, _)| *body).collect();
+    let mut vectors = embedder
+        .embed(&EmbedRequest::documents(&bodies, None))
+        .unwrap();
+    for vector in &mut vectors {
+        normalize_in_place(vector);
+    }
+    for ((name, _, _), vector) in BODIES.iter().zip(vectors.iter()) {
+        db.insert_embedding(
+            &EmbeddingSpaceId::new("code"),
+            &format!("impl-{name}"),
+            vector,
+        )
+        .unwrap();
+    }
+    let index = SearchIndex::from_snapshot(db.snapshot(&[]).unwrap()).unwrap();
+
+    // Without a task the model has no default instruction: must error loudly.
+    let error = index
+        .search_text(
+            &mut embedder,
+            "parse flags",
+            None,
+            &EmbeddingSpaceId::new("code"),
+            &WhereFilter::default(),
+            10,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("task instruction"), "got: {error}");
+
+    // With a task instruction the query renders differently from documents
+    // yet still searches the unchanged document index.
+    let task = EmbeddingTask::new("code-search", "retrieve relevant code");
+    let results = index
+        .search_text(
+            &mut embedder,
+            "parse command line flags",
+            Some(&task),
+            &EmbeddingSpaceId::new("code"),
+            &WhereFilter::default(),
+            10,
+        )
+        .unwrap();
+    assert_eq!(index.units[results.hits[0].index].name, "parse_flags");
 }

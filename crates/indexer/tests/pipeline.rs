@@ -162,6 +162,7 @@ fn use_it() -> i32 { let value = parse_flags("hello world"); value }
         .search_text(
             &mut embedder,
             "parse command line flags",
+            None,
             &EmbeddingSpaceId::new("default/documentation"),
             &WhereFilter::default(),
             10,
