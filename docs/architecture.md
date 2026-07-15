@@ -1,9 +1,10 @@
 # Architecture
 
 `codeindex` is split by dependency and change boundary, not by command or user
-interface. The workspace is a reusable library substrate. A future
-`codeindex-cli`, IDE extension, daemon, binding, or analyzer is a consumer of
-these crates rather than part of the core architecture.
+interface. The workspace is a reusable library substrate. `codeindex-cli` is
+the first consumer and deliberately thin; IDE extensions, daemons, bindings,
+and analyzers are likewise consumers of these crates rather than part of the
+core architecture.
 
 ## Crate boundaries
 
@@ -14,7 +15,7 @@ Application-neutral vocabulary:
 - source languages and spans;
 - logical `EntityId` and exact `EntityVersionId`;
 - `RepresentationKind`, `Representation`, and `RepresentationOrigin`;
-- exact `ModelIdentity`;
+- the semantic `ModelContract` and provenance-only `ExecutionInfo`;
 - named `EmbeddingSpaceId` and `EmbeddingSpaceIdentity`.
 
 The model and space contracts live in the leaf crate because embedding backends,
@@ -73,7 +74,9 @@ The indexer:
 6. carries logical entity identity across unambiguous edits and renames;
 7. checkpoints a versioned document payload without mutating live tables;
 8. repeats a full manifest refresh until a barrier observes no changes;
-9. atomically publishes the complete selected scope and derives `Usage`;
+9. atomically publishes the complete selected scope and derives `Usage`
+   (call sites attribute to the innermost unit whose byte span contains them,
+   so calls inside nested closures attribute to the closure);
 10. projects representation content into explicit embedding spaces separately.
 
 `IndexRunBuilder` defaults to compatible auto-resume and automatic convergence.
@@ -88,12 +91,17 @@ text recovery under lean retention.
 
 Storage- and parser-free embedding primitives:
 
-- `Embedder`;
-- fastembed/custom ONNX execution;
-- managed models and accelerator diagnostics;
+- the role-aware `EmbeddingBackend` trait and typed `EmbedRequest`
+  (Query vs Document, task instructions, document-side prompts);
+- prompt rendering driven by each model's `PromptContract`;
+- generic model resolution: `hf:owner/name[@rev]` / `dir:/path` references
+  resolved from the repository's own sentence-transformers configuration,
+  verified trust-on-first-use through a lockfile;
+- fastembed/ONNX execution for mean/cls models, candle execution for
+  decoder-style last-token models (Qwen3-Embedding);
 - exact tokenizer accounting;
 - length-sorted token-area batch packing;
-- vector normalization and token statistics.
+- vector normalization, Matryoshka projection, and token statistics.
 
 ### `codeindex-query`
 
@@ -190,8 +198,8 @@ A representation channel and an embedding model are different axes. An
 ```text
 space id
 + representation channel
-+ exact model identity
-+ input transform
++ semantic model contract (weights, tokenizer, pooling, prompts, dims)
++ document-side contract (document prompt, Matryoshka output dimensions)
 ```
 
 This permits, for example:
@@ -207,7 +215,9 @@ description = GeneratedDescription × text embedding model
 Identical representation hashes share one vector inside a space. The same
 content can be embedded in multiple spaces without collisions. Space ids are
 immutable semantic keys: an existing id cannot silently change channel, model,
-or input transform.
+or input transform. Every representation channel present in the store except
+`FullSource` (display-only) is embeddable; the `embed_pending` convenience
+creates one `default/<channel>` space per embeddable channel.
 
 ## Data flow
 
@@ -273,8 +283,8 @@ per-space search / similarity / rank fusion
   representation with explicit provenance.
 - New language: add a grammar, language metadata, unit/reference queries, and
   fixtures; use an adapter only when necessary.
-- New embedding backend: implement `Embedder` with a reproducible
-  `ModelIdentity`.
+- New embedding backend: implement `EmbeddingBackend` with a reproducible
+  `ModelContract` (semantic identity) and `ExecutionInfo` (provenance).
 - New persistence backend: construct `IndexSnapshot` for search; a generalized
   incremental write-side store interface may be added when a second backend
   needs to reuse the indexer.

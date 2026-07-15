@@ -1,5 +1,4 @@
 id = "cpp"
-name = "C++"
 extensions = ["cc", "cpp", "cxx", "c++", "hpp", "hh", "hxx", "h++"]
 comment_nodes = ["comment"]
 

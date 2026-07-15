@@ -173,20 +173,17 @@ impl Db {
                          WHERE run_id = ?1 AND project_label = ?2 AND action != 'delete'",
                     )?;
                     let manifest_rows = statement.query_map(params![run_id, label], |row| {
-                        Ok(format!(
-                            "{}\0{}\0{}\0{}\0{}",
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
+                        Ok(crate::index_runs::manifest_row_line(
+                            &row.get::<_, String>(0)?,
+                            &row.get::<_, String>(1)?,
+                            &row.get::<_, String>(2)?,
+                            &row.get::<_, String>(3)?,
+                            &row.get::<_, String>(4)?,
                         ))
                     })?;
-                    let mut manifest: Vec<String> =
-                        manifest_rows.collect::<rusqlite::Result<_>>()?;
-                    manifest.sort();
+                    let manifest: Vec<String> = manifest_rows.collect::<rusqlite::Result<_>>()?;
                     ensure!(
-                        sha256_hex(&manifest.join("\n")) == expected_digest,
+                        crate::index_runs::manifest_digest_from_lines(manifest) == expected_digest,
                         "project {label:?} manifest digest is inconsistent"
                     );
                 }
@@ -372,6 +369,29 @@ impl Db {
                 "publication produced dangling live corpus rows"
             );
             call_hook(fault_hook, PublishStep::Invariants)?;
+
+            // Vectors whose content hash no longer exists in any representation
+            // of their space's channel are unreachable by snapshot exports;
+            // drop them so they cannot accumulate across reindexes. Only runs
+            // when documents actually changed — unchanged/metadata publishes
+            // cannot create orphans, and the sweep probes the whole table.
+            if documents.iter().any(|document| {
+                matches!(
+                    document.action,
+                    DocumentAction::Upsert | DocumentAction::Delete
+                )
+            }) {
+                transaction.execute(
+                    "DELETE FROM embeddings
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM embedding_spaces s
+                       JOIN representations r
+                         ON r.kind = s.channel AND r.content_hash = embeddings.content_hash
+                       WHERE s.space_id = embeddings.space_id
+                     )",
+                    [],
+                )?;
+            }
 
             transaction.execute(
                 "INSERT INTO settings(key, value) VALUES ('index.generation', ?1)

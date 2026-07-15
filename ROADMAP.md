@@ -43,6 +43,20 @@ library consumer.
 
 ## Remaining milestones
 
+### M9 — Typed embedding contract, generic models, candle/Qwen3 (next up)
+
+Full design in `docs/rearchitecture-plan.md`: replace `embed(&[String])` with a
+role/instruction-aware `EmbedRequest`, split semantic model identity from
+execution provenance (schema epoch 5), resolve models from HuggingFace repo
+paths (sentence-transformers config parsing + TOFU lockfile) instead of
+hardcoded enums, and add a candle backend for Qwen3-Embedding (last-token
+pooling, left padding, Matryoshka dims). Precedes and unblocks the M2 query
+surface.
+
+*Exit:* `hf:Qwen/Qwen3-Embedding-0.6B` resolves without code changes, embeds a
+corpus, and answers instruction-tasked queries end-to-end; golden-vector
+conformance passes.
+
 ### M2 — remaining `codeindex-cli` surface
 
 Extend the existing atomic `index`/status lifecycle consumer with `embed`, `query`, `search`,
@@ -67,7 +81,10 @@ compiling bundled SQLite or all language grammars.
 
 - decide crate publication scope and reserve names;
 - compile and test examples;
-- semver-audit public types and error contracts;
+- semver-audit public types and error contracts (`SourceProvider`,
+  `IndexSnapshot`, representation enrichment, embedding-space APIs);
+- migrate `decombine` to the current explicit-space APIs and typed entity ids
+  as the first compatibility proof;
 - complete rustdoc and enable `deny(missing_docs)`;
 - add a changelog and deprecation policy;
 - publish supported crates to crates.io.
@@ -77,16 +94,28 @@ compiling bundled SQLite or all language grammars.
 ### M6 — Platform and accelerator matrix
 
 CI-tested embedding on Linux/CUDA, macOS/CoreML, and Windows/DirectML, plus
-managed per-platform model artifacts and provider drift gates.
+provider drift gates. Add a scheduled/manually-triggered smoke test that
+downloads a small model and runs real inference rather than compile-only
+checking the backend features. Drift gates move from pinned artifact hashes to
+golden-vector conformance once M9's generic model resolution lands.
 
 *Exit:* documented support tier and reproducibility results per provider.
 
 ### M7 — Relations and context planning
 
-Generalize the current raw call-site/Usage prototype into parser-neutral,
-provenance-carrying relations. Add resolved compiler/LSP/SCIP adapters where
-available, then build token-budgeted context-pack planning over semantic seeds,
-relations, tests, examples, and diversity constraints.
+Foundation shipped with M9: `codeindex-lsp` drives any stdio language server
+(server-agnostic; integration-tested against rust-analyzer and clangd) as a
+post-publish pass producing a derived `typed_signature` channel and exact
+`calls` relations via LSP `callHierarchy` — no per-language query work — with
+a `textDocument/definition` fallback seeded from tree-sitter call sites.
+Relations are generation-keyed rows surfaced through `IndexSnapshot.relations`
+and the `lsp-enrich` CLI command.
+
+Remaining for M7: more relation kinds (implements, type-of, references),
+SCIP batch ingestion as an alternative provider, relation-aware query filters,
+and token-budgeted context-pack planning over semantic seeds, relations,
+tests, examples, and diversity constraints (design:
+`docs/rearchitecture-plan.md` §3.6).
 
 *Exit:* a consumer can request an implementation/debug/review context pack
 without implementing graph expansion or token selection itself.
@@ -110,7 +139,11 @@ code depending on `codeindex-sqlite`.
   Rust and support runtime-registered grammars when packaging and trust concerns
   are resolved.
 - **Source providers.** Add maintained Git revision, editor overlay, archive, and
-  structured-import adapters as real consumers demand them.
+  structured-import adapters as real consumers demand them. Optimize provider
+  catalogs so lean-retention source recovery does not re-enumerate the full
+  corpus per lookup.
+- **Cross-document entity moves.** Preserve logical identity across provider
+  document moves only when matching is unique and evidence is explicit.
 - **Serving.** A daemon and/or MCP server can maintain a live index once the CLI
   contract and invalidation model are stable.
 

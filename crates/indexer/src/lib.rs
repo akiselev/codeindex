@@ -229,7 +229,7 @@ pub(crate) fn complete_representations(source: &str, entity: &mut ExtractedEntit
         .min(full.len());
     let search_prefix = &full[..body_offset];
     if entity.name != "<anonymous>"
-        && let Some(offset) = search_prefix.find(&entity.name)
+        && let Some(offset) = find_declared_name(search_prefix, &entity.name)
     {
         let mut without_name = String::with_capacity(full.len() + 8);
         without_name.push_str(&full[..offset]);
@@ -245,6 +245,31 @@ pub(crate) fn complete_representations(source: &str, entity: &mut ExtractedEntit
             ),
         );
     }
+}
+
+/// First occurrence of `name` in `text` bounded by non-identifier characters,
+/// so a declared name that is also a substring of another identifier
+/// (`add` inside a Go receiver type `adder`) never matches.
+fn find_declared_name(text: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident(c));
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_ident(c));
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
 }
 
 pub(crate) fn apply_enrichers(
@@ -398,6 +423,16 @@ mod tests {
             max_body_chars: 10_000,
             retention: RetentionMode::Full,
         }
+    }
+
+    #[test]
+    fn declared_name_erasure_respects_word_boundaries() {
+        // `add` inside the receiver type `adder` must not match; the real
+        // declared name after the receiver must.
+        assert_eq!(find_declared_name("func (a *adder) add(", "add"), Some(16));
+        assert_eq!(find_declared_name("fn addr(", "add"), None);
+        assert_eq!(find_declared_name("fn add(", "add"), Some(3));
+        assert_eq!(find_declared_name("", "add"), None);
     }
 
     #[test]

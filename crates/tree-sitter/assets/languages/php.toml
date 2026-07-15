@@ -1,5 +1,4 @@
 id = "php"
-name = "PHP"
 extensions = ["php", "phtml"]
 comment_nodes = ["comment"]
 

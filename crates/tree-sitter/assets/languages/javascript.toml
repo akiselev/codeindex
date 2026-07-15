@@ -1,5 +1,4 @@
 id = "javascript"
-name = "JavaScript"
 extensions = ["js", "jsx", "mjs", "cjs"]
 comment_nodes = ["comment"]
 adapter = "js-like"

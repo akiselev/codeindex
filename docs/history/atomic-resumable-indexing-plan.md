@@ -1,5 +1,10 @@
 # Atomic, resumable indexing implementation plan
 
+> **Historical design record — implemented.** Shipped in schema epoch 3
+> (commit `ed72dfa`). Written pre-implementation, so it reads as pending work
+> ("Add…", "Refactor…"); the implementation map below is accurate. Current
+> contracts live in `docs/architecture.md`.
+
 Status: implemented in schema epoch 3. Scope: replace the former live,
 statement-by-statement index
 mutation with a durable staging journal and one atomic publish transaction before

@@ -1,5 +1,12 @@
 # Implementation plan — M1 (standalone search API) & M4 (multi-representation & entity versions)
 
+> **Historical design record — superseded.** This work shipped in commits
+> `22817c3`…`e9aa8df`. The wire types, SQL keys, and search signatures shown
+> below no longer match the code (e.g. `IndexSnapshot` now carries named
+> `spaces`, embeddings are keyed by `(space_id, content_hash)`, and search takes
+> a `space_id`, not a channel). Current contracts live in
+> `docs/architecture.md`.
+
 Status: proposed. Scope: implement M1 and M4 **in full**, with two overriding
 constraints from the maintainer:
 

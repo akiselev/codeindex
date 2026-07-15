@@ -1,5 +1,4 @@
 id = "go"
-name = "Go"
 extensions = ["go"]
 comment_nodes = ["comment"]
 adapter = "go"

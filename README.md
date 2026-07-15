@@ -25,7 +25,7 @@ publication to the library.
 | `codeindex-query` | Stable selectors, metadata filtering, model identity diagnostics, and deterministic ranking kernels. | none |
 | `codeindex-search` | Validated snapshot loading, per-space search, similarity search, and reciprocal-rank fusion across spaces. | none beyond embedding/query primitives |
 | `codeindex` | Thin facade re-exporting the eight component crates. | selected features |
-| `codeindex-cli` | Thin atomic index/resume/status/abandon command-line consumer. | SQLite + grammars |
+| `codeindex-cli` | Thin atomic index/status/abandon/supersede command-line consumer (resume via `index --resume`). | SQLite + grammars |
 
 The major dependency boundaries are deliberate:
 
@@ -47,119 +47,55 @@ pulls in SQLite or language grammars.
 
 ## Source providers
 
-The compatibility `index()` function still indexes ordinary filesystem
-projects. The underlying operation is `index_sources()`, which accepts any
-`SourceProvider`:
-
-```rust
-use codeindex::indexer::{
-    IndexSettings, MemorySource, RetentionMode, SourceProject, index_sources,
-};
-use codeindex::sqlite;
-
-let db = sqlite::open_in_memory()?;
-let mut source = MemorySource::new("memory://workspace");
-source.insert(
-    "src/lib.rs",
-    "fn answer() -> i32 { 42 }",
-);
-
-let settings = IndexSettings {
-    enabled_languages: vec!["rust".into()],
-    body_node_count_threshold: 1,
-    max_body_chars: 10_000,
-    retention: RetentionMode::Full,
-};
-index_sources(
-    &db,
-    &settings,
-    &[SourceProject {
-        label: "main".into(),
-        provider: &source,
-    }],
-    None,
-)?;
-```
-
-Providers expose stable document identities, logical paths, opaque revisions,
-and UTF-8 content. Database, object-store, Git-tree, archive, generated-source,
-and editor-overlay providers can reuse the same indexing pipeline.
-
-Indexing is atomic for the complete selected project scope. Extraction and
-enrichment are checkpointed in a durable operational journal while queries keep
-seeing the prior generation. A no-change refresh barrier then publishes every
-selected project in one SQLite transaction. Interrupted runs automatically
-reuse compatible staged documents; advisory provider revisions are verified by
-content hash unless the caller explicitly opts into metadata trust.
-
-The compatibility functions above use `IndexRunBuilder` with automatic resume,
-refresh, and retry defaults. Applications that need cancellation, progress,
-explicit run selection, or restart behavior can use the builder directly.
+`index()` indexes ordinary filesystem projects; the underlying
+`index_sources()` accepts any `SourceProvider` — database rows, Git objects,
+editor buffers, object stores, archives, or generated code. Providers expose
+stable document identities, logical paths, opaque revisions, and UTF-8
+content. Indexing is atomic for the complete selected scope: extraction is
+checkpointed in a durable journal while queries keep seeing the prior
+generation, and a no-change refresh barrier publishes everything in one
+transaction. See `docs/getting-started.md` §2–3 for runnable examples and
+`docs/architecture.md` for the provider contract.
 
 ## Representations
 
-Each entity can carry multiple independently versioned representation channels:
-
-- `FullSource`
-- `Implementation`
-- `Body`
-- `BodyWithoutDeclaredName`
-- `Signature`
-- `Symbol`
-- `Documentation`
-- `Usage`
-- `GeneratedDescription`
-- consumer-defined custom channels
-
-Representations include provenance. Deterministic frontend channels are marked
-`Extracted`; corpus-derived channels such as `Usage` are `Derived`; external or
-model-generated channels are `Imported`. Consumers can register
-`RepresentationEnricher` implementations before retention is applied.
+Each entity carries multiple independently versioned representation channels
+(`FullSource`, `Implementation`, `Body`, `BodyWithoutDeclaredName`,
+`Signature`, `Symbol`, `Documentation`, derived `Usage`, imported
+`GeneratedDescription`, and custom channels), each with provenance. The full
+model is documented in `docs/architecture.md`.
 
 ## Embedding spaces
 
-An embedding space binds one representation channel to one exact model identity
-and input transform. A corpus can therefore use a code model for implementations
-and a text model for documentation or generated descriptions:
+A space binds one representation channel to one semantic model contract and a
+document-side contract (document prompt + Matryoshka output dimensions), so a
+code model can embed implementations while a text model embeds documentation.
+Search selects an explicit space; multi-model retrieval fuses independently
+ranked lists with weighted reciprocal rank rather than averaging raw cosines
+across models. Query-side task instructions render per request — one document
+index serves many retrieval intents. Examples: `docs/getting-started.md` §5–7.
 
-```rust
-use codeindex::core::{EmbeddingSpaceIdentity, RepresentationKind};
-use codeindex::indexer::embed_space_pending;
+## Local model backends
 
-let code_space = EmbeddingSpaceIdentity::new(
-    "code",
-    RepresentationKind::Implementation,
-    code_embedder.identity().clone(),
-);
-embed_space_pending(&db, &mut code_embedder, &run_config, &code_space)?;
+Models are referenced generically — `hf:owner/name[@rev]`, `dir:/path`, or
+`fastembed:Name` — and their semantic contract (pooling, prompts, dimensions,
+max length) is resolved from the repository's own sentence-transformers
+configuration, hash-locked trust-on-first-use. Two execution backends:
 
-let docs_space = EmbeddingSpaceIdentity::new(
-    "docs",
-    RepresentationKind::Documentation,
-    text_embedder.identity().clone(),
-);
-embed_space_pending(&db, &mut text_embedder, &run_config, &docs_space)?;
-```
-
-`embed_pending()` remains a convenience operation. It creates one
-`default/<channel>` space per embeddable channel using the same embedder.
-
-Search selects an explicit space. For multi-model retrieval,
-`SearchIndex::search_vectors_fused` combines independently ranked result lists
-with weighted reciprocal rank; raw cosine values from incompatible models are
-not averaged.
-
-## Local model backend
-
-Enable `fastembed` to run supported local ONNX models. Accelerator features are
-available for CUDA, DirectML, CoreML, and OpenVINO.
+- `fastembed` — bundled ONNX/ort execution for mean/cls encoder models
+  (BGE, MiniLM, Jina v2 code, the managed CodeRankEmbed), with CUDA,
+  DirectML, CoreML, and OpenVINO accelerator features;
+- `candle` — native execution for decoder-style last-token models
+  (Qwen3-Embedding), with `candle-cuda`/`candle-metal` device features and
+  instruction-aware queries (`Instruct:/Query:` rendered per request).
 
 ```toml
 [dependencies]
-codeindex = { git = "https://github.com/akiselev/codeindex", features = ["fastembed"] }
+codeindex = { git = "https://github.com/akiselev/codeindex", features = ["fastembed", "candle"] }
 ```
 
-A build without embedding backend features can still extract, persist, load,
+There is no implicit default model; every consumer picks an explicit
+reference. A build without backend features can still extract, persist, load,
 and rank externally computed vectors.
 
 ## Building
@@ -172,5 +108,6 @@ cargo check -p codeindex --features fastembed
 cargo run -p codeindex-cli -- --help
 ```
 
-The current database schema is epoch 3. It is pre-release; incompatible epochs are rejected with
-an explicit delete-and-reindex error rather than migrated.
+The database schema is pre-release (`codeindex_sqlite::SCHEMA_VERSION` is the
+current epoch); incompatible epochs are rejected with an explicit
+delete-and-reindex error rather than migrated.
