@@ -308,10 +308,22 @@ struct IndexArgs {
     /// Glob excluded from every filesystem project. Repeat as needed.
     #[arg(long = "exclude")]
     excludes: Vec<String>,
+    /// Index files that .gitignore would hide. Use for deliberately untracked
+    /// corpora such as downloaded documents or OCR text.
+    #[arg(long)]
+    include_ignored: bool,
     #[arg(long, default_value_t = 10)]
     body_node_count_threshold: usize,
     #[arg(long, default_value_t = 10_000)]
     max_body_chars: usize,
+    /// Chunk target for prose documents (Markdown, text), in bytes. Separate
+    /// from the code fragment target. Fixed once a database is published.
+    #[arg(long, default_value_t = 1_200)]
+    prose_target_chars: usize,
+    /// Bytes of the previous prose chunk repeated at the head of the next.
+    /// Unstructured text only; Markdown sections do not overlap.
+    #[arg(long, default_value_t = 150)]
+    prose_overlap_chars: usize,
     #[arg(long, value_enum, default_value_t = RetentionArgument::Full)]
     retention: RetentionArgument,
     /// Resume this exact compatible run id.
@@ -1128,7 +1140,9 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
         .map(|project| {
             (
                 project.label.clone(),
-                FileSystemSource::new(&project.path).with_excludes(arguments.excludes.clone()),
+                FileSystemSource::new(&project.path)
+                    .with_excludes(arguments.excludes.clone())
+                    .including_ignored(arguments.include_ignored),
             )
         })
         .collect();
@@ -1141,10 +1155,8 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
         .collect();
     let settings = IndexSettings {
         enabled_languages: if arguments.languages.is_empty() {
-            codeindex_tree_sitter::BUNDLED_LANGUAGE_IDS
-                .iter()
-                .map(|language| (*language).to_string())
-                .collect()
+            // Grammars plus grammar-free prose formats.
+            codeindex_indexer::all_language_ids()
         } else {
             arguments.languages.clone()
         },
@@ -1152,6 +1164,8 @@ fn index_command(arguments: IndexArgs) -> Result<ExitCode> {
         max_body_chars: arguments.max_body_chars,
         fragment_threshold_chars: 6_000,
         fragment_target_chars: 3_000,
+        prose_target_chars: arguments.prose_target_chars,
+        prose_overlap_chars: arguments.prose_overlap_chars,
         retention: arguments.retention.into(),
     };
     let cancellation = CancellationToken::new();

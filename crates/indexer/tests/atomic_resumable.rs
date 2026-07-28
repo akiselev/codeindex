@@ -19,6 +19,8 @@ fn settings() -> IndexSettings {
         max_body_chars: 10_000,
         fragment_threshold_chars: 6_000,
         fragment_target_chars: 3_000,
+        prose_target_chars: 1_200,
+        prose_overlap_chars: 150,
         retention: RetentionMode::Full,
     }
 }

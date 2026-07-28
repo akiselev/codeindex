@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use codeindex_core::{EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelContract, RepresentationKind};
 use codeindex_embedding::config::EmbeddingRunConfig;
 use codeindex_embedding::{
@@ -10,7 +10,7 @@ use codeindex_embedding::{
     estimated_tokens, normalize_in_place, pack_batches, render_input,
 };
 use codeindex_sqlite::{Db, ModelId};
-use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_units};
+use codeindex_tree_sitter::ExtractOptions;
 
 use crate::SourceProviderCatalog;
 
@@ -336,7 +336,15 @@ fn recover_channel_texts(
         fragment_target_chars: persisted_usize(db, "index.fragment_target_chars")?
             .unwrap_or(defaults.fragment_target_chars),
     };
-    let registry = LanguageRegistry::global();
+    // Same rule for prose: chunk boundaries decide content hashes, so recovery
+    // must re-chunk with the settings the corpus was indexed under.
+    let prose_defaults = codeindex_prose::ProseOptions::default();
+    let prose = codeindex_prose::ProseOptions::with_target(
+        persisted_usize(db, "index.prose_target_chars")?
+            .unwrap_or(prose_defaults.chunking.target_chars),
+        persisted_usize(db, "index.prose_overlap_chars")?
+            .unwrap_or(prose_defaults.chunking.overlap_chars),
+    );
     let mut recovered = HashMap::new();
     for location in locations {
         let source = if let Some(catalog) = sources {
@@ -351,10 +359,9 @@ fn recover_channel_texts(
             std::fs::read_to_string(path).ok()
         };
         let Some(source) = source else { continue };
-        let def = registry
-            .get(&location.language_id)
-            .with_context(|| format!("unknown language {}", location.language_id))?;
-        for mut entity in extract_units(def, &source, &options)? {
+        for mut entity in
+            crate::language::extract_entities(&location.language_id, &source, &options, &prose)?
+        {
             super::complete_representations(&source, &mut entity);
             if let Some(representation) = entity.representation(channel)
                 && wanted.contains(representation.content_hash.as_str())

@@ -1,6 +1,6 @@
 # Oversized units: from truncation to fragments
 
-Status: P1+P2 implemented (2026-07-15); P3 presentation shipped with the `parent` hit field. Track 3 remains future work. Motivated by the big-corpus eval
+Status: P1+P2 implemented (2026-07-15); P3 presentation shipped with the `parent` hit field. Nested-oversized-unit suppression (the "cost finding" below) shipped 2026-07-23. The chunk-everything experiment (Track 3, first item) ran on fd 2026-07-23: 2.3x unit-count cost for a *worse* fused rank on the one target tested — not a clean win at this scale; RRF fusion-of-many-small-candidates is the load-bearing question before lowering the default threshold further, not raw coverage. Summary representations and late-interaction pooling remain future work pending a design decision. Motivated by the big-corpus eval
 (`evals/2026-07-15-daemon-big-corpus.md`): jq's `jq_next` — the literal
 answer to "where is the bytecode interpreter's dispatch loop" — was
 absent from every retrieval mode because bodies over `max_body_chars`

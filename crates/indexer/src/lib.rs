@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod embed;
+mod language;
 mod run;
 mod scanner;
 pub mod source;
@@ -23,12 +24,13 @@ pub use embed::{
     EmbedProgress, EmbedStats, LanguageTokens, embed_pending, embed_pending_with_progress,
     embed_space_pending, embed_space_pending_with_progress, find_or_create_model_id, token_report,
 };
+pub use language::{all_language_ids, is_prose, language_for_extension};
 pub use run::{
     CancellationToken, DocumentCheckpointStep, IndexOutcome, IndexPausedError, IndexProgress,
     IndexRunBuilder, IndexRunFailure, RefreshMode, RefreshPolicy, ResumePolicy, RetryBackoff,
     RetryPolicy, RevisionTrust,
 };
-pub use scanner::{ScannedFile, scan_files};
+pub use scanner::{ScanOptions, ScannedFile, scan_files};
 use serde::{Deserialize, Serialize};
 pub use source::{
     FileSystemSource, MemorySource, RevisionSemantics, SourceDocument, SourceProject,
@@ -70,7 +72,24 @@ pub struct IndexSettings {
     /// Bodies above this emit fragment entities (docs/oversized-units-plan.md).
     pub fragment_threshold_chars: usize,
     pub fragment_target_chars: usize,
+    /// Chunk target for prose documents, independent of the code fragment
+    /// target above (docs/prose-chunking-plan.md). Prose is chunked for
+    /// embedding-window fit, code for AST-boundary fit; they are not the same
+    /// question and sharing one knob was a wiring accident, not a decision.
+    pub prose_target_chars: usize,
+    /// Bytes of the previous prose chunk repeated at the head of the next.
+    /// Applies to unstructured text only; Markdown sections do not overlap.
+    pub prose_overlap_chars: usize,
     pub retention: RetentionMode,
+}
+
+impl IndexSettings {
+    pub(crate) fn prose_options(&self) -> codeindex_prose::ProseOptions {
+        codeindex_prose::ProseOptions::with_target(
+            self.prose_target_chars,
+            self.prose_overlap_chars,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +111,12 @@ impl IndexOptions {
                 .fragment_threshold_chars,
             fragment_target_chars: codeindex_tree_sitter::ExtractOptions::default()
                 .fragment_target_chars,
+            prose_target_chars: codeindex_prose::ProseOptions::default()
+                .chunking
+                .target_chars,
+            prose_overlap_chars: codeindex_prose::ProseOptions::default()
+                .chunking
+                .overlap_chars,
             retention: self.retention,
         }
     }
@@ -430,6 +455,8 @@ mod tests {
             max_body_chars: 10_000,
             fragment_threshold_chars: 6_000,
             fragment_target_chars: 3_000,
+            prose_target_chars: 1_200,
+            prose_overlap_chars: 150,
             retention: RetentionMode::Full,
         }
     }
@@ -498,6 +525,102 @@ mod tests {
             .entity_id
             .clone();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn prose_chunk_settings_are_fixed_once_published() {
+        // Chunk boundaries decide prose content hashes, and the embedding-time
+        // recovery path re-chunks from the persisted values. Letting the target
+        // change on a published corpus would silently orphan every stored hash,
+        // so it must be rejected the way fragment_target_chars is.
+        let mut source = MemorySource::new("memory://prose-settings");
+        source.insert("note.md", "# Note\n\nSome prose body text here.\n");
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+
+        let mut first = settings();
+        first.enabled_languages = vec!["markdown".into()];
+        index_sources(&db, &first, &projects, None).unwrap();
+        assert_eq!(
+            db.get_setting("index.prose_target_chars")
+                .unwrap()
+                .as_deref(),
+            Some("1200")
+        );
+
+        let mut drifted = first.clone();
+        drifted.prose_target_chars = 900;
+        let error = index_sources(&db, &drifted, &projects, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("index.prose_target_chars"),
+            "expected the immutable-settings guard to name the key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn prose_documents_index_through_the_real_pipeline() {
+        // End-to-end proof that a grammar-free format reaches published units:
+        // scanner resolves the extension, stage dispatches to the prose
+        // frontend, and publication stores sections with their heading scope.
+        let mut source = MemorySource::new("memory://prose-pipeline");
+        source.insert(
+            "note.md",
+            "# Top\n\nlead paragraph\n\n## Findings\n\nthe finding body\n",
+        );
+        source.insert("scan.txt", "plain OCR-ish text body\n");
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        let mut prose_settings = settings();
+        prose_settings.enabled_languages = vec!["markdown".into(), "text".into()];
+        let stats = index_sources(&db, &prose_settings, &projects, None).unwrap();
+        assert_eq!(stats[0].indexed, 2, "both prose documents should index");
+        assert!(stats[0].units >= 3, "expected sections plus a text chunk");
+    }
+
+    #[test]
+    fn frontend_version_drift_refuses_reindex_instead_of_silent_reuse() {
+        // Unchanged file content alone never triggers re-extraction
+        // (`action_for` only looks at content hash/mtime/size), so an
+        // extractor code change must be enforced the same way other
+        // extraction-affecting settings are: fixed once published, loudly
+        // rejected on drift. Simulates the drift by overwriting the
+        // already-published `index.frontend_version` row with a stale value,
+        // then reindexing identical content with the real (current) version.
+        let mut source = MemorySource::new("memory://frontend-version");
+        source.insert(
+            "lib.rs",
+            "fn add(a: i32, b: i32) -> i32 { let s = a + b; s }",
+        );
+        let db = codeindex_sqlite::open_in_memory().unwrap();
+        let projects = [SourceProject {
+            label: "main".into(),
+            provider: &source,
+        }];
+        index_sources(&db, &settings(), &projects, None).unwrap();
+        assert_eq!(
+            db.get_setting("index.frontend_version").unwrap().as_deref(),
+            Some(codeindex_tree_sitter::FRONTEND_VERSION)
+        );
+
+        db.set_setting("index.frontend_version", "0.0.0:stale")
+            .unwrap();
+        let error = index_sources(&db, &settings(), &projects, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("index.frontend_version"),
+            "error must name the drifted setting: {message}"
+        );
+        assert!(
+            message.contains("Delete the database file"),
+            "error must point at the documented recovery path: {message}"
+        );
     }
 
     #[test]
@@ -574,7 +697,7 @@ mod tests {
             .collect();
         source.insert(
             "huge.rs",
-            &format!("fn dispatch_monster(input: u32) -> u32 {{\n{deep_body}    input\n}}\n"),
+            format!("fn dispatch_monster(input: u32) -> u32 {{\n{deep_body}    input\n}}\n"),
         );
         let projects = [SourceProject {
             label: "main".into(),

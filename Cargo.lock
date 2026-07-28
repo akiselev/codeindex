@@ -635,6 +635,7 @@ dependencies = [
  "anyhow",
  "codeindex-core",
  "codeindex-embedding",
+ "codeindex-prose",
  "codeindex-query",
  "codeindex-search",
  "codeindex-sqlite",
@@ -659,6 +660,16 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+]
+
+[[package]]
+name = "codeindex-prose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "codeindex-core",
+ "hex",
+ "sha2 0.11.0",
 ]
 
 [[package]]

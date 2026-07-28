@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use codeindex_sqlite::{Db, NewFile, StagedDocumentPayload, StagedReference};
-use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_references, extract_units};
+use codeindex_tree_sitter::{ExtractOptions, LanguageRegistry, extract_references};
 
 use crate::{
     IndexSettings, RepresentationEnricher, SourceDocument, apply_enrichers, apply_retention,
@@ -22,31 +22,47 @@ pub(crate) struct PrepareDocument<'a> {
 }
 
 pub(crate) fn prepare_document(input: PrepareDocument<'_>) -> Result<StagedDocumentPayload> {
-    let definition = LanguageRegistry::global()
-        .get(&input.document.language_id)
-        .with_context(|| format!("unknown language {}", input.document.language_id))?;
+    // Two frontends produce the same `ExtractedEntity` contract: compiled
+    // grammars for code, and grammar-free chunking for prose. Prose has no call
+    // sites, so Usage stays empty — as it already does for any language whose
+    // references query is absent.
     let extraction = ExtractOptions {
         body_node_count_threshold: input.settings.body_node_count_threshold,
         max_body_chars: input.settings.max_body_chars,
         fragment_threshold_chars: input.settings.fragment_threshold_chars,
         fragment_target_chars: input.settings.fragment_target_chars,
     };
-    let mut entities = extract_units(definition, input.source, &extraction).with_context(|| {
+    let mut entities = crate::language::extract_entities(
+        &input.document.language_id,
+        input.source,
+        &extraction,
+        &input.settings.prose_options(),
+    )
+    .with_context(|| {
         format!(
             "failed to extract units from {}",
             input.document.relative_path
         )
     })?;
+    // Prose has no call sites, so Usage stays empty — as it already does for
+    // any language whose references query is absent.
+    let raw_references = if crate::is_prose(&input.document.language_id) {
+        Vec::new()
+    } else {
+        let definition = LanguageRegistry::global()
+            .get(&input.document.language_id)
+            .with_context(|| format!("unknown language {}", input.document.language_id))?;
+        extract_references(definition, input.source).with_context(|| {
+            format!(
+                "failed to extract references from {}",
+                input.document.relative_path
+            )
+        })?
+    };
     for entity in &mut entities {
         complete_representations(input.source, entity);
         apply_enrichers(input.document, input.source, entity, input.enrichers)?;
     }
-    let raw_references = extract_references(definition, input.source).with_context(|| {
-        format!(
-            "failed to extract references from {}",
-            input.document.relative_path
-        )
-    })?;
 
     let existing = match input.db.get_project(input.project_label)? {
         Some(project) => input

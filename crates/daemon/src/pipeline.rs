@@ -157,6 +157,23 @@ pub fn hybrid_search<'e>(
             .collect()
     };
 
+    // Down-weight lexical when it disagrees with dense's top pick: RRF only
+    // sees ranks, so OR-token lexical noise can dilute a confident dense #1
+    // to fused #4-6 (evals/2026-07-15-daemon-big-corpus.md). Gated to
+    // multi-word queries only — a short/identifier query disagreeing with
+    // dense more often means dense picked a decoy than that lexical is
+    // noisy, and lexical's exact-match precision is exactly what should
+    // dominate there.
+    let lexical_weight = codeindex_query::adaptive_lexical_weight(
+        &dense_indices,
+        &lexical_indices,
+        1.0,
+        0.4,
+        5,
+        options.query.split_whitespace().count(),
+        6,
+    );
+
     let mut lists = Vec::new();
     if !dense_indices.is_empty() {
         lists.push(RankedList {
@@ -175,7 +192,7 @@ pub fn hybrid_search<'e>(
     if !lexical_indices.is_empty() {
         lists.push(RankedList {
             source: "lexical".into(),
-            weight: 1.0,
+            weight: lexical_weight,
             indices: lexical_indices,
         });
     }
@@ -309,6 +326,8 @@ pub fn run_index_job(
         max_body_chars: 10_000,
         fragment_threshold_chars: config.index.fragment_threshold_chars.unwrap_or(6_000),
         fragment_target_chars: config.index.fragment_target_chars.unwrap_or(3_000),
+        prose_target_chars: config.index.prose_target_chars.unwrap_or(1_200),
+        prose_overlap_chars: config.index.prose_overlap_chars.unwrap_or(150),
         retention: RetentionMode::Full,
     };
     let outcome = IndexRunBuilder::new(&db, &settings, &projects)

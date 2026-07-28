@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
-use codeindex_tree_sitter::LanguageRegistry;
 use serde::{Deserialize, Serialize};
 
 use crate::scanner::scan_files;
@@ -161,6 +160,7 @@ impl<'a> SourceProviderCatalog<'a> {
 pub struct FileSystemSource {
     root: PathBuf,
     exclude: Vec<String>,
+    scan: crate::ScanOptions,
 }
 
 impl FileSystemSource {
@@ -168,11 +168,19 @@ impl FileSystemSource {
         Self {
             root: root.into(),
             exclude: Vec::new(),
+            scan: crate::ScanOptions::default(),
         }
     }
 
     pub fn with_excludes(mut self, exclude: Vec<String>) -> Self {
         self.exclude = exclude;
+        self
+    }
+
+    /// Index files that `.gitignore` would hide. Needed for corpora that are
+    /// deliberately untracked — downloaded documents, OCR text, datasets.
+    pub fn including_ignored(mut self, including: bool) -> Self {
+        self.scan.respect_ignore = !including;
         self
     }
 
@@ -187,11 +195,18 @@ impl SourceProvider for FileSystemSource {
     }
 
     fn provider_fingerprint(&self) -> String {
-        format!("{}\0{}", self.project_locator(), self.exclude.join("\0"))
+        // Behaviour-affecting configuration must be in the fingerprint, or a
+        // run that changed the ignore policy would be treated as resumable.
+        format!(
+            "{}\0{}\0respect_ignore={}",
+            self.project_locator(),
+            self.exclude.join("\0"),
+            self.scan.respect_ignore
+        )
     }
 
     fn documents(&self, enabled_languages: &HashSet<String>) -> Result<Vec<SourceDocument>> {
-        scan_files(&self.root, &self.exclude, enabled_languages)?
+        scan_files(&self.root, &self.exclude, enabled_languages, self.scan)?
             .into_iter()
             .map(|file| {
                 let metadata = std::fs::metadata(&file.absolute_path)
@@ -293,7 +308,6 @@ impl SourceProvider for MemorySource {
     }
 
     fn documents(&self, enabled_languages: &HashSet<String>) -> Result<Vec<SourceDocument>> {
-        let registry = LanguageRegistry::global();
         let mut documents = Vec::new();
         for (path, content) in &self.documents {
             let extension = Path::new(path)
@@ -301,16 +315,16 @@ impl SourceProvider for MemorySource {
                 .and_then(|extension| extension.to_str())
                 .unwrap_or_default()
                 .to_lowercase();
-            let Some(language) = registry.by_extension(&extension) else {
+            let Some(language_id) = crate::language_for_extension(&extension) else {
                 continue;
             };
-            if !enabled_languages.contains(&language.spec.id) {
+            if !enabled_languages.contains(&language_id) {
                 continue;
             }
             documents.push(SourceDocument {
                 id: path.clone(),
                 relative_path: path.clone(),
-                language_id: language.spec.id.clone(),
+                language_id: language_id.clone(),
                 revision: SourceRevision {
                     opaque: codeindex_tree_sitter::normalizer::sha256_hex(content),
                     modified_ns: None,

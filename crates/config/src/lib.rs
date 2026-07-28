@@ -69,6 +69,15 @@ pub struct IndexSection {
     /// Greedy packing target per fragment. Default 3000.
     #[serde(default)]
     pub fragment_target_chars: Option<usize>,
+    /// Chunk target for prose documents (Markdown, text). Independent of
+    /// `fragment_target_chars`, which governs code. Default 1200.
+    /// See docs/prose-chunking-plan.md.
+    #[serde(default)]
+    pub prose_target_chars: Option<usize>,
+    /// Bytes of the previous prose chunk repeated at the head of the next, for
+    /// unstructured text only. Default 150.
+    #[serde(default)]
+    pub prose_overlap_chars: Option<usize>,
 }
 
 /// One embedding space definition. `model` is a resolvable reference

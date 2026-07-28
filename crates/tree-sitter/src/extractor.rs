@@ -53,6 +53,7 @@ pub fn extract_units(
     let scope_idx = capture_index(def, "unit.scope");
 
     let mut units = Vec::new();
+    let mut candidates: Vec<PendingUnit<'_>> = Vec::new();
     let mut seen_ranges: HashSet<(usize, usize)> = HashSet::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&def.query, tree.root_node(), source.as_bytes());
@@ -97,8 +98,47 @@ pub fn extract_units(
         if seen_ranges.contains(&(range.start, range.end)) {
             continue;
         }
-        if let Some((unit, fragments)) = build_unit(def, source, pending, options) {
-            seen_ranges.insert((range.start, range.end));
+        seen_ranges.insert((range.start, range.end));
+        candidates.push(pending);
+    }
+
+    // Size every candidate up front so nested oversized units can be
+    // detected before deciding who fragments: an inner closure that itself
+    // exceeds the threshold fragments the same lines as its enclosing
+    // function, doubling fragment count for no extra coverage (measured on
+    // `spawn_senders`/`walker.run(...)` — 6 fragments where 3 carried the
+    // information; docs/oversized-units-plan.md track 3). A covering child
+    // only disqualifies its parent from fragmenting if the child will
+    // actually produce fragments itself (`would_fragment`) — an oversized
+    // body that isn't AST-splittable (e.g. one giant string/byte literal, as
+    // in generated code) must not suppress every ancestor's attempt too,
+    // or the whole nested chain loses fragment-level addressability.
+    let fragment_target = options.fragment_target_chars.max(256);
+    let sizes: Vec<(Range<usize>, usize, bool)> = candidates
+        .iter()
+        .map(|pending| {
+            let (_, _, stripped_chars) = strip_and_measure(def, source, pending);
+            let fragmentable = stripped_chars > options.fragment_threshold_chars
+                && would_fragment(pending, source, fragment_target);
+            (pending.node.byte_range(), stripped_chars, fragmentable)
+        })
+        .collect();
+
+    for (index, pending) in candidates.into_iter().enumerate() {
+        let (range, stripped_chars, _) = &sizes[index];
+        let covered_by_oversized_child = sizes.iter().enumerate().any(
+            |(other_index, (other_range, other_chars, other_fragmentable))| {
+                other_index != index
+                    && other_range.start >= range.start
+                    && other_range.end <= range.end
+                    && (other_range.start, other_range.end) != (range.start, range.end)
+                    && *other_fragmentable
+                    && (*other_chars as f64) >= 0.9 * (*stripped_chars as f64)
+            },
+        );
+        if let Some((unit, fragments)) =
+            build_unit(def, source, pending, options, covered_by_oversized_child)
+        {
             units.push(unit);
             units.extend(fragments);
         }
@@ -179,11 +219,36 @@ fn capture_index(def: &LanguageDef, name: &str) -> Option<u32> {
         .map(|i| i as u32)
 }
 
+/// Compute the stripped (comment/marker-free) embedding text for a pending
+/// unit and its char count, ahead of deciding whether it fragments. Shared
+/// between the sizing pass (which needs only the count) and `build_unit`
+/// (which needs the text too), so the two never disagree on size.
+fn strip_and_measure(
+    def: &LanguageDef,
+    source: &str,
+    pending: &PendingUnit<'_>,
+) -> (Vec<Range<usize>>, String, usize) {
+    let node = pending.node;
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+    let display_source = &source[start_byte..end_byte];
+    let mut strip: Vec<Range<usize>> = pending
+        .strip
+        .iter()
+        .map(|r| r.start.saturating_sub(start_byte)..r.end.saturating_sub(start_byte))
+        .collect();
+    collect_comment_ranges(node, &def.spec.comment_nodes, start_byte, &mut strip);
+    let embedding_text = strip_ranges(display_source, &strip);
+    let stripped_chars = embedding_text.chars().count();
+    (strip, embedding_text, stripped_chars)
+}
+
 fn build_unit(
     def: &LanguageDef,
     source: &str,
     pending: PendingUnit<'_>,
     options: &ExtractOptions,
+    covered_by_oversized_child: bool,
 ) -> Option<(ExtractedEntity, Vec<ExtractedEntity>)> {
     let node = pending.node;
     let start_byte = node.start_byte();
@@ -195,14 +260,7 @@ fn build_unit(
         return None;
     }
 
-    let mut strip: Vec<Range<usize>> = pending
-        .strip
-        .iter()
-        .map(|r| r.start.saturating_sub(start_byte)..r.end.saturating_sub(start_byte))
-        .collect();
-    collect_comment_ranges(node, &def.spec.comment_nodes, start_byte, &mut strip);
-    let mut embedding_text = strip_ranges(display_source, &strip);
-    let stripped_chars = embedding_text.chars().count();
+    let (strip, mut embedding_text, stripped_chars) = strip_and_measure(def, source, &pending);
     // Oversized bodies truncate rather than vanish: interpreter dispatch
     // loops and generated builders are exactly the units agents ask about,
     // and a dropped unit is invisible to every retrieval mode (measured:
@@ -303,11 +361,17 @@ fn build_unit(
         sha256_hex(&symbol),
     ));
 
-    let fragments = if stripped_chars > options.fragment_threshold_chars {
-        build_fragments(def, source, &pending, &name, &strip, options)
-    } else {
-        Vec::new()
-    };
+    // A unit whose body is almost entirely one oversized child (an inner
+    // closure or nested function that itself exceeds the threshold) skips
+    // fragmenting: the child fragments the same lines on its own, and
+    // fragmenting both just doubles the fragment count over identical text
+    // (docs/oversized-units-plan.md track 3).
+    let fragments =
+        if stripped_chars > options.fragment_threshold_chars && !covered_by_oversized_child {
+            build_fragments(def, source, &pending, &name, &strip, options)
+        } else {
+            Vec::new()
+        };
 
     Some((
         ExtractedEntity {
@@ -324,6 +388,20 @@ fn build_unit(
         },
         fragments,
     ))
+}
+
+/// Whether a candidate's body would actually produce ≥2 AST-boundary
+/// fragments — the same leaf-count gate `build_fragments` uses internally,
+/// exposed so a covering ancestor can be trusted to skip fragmenting only
+/// when the child is guaranteed to pick up the coverage itself. An
+/// unsplittable oversized body (e.g. one giant string/byte literal — not
+/// unheard of in generated code) has fewer than 2 leaves and must not
+/// suppress every enclosing unit's own fragmenting attempt too.
+fn would_fragment(pending: &PendingUnit<'_>, source: &str, target: usize) -> bool {
+    let body_node = pending.body.unwrap_or(pending.node);
+    let mut leaves: Vec<Node<'_>> = Vec::new();
+    collect_fragment_leaves(body_node, source, target, &mut leaves);
+    leaves.len() >= 2
 }
 
 /// Fragment an oversized body at AST boundaries: descend until nodes fit the
@@ -822,6 +900,311 @@ fn negated() { do_it() }
             changed.len(),
             1,
             "exactly the edited region's fragment must change: {changed:?}"
+        );
+    }
+
+    fn nested_oversized_closure_source() -> String {
+        let body: String = (0..300)
+            .map(|i| format!("        let step_{i} = compute_{i}({i});\n"))
+            .collect();
+        format!(
+            "fn spawn_senders(input: u32) -> u32 {{\n    \
+             let total = (0..input).map(|i| {{\n{body}        i\n    }}).sum();\n    \
+             total\n}}\n"
+        )
+    }
+
+    #[test]
+    fn nested_oversized_child_suppresses_parent_fragmenting() {
+        // The outer function's body is almost entirely one closure, and the
+        // closure itself is oversized — both would fragment over the same
+        // lines without the covered-by-oversized-child suppression.
+        let source = nested_oversized_closure_source();
+        let units = small_units("rust", &source);
+
+        let parent = units
+            .iter()
+            .find(|unit| unit.name == "spawn_senders")
+            .expect("outer function present");
+        let closure = units
+            .iter()
+            .find(|unit| unit.kind.as_str() == "closure")
+            .expect("nested closure present");
+
+        let parent_fragments: Vec<_> = units
+            .iter()
+            .filter(|unit| {
+                unit.kind.as_str() == "fragment"
+                    && unit.scope.as_deref() == Some(parent.name.as_str())
+            })
+            .collect();
+        let closure_fragments: Vec<_> = units
+            .iter()
+            .filter(|unit| {
+                unit.kind.as_str() == "fragment"
+                    && unit.scope.as_deref() == Some(closure.name.as_str())
+            })
+            .collect();
+
+        assert!(
+            parent_fragments.is_empty(),
+            "parent must not double-fragment lines its oversized child already fragments"
+        );
+        assert!(
+            closure_fragments.len() >= 2,
+            "the oversized closure itself must still fragment"
+        );
+    }
+
+    /// fd's real `WorkerState::spawn_senders` (docs/oversized-units-plan.md
+    /// track 3 cost finding): three closures deep, each nested one entirely
+    /// covering its parent's body. Only the innermost (`Box::new(...)`, the
+    /// one AST-boundary fragmenting actually helps) should fragment; the two
+    /// enclosing units are each ≥90% covered by an oversized descendant and
+    /// must suppress.
+    const SPAWN_SENDERS_TRIPLE_NESTED: &str = r#"
+struct WorkerState;
+impl WorkerState {
+    fn spawn_senders(&self, walker: WalkParallel, tx: Sender<Batch>) {
+        walker.run(|| {
+            let patterns = &self.patterns;
+            let config = &self.config;
+            let quit_flag = self.quit_flag.as_ref();
+
+            let mut limit = 0x100;
+            if let Some(cmd) = &config.command
+                && !cmd.in_batch_mode()
+                && config.threads > 1
+            {
+                limit = 1;
+            }
+            let mut tx = BatchSender::new(tx.clone(), limit);
+
+            Box::new(move |entry| {
+                if quit_flag.load(Ordering::Relaxed) {
+                    return WalkState::Quit;
+                }
+
+                if let Ok(e) = &entry {
+                    if e.file_type().is_some_and(|t| t.is_dir()) {
+                        let entry_path = e.path();
+                        if config
+                            .ignore_contain
+                            .iter()
+                            .any(|ic| entry_path.join(ic).exists())
+                        {
+                            return WalkState::Skip;
+                        }
+                    }
+                    if e.depth() == 0 {
+                        return WalkState::Continue;
+                    }
+                }
+                let entry = match entry {
+                    Ok(e) => DirEntry::normal(e),
+                    Err(ignore::Error::WithPath {
+                        path,
+                        err: inner_err,
+                    }) if inner_err
+                        .io_error()
+                        .is_some_and(|io_error| io_error.kind() == io::ErrorKind::NotFound)
+                        && path
+                            .symlink_metadata()
+                            .ok()
+                            .is_some_and(|m| m.file_type().is_symlink()) =>
+                    {
+                        DirEntry::broken_symlink(path)
+                    }
+                    Err(err) => {
+                        return match tx.send(WorkerResult::Error(err)) {
+                            Ok(_) => WalkState::Continue,
+                            Err(_) => WalkState::Quit,
+                        };
+                    }
+                };
+
+                if let Some(min_depth) = config.min_depth
+                    && entry.depth().is_none_or(|d| d < min_depth)
+                {
+                    return WalkState::Continue;
+                }
+
+                let entry_path = entry.path();
+                let search_str = search_str_for_entry(entry_path, config.full_path_base.as_deref());
+
+                if !patterns
+                    .iter()
+                    .all(|pat| pat.is_match(&filesystem::osstr_to_bytes(search_str.as_ref())))
+                {
+                    return WalkState::Continue;
+                }
+
+                if let Some(ref exts_regex) = config.extensions {
+                    if let Some(path_str) = entry_path.file_name() {
+                        if !exts_regex.is_match(&filesystem::osstr_to_bytes(path_str)) {
+                            return WalkState::Continue;
+                        }
+                    } else {
+                        return WalkState::Continue;
+                    }
+                }
+
+                if let Some(ref file_types) = config.file_types
+                    && file_types.should_ignore(&entry)
+                {
+                    return WalkState::Continue;
+                }
+
+                #[cfg(unix)]
+                {
+                    if let Some(ref owner_constraint) = config.owner_constraint {
+                        if let Some(metadata) = entry.metadata() {
+                            if !owner_constraint.matches(metadata) {
+                                return WalkState::Continue;
+                            }
+                        } else {
+                            return WalkState::Continue;
+                        }
+                    }
+                }
+
+                if !config.size_constraints.is_empty() {
+                    if entry_path.is_file() {
+                        if let Some(metadata) = entry.metadata() {
+                            let file_size = metadata.len();
+                            if config
+                                .size_constraints
+                                .iter()
+                                .any(|sc| !sc.is_within(file_size))
+                            {
+                                return WalkState::Continue;
+                            }
+                        } else {
+                            return WalkState::Continue;
+                        }
+                    } else {
+                        return WalkState::Continue;
+                    }
+                }
+
+                if !config.time_constraints.is_empty() {
+                    let mut matched = false;
+                    if let Some(metadata) = entry.metadata()
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        matched = config
+                            .time_constraints
+                            .iter()
+                            .all(|tf| tf.applies_to(&modified));
+                    }
+                    if !matched {
+                        return WalkState::Continue;
+                    }
+                }
+
+                if config.is_printing()
+                    && let Some(ls_colors) = &config.ls_colors
+                {
+                    entry.style(ls_colors);
+                }
+
+                let send_result = tx.send(WorkerResult::Entry(entry));
+
+                if send_result.is_err() {
+                    return WalkState::Quit;
+                }
+
+                if config.prune {
+                    return WalkState::Skip;
+                }
+
+                WalkState::Continue
+            })
+        });
+    }
+}
+"#;
+
+    #[test]
+    fn triple_nested_oversized_closures_only_fragment_the_innermost() {
+        // fd's own per-project fragment_threshold_chars (docs above trim a
+        // few comment lines versus the real file, so the default 6000
+        // threshold no longer trips; 3000/1500 mirrors the actual config).
+        let def = LanguageRegistry::global().get("rust").unwrap();
+        let units = extract_units(
+            def,
+            SPAWN_SENDERS_TRIPLE_NESTED,
+            &ExtractOptions {
+                body_node_count_threshold: 1,
+                max_body_chars: 10_000,
+                fragment_threshold_chars: 3_000,
+                fragment_target_chars: 1_500,
+            },
+        )
+        .unwrap();
+        let fragment_scopes: std::collections::HashSet<&str> = units
+            .iter()
+            .filter(|unit| unit.kind.as_str() == "fragment")
+            .filter_map(|unit| unit.scope.as_deref())
+            .collect();
+        assert!(
+            fragment_scopes.contains("Box::new(...)"),
+            "the innermost oversized closure must still fragment: {fragment_scopes:?}"
+        );
+        assert!(
+            !fragment_scopes.contains("spawn_senders"),
+            "spawn_senders is ~100% covered by nested oversized closures and must not double-fragment"
+        );
+        assert!(
+            !fragment_scopes.contains("walker.run(...)"),
+            "walker.run(...)'s closure is ~99% covered by Box::new(...) and must not double-fragment"
+        );
+    }
+
+    #[test]
+    fn unsplittable_covering_child_does_not_suppress_the_parent() {
+        // An oversized child that can't itself produce ≥2 AST-boundary
+        // fragments (here: a closure whose entire body is one giant string
+        // literal — a single leaf token, not unheard of in generated code)
+        // must not disqualify its parent from fragmenting too. Without the
+        // `would_fragment` gate, size/coverage alone would suppress the
+        // parent, and neither level would fragment — a total loss of
+        // fragment-level addressability for the whole region.
+        let giant_literal: String = std::iter::repeat_n('A', 5_000).collect();
+        let source = format!(
+            "fn outer() -> String {{\n    \
+             let setup_a = compute_a();\n    \
+             let setup_b = compute_b();\n    \
+             let closure = || {{\n        \"{giant_literal}\"\n    }};\n    \
+             closure()\n}}\n"
+        );
+        let def = LanguageRegistry::global().get("rust").unwrap();
+        let units = extract_units(
+            def,
+            &source,
+            &ExtractOptions {
+                body_node_count_threshold: 1,
+                max_body_chars: 10_000,
+                fragment_threshold_chars: 3_000,
+                fragment_target_chars: 1_500,
+            },
+        )
+        .unwrap();
+        let closure = units
+            .iter()
+            .find(|unit| unit.kind.as_str() == "closure")
+            .expect("closure present");
+        assert!(
+            !units.iter().any(|unit| unit.kind.as_str() == "fragment"
+                && unit.scope.as_deref() == Some(closure.name.as_str())),
+            "the unsplittable closure itself must not fragment"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.kind.as_str() == "fragment"
+                    && unit.scope.as_deref() == Some("outer")),
+            "outer must still fragment on its own boundaries since its covering child can't"
         );
     }
 

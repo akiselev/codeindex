@@ -838,7 +838,17 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
     /// Settings fixed once a corpus is first published. Enforced inside the
     /// publish transaction and validated against any existing database before
     /// a run starts; both sites must use this single list.
-    fn immutable_settings(&self) -> [(&'static str, String); 5] {
+    ///
+    /// `frontend_version` belongs here for the same reason as the fragment
+    /// knobs: a document whose content hasn't changed is otherwise never
+    /// re-extracted (`action_for` only looks at content hash/mtime/size), so
+    /// an extractor code change with no version bump would silently leave
+    /// stale entities in place forever. Bump
+    /// `codeindex_tree_sitter::FRONTEND_VERSION` on any change to bundled
+    /// queries, normalization, or adapters that can alter a staged payload —
+    /// this gate turns a stale silent reuse into a loud, actionable error
+    /// demanding a fresh database.
+    fn immutable_settings(&self) -> [(&'static str, String); 8] {
         [
             (
                 "index.body_node_count_threshold",
@@ -859,6 +869,22 @@ impl<'a, 'provider> IndexRunBuilder<'a, 'provider> {
             (
                 "index.fragment_target_chars",
                 self.settings.fragment_target_chars.to_string(),
+            ),
+            (
+                "index.frontend_version",
+                codeindex_tree_sitter::FRONTEND_VERSION.to_string(),
+            ),
+            // Prose chunk boundaries determine content hashes exactly as AST
+            // fragment boundaries do, so these are immutable for the same
+            // reason: changing them invalidates every stored prose hash, and
+            // the embedding-time recovery path would stop matching.
+            (
+                "index.prose_target_chars",
+                self.settings.prose_target_chars.to_string(),
+            ),
+            (
+                "index.prose_overlap_chars",
+                self.settings.prose_overlap_chars.to_string(),
             ),
         ]
     }

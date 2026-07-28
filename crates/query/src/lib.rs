@@ -344,6 +344,56 @@ pub fn reciprocal_rank_fusion(lists: &[RankedList], rrf_k: usize) -> Vec<FusedIn
     hits
 }
 
+/// Adapts the lexical list's fusion weight to whether it corroborates
+/// dense's top pick. Reciprocal-rank fusion only sees ranks, never
+/// confidence — so when dense confidently ranks a unit #1 but lexical's own
+/// ranking disagrees entirely, the lexical list is behaving as OR-token
+/// noise rather than a genuine second opinion. Measured recurring pattern
+/// (`evals/2026-07-15-daemon-big-corpus.md`, "lexical dilution of a correct
+/// dense #1"): 7 cases in one battery where dense ranked the true target #1
+/// and lexical noise still diluted the fused rank to #4-6. Full weight
+/// returns the moment lexical corroborates — even weakly, by placing
+/// dense's #1 anywhere within its own top `agreement_depth`.
+///
+/// Gated on `query_word_count < min_words_for_adaptation` staying at full
+/// weight: every one of the 7 documented cases was a multi-word behavioral
+/// question (16+ words), where an OR-token lexical match on one common word
+/// really is noise. A bare identifier or few-word query is the *opposite*
+/// case — lexical's exact-match precision is naturally high there, and
+/// "disagrees with dense" more often means dense picked a semantically
+/// similar decoy than that lexical is noisy (`evals/2026-07-14-qwen3-
+/// scenarios.md` S07: dense handles "make_response" fine here, but nothing
+/// guarantees that generally). Down-weighting lexical on a short query risks
+/// silently suppressing the one signal that would have corrected a dense
+/// decoy; verified this can flip a case reciprocal-rank fusion would
+/// otherwise get right (correct answer at dense-rank 35+/lexical-rank ≤9
+/// vs. a lexical-absent decoy at dense#1).
+pub fn adaptive_lexical_weight(
+    dense_indices: &[usize],
+    lexical_indices: &[usize],
+    base_weight: f32,
+    down_weight: f32,
+    agreement_depth: usize,
+    query_word_count: usize,
+    min_words_for_adaptation: usize,
+) -> f32 {
+    if query_word_count < min_words_for_adaptation {
+        return base_weight;
+    }
+    let (Some(&dense_top), false) = (dense_indices.first(), lexical_indices.is_empty()) else {
+        return base_weight;
+    };
+    let corroborates = lexical_indices
+        .iter()
+        .take(agreement_depth)
+        .any(|&index| index == dense_top);
+    if corroborates {
+        base_weight
+    } else {
+        down_weight
+    }
+}
+
 /// Field-by-field differences between two semantic model contracts, derived
 /// mechanically from their serialized form so newly added contract fields can
 /// never be silently omitted from mismatch diagnostics.
@@ -487,6 +537,149 @@ mod tests {
         );
         // `min_words: 0` (--compress always) still refuses no-op compression.
         assert_eq!(compress_query("parse command line flags", 16, 0), None);
+    }
+
+    #[test]
+    fn lexical_weight_adapts_to_dense_agreement() {
+        // Lexical's own #1 matches dense's #1: full weight, no signal of noise.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[7, 11], 1.0, 0.4, 5, 20, 6),
+            1.0
+        );
+        // Lexical corroborates weakly (dense's #1 shows up within the
+        // agreement depth, just not first): still full weight.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[11, 20, 7], 1.0, 0.4, 5, 20, 6),
+            1.0
+        );
+        // Lexical's top ranks never mention dense's #1 at all: down-weighted.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[11, 20, 33, 40, 50], 1.0, 0.4, 5, 20, 6),
+            0.4
+        );
+        // No dense signal (lexical-only mode): untouched.
+        assert_eq!(
+            adaptive_lexical_weight(&[], &[11, 20], 1.0, 0.4, 5, 20, 6),
+            1.0
+        );
+        // No lexical hits at all: nothing to down-weight.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[], 1.0, 0.4, 5, 20, 6),
+            1.0
+        );
+    }
+
+    #[test]
+    fn short_queries_never_get_lexical_down_weighted() {
+        // A bare identifier/short query disagreeing with dense must stay at
+        // full lexical weight: lexical's exact-match precision is naturally
+        // high here, and disagreement more often means dense picked a
+        // semantically similar decoy than that lexical is noisy. Same
+        // dense/lexical shape that triggers down-weighting for a long query.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[11, 20, 33, 40, 50], 1.0, 0.4, 5, 1, 6),
+            1.0,
+            "a 1-word query (e.g. a bare identifier) must not down-weight lexical"
+        );
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[11, 20, 33, 40, 50], 1.0, 0.4, 5, 5, 6),
+            1.0,
+            "still below the word-count gate"
+        );
+        // At or above the gate, the existing disagreement logic applies.
+        assert_eq!(
+            adaptive_lexical_weight(&[7, 3, 9], &[11, 20, 33, 40, 50], 1.0, 0.4, 5, 6, 6),
+            0.4
+        );
+    }
+
+    #[test]
+    fn short_identifier_query_is_not_worsened_by_a_dense_decoy() {
+        // A demonstrated regression this gate closes: without it, a
+        // realistic rank shape (correct answer weak-ish on dense but
+        // lexically corroborated vs. a lexical-absent decoy at dense#1) has
+        // reciprocal-rank fusion get it right at equal weight but *wrong*
+        // once lexical is down-weighted. Gating on query length keeps short
+        // queries at full weight, so the correct answer still wins.
+        //
+        // decoy (index 999) sits alone at dense#1; correct (index 7) sits at
+        // dense#35 but is corroborated at lexical#9 — the shape found by an
+        // exhaustive search over realistic rank combinations.
+        let mut dense_indices = vec![999];
+        dense_indices.extend((0..33).map(|i| 1000 + i)); // filler ranks 2..34
+        dense_indices.push(7); // rank 35
+        let mut lexical_indices: Vec<usize> = (0..8).map(|i| 2000 + i).collect(); // filler ranks 1..8
+        lexical_indices.push(7); // rank 9
+
+        let weight_short =
+            adaptive_lexical_weight(&dense_indices, &lexical_indices, 1.0, 0.4, 5, 1, 6);
+        assert_eq!(weight_short, 1.0);
+        let fused = reciprocal_rank_fusion(
+            &[
+                RankedList {
+                    source: "dense".into(),
+                    weight: 1.0,
+                    indices: dense_indices,
+                },
+                RankedList {
+                    source: "lexical".into(),
+                    weight: weight_short,
+                    indices: lexical_indices,
+                },
+            ],
+            60,
+        );
+        assert_eq!(
+            fused[0].index, 7,
+            "short-query gate must preserve the correct, lexically-corroborated answer"
+        );
+    }
+
+    #[test]
+    fn down_weighted_lexical_stops_diluting_a_confident_dense_hit() {
+        // Reproduces the recorded failure mode: dense ranks the true target
+        // (7) #1, but lexical's OR-token noise ranks unrelated units 3/11/20
+        // ahead of it. At equal weight, noise wins the fused rank 1 spot;
+        // adaptive down-weighting restores dense's #1 as the fused #1.
+        let dense = vec![7, 40, 50];
+        let lexical = vec![3, 11, 20, 33];
+        let equal_weight = reciprocal_rank_fusion(
+            &[
+                RankedList {
+                    source: "dense".into(),
+                    weight: 1.0,
+                    indices: dense.clone(),
+                },
+                RankedList {
+                    source: "lexical".into(),
+                    weight: 1.0,
+                    indices: lexical.clone(),
+                },
+            ],
+            60,
+        );
+        assert_ne!(equal_weight[0].index, 7, "sets up the documented dilution");
+
+        let adapted_weight = adaptive_lexical_weight(&dense, &lexical, 1.0, 0.4, 5, 20, 6);
+        let adapted = reciprocal_rank_fusion(
+            &[
+                RankedList {
+                    source: "dense".into(),
+                    weight: 1.0,
+                    indices: dense,
+                },
+                RankedList {
+                    source: "lexical".into(),
+                    weight: adapted_weight,
+                    indices: lexical,
+                },
+            ],
+            60,
+        );
+        assert_eq!(
+            adapted[0].index, 7,
+            "dense's confident #1 wins once lexical is down-weighted"
+        );
     }
 
     #[test]

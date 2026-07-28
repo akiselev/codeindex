@@ -9,6 +9,7 @@ members = [
     "crates/embedding",
     "crates/indexer",
     "crates/lsp",
+    "crates/prose",
     "crates/query",
     "crates/search",
     "crates/sqlite",
