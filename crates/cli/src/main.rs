@@ -101,6 +101,14 @@ struct EmbedArgs {
     /// Execution provider (cpu, cuda, metal, ...).
     #[arg(long, default_value = "cpu")]
     execution_provider: String,
+    /// Pause (releasing the model) while available system memory is below
+    /// this many MiB, instead of risking the OOM killer.
+    #[arg(long)]
+    pause_below_mib: Option<u64>,
+    /// Resume a memory-paused run once this many MiB are available
+    /// (default: twice `--pause-below-mib`).
+    #[arg(long, requires = "pause_below_mib")]
+    resume_above_mib: Option<u64>,
 }
 
 #[derive(Args)]
@@ -504,6 +512,12 @@ fn embed_command(arguments: EmbedArgs) -> Result<ExitCode> {
         model: arguments.model.clone(),
         cache_dir: arguments.cache_dir.clone(),
         execution_provider: arguments.execution_provider.clone(),
+        memory_guard: arguments.pause_below_mib.map(|pause| {
+            codeindex_embedding::memory::MemoryGuard::new(
+                pause,
+                arguments.resume_above_mib.unwrap_or(pause * 2),
+            )
+        }),
         ..EmbeddingConfig::default()
     };
     let mut embedder = codeindex_embedding::embedder_from_config(&config)?;
@@ -533,6 +547,12 @@ fn embed_command(arguments: EmbedArgs) -> Result<ExitCode> {
             &identity,
             None,
             &mut |progress| {
+                if let Some(available) = progress.memory_paused_mib {
+                    eprintln!(
+                        "embed paused: {available} MiB available; model released until memory \
+                         recovers"
+                    );
+                }
                 if json
                     && let Ok(line) = envelope_line(
                         "progress",
@@ -540,6 +560,7 @@ fn embed_command(arguments: EmbedArgs) -> Result<ExitCode> {
                             space_id: progress.space_id.to_string(),
                             embedded: progress.embedded,
                             pending_total: progress.pending_total,
+                            memory_paused_mib: progress.memory_paused_mib,
                         },
                     )
                 {
@@ -564,6 +585,8 @@ struct EmbedProgressOut {
     space_id: String,
     embedded: usize,
     pending_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_paused_mib: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

@@ -103,6 +103,104 @@ pub struct CustomModelConfig {
     pub max_length: usize,
 }
 
+/// What a remote embedding provider may do with the code it receives.
+/// Deliberately has no default: sending source off-machine is an explicit
+/// choice, and the retention terms are part of that choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPolicy {
+    /// Zero data retention: route only to endpoints that keep neither
+    /// prompts nor outputs, and never to ones that train on them.
+    Zdr,
+    /// Never route to endpoints that may store inputs for training; normal
+    /// operational retention (abuse logs) may still apply.
+    NoTraining,
+    /// The provider's and account's defaults apply as-is. For public code.
+    ProviderDefault,
+}
+
+impl DataPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Zdr => "zdr",
+            Self::NoTraining => "no_training",
+            Self::ProviderDefault => "provider_default",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "zdr" => Some(Self::Zdr),
+            "no_training" => Some(Self::NoTraining),
+            "provider_default" => Some(Self::ProviderDefault),
+            _ => None,
+        }
+    }
+}
+
+/// A remotely hosted model reached through one of the
+/// [`remote`](crate::embed::remote) providers, selected by
+/// `EmbeddingConfig::backend`. Nothing here is secret: the API key is read
+/// from the environment variable named by `api_key_env` at call time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteModelConfig {
+    /// Required; the backend refuses to start without one.
+    pub data_policy: Option<DataPolicy>,
+    /// Endpoint root; `None` uses the provider's public API.
+    pub base_url: Option<String>,
+    /// `None` uses the provider's conventional variable
+    /// (`OPENROUTER_API_KEY`).
+    pub api_key_env: Option<String>,
+    /// Expected output width; every response is checked against it.
+    pub dimensions: usize,
+    /// Send `dimensions` in the request (server-side Matryoshka truncation).
+    /// Only for models whose API honours the parameter.
+    pub request_dimensions: bool,
+    /// Context length the remote model accepts. Inputs are not tokenized
+    /// locally; `max_body_chars` keeps bodies under it.
+    pub max_input_tokens: usize,
+    /// Upstream providers to route to, in order, for aggregators that route
+    /// (OpenRouter). Non-empty disables fallback routing, so one space never
+    /// mixes providers' numerics. Recorded in the model contract.
+    pub providers: Vec<String>,
+    /// Upstream quantizations to accept (e.g. `bf16`, `fp8`). Non-empty
+    /// keeps routing off endpoints serving the same model at lower precision.
+    pub quantizations: Vec<String>,
+    /// Provider-specific `input_type` per side (Voyage: `document`/`query`).
+    /// Changes vectors, so the document side is part of the contract.
+    pub document_input_type: Option<String>,
+    pub query_input_type: Option<String>,
+    pub max_inputs_per_request: usize,
+    /// Requests in flight at once per embed batch.
+    pub concurrency: usize,
+    pub query_prefix: String,
+    pub document_prefix: String,
+    pub timeout_secs: u64,
+    pub max_retries: u32,
+}
+
+impl Default for RemoteModelConfig {
+    fn default() -> Self {
+        Self {
+            data_policy: None,
+            base_url: None,
+            api_key_env: None,
+            dimensions: 0,
+            request_dimensions: false,
+            max_input_tokens: 8192,
+            providers: Vec::new(),
+            quantizations: Vec::new(),
+            document_input_type: None,
+            query_input_type: None,
+            max_inputs_per_request: 64,
+            concurrency: 4,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+            timeout_secs: 120,
+            max_retries: 6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfig {
     pub backend: String,
@@ -118,6 +216,11 @@ pub struct EmbeddingConfig {
     pub provider_mode: ProviderMode,
     pub quantized: bool,
     pub custom: Option<CustomModelConfig>,
+    /// Required by remote backends (`openrouter`); ignored by local ones.
+    pub remote: Option<RemoteModelConfig>,
+    /// Pause the embed loop (releasing the model) while available system
+    /// memory is low, instead of risking the OOM killer. `None` disables it.
+    pub memory_guard: Option<crate::memory::MemoryGuard>,
 }
 
 impl Default for EmbeddingConfig {
@@ -139,12 +242,17 @@ impl Default for EmbeddingConfig {
             provider_mode: ProviderMode::Require,
             quantized: false,
             custom: None,
+            remote: None,
+            memory_guard: None,
         }
     }
 }
 
 impl EmbeddingConfig {
     pub fn dimensions(&self) -> usize {
+        if crate::embed::remote::is_remote_backend(&self.backend) {
+            return self.remote.as_ref().map_or(0, |remote| remote.dimensions);
+        }
         if let Some(custom) = &self.custom {
             return custom.dimensions;
         }

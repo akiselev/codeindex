@@ -10,6 +10,7 @@
 //! lives in `codeindex-indexer`.
 
 pub mod config;
+pub mod memory;
 pub mod rerank;
 pub mod resolve;
 

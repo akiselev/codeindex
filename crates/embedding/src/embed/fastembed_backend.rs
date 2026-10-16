@@ -20,7 +20,13 @@ use codeindex_core::{ExecutionInfo, ModelContract, Pooling as ContractPooling, P
 pub struct FastembedBackend {
     contract: ModelContract,
     execution: ExecutionInfo,
-    model: TextEmbedding,
+    /// `None` while released by the memory guard; reloaded on demand.
+    model: Option<TextEmbedding>,
+    /// Rebuilds the session after a release (re-resolving providers).
+    loader: Loader,
+    /// Counts tokens exactly as inference sees them (truncation on). Kept
+    /// apart from `model` so batch packing works while the model is released.
+    truncated_len: LenCounter,
     /// Encodes with truncation disabled, so a length past the contract's
     /// `max_sequence_length` is reported in full instead of clamped. Built
     /// once by cloning the inference tokenizer (avoids naming the
@@ -43,6 +49,19 @@ fn prefix_prompts(query_prefix: &str, document_prefix: &str) -> PromptContract {
 
 /// Counts a text's tokens with truncation disabled; `None` if encoding fails.
 type LenCounter = Box<dyn Fn(&str) -> Option<usize> + Send + Sync>;
+
+/// Builds (or rebuilds) the inference session.
+type Loader = Box<dyn Fn() -> Result<TextEmbedding> + Send>;
+
+fn custom_loader(custom: CustomModelConfig, config: EmbeddingConfig) -> Loader {
+    Box::new(move || load_custom_model(&custom, resolve_providers(&config)?.0))
+}
+
+/// A token counter over a clone of the inference tokenizer, truncation intact.
+fn truncated_len_fn(model: &TextEmbedding) -> LenCounter {
+    let tokenizer = model.tokenizer.clone();
+    Box::new(move |text| tokenizer.encode(text, true).ok().map(|e| e.len()))
+}
 
 /// A cloned copy of the model's tokenizer with truncation switched off, wrapped
 /// as a length-counting closure. The clone leaves the inference tokenizer's
@@ -152,7 +171,7 @@ impl FastembedBackend {
         // Resolve the execution provider once; `provider` is what actually
         // took effect (never the requested accelerator when it fell back to
         // CPU) and is what the execution provenance records.
-        let (execution_providers, provider) = resolve_providers(config)?;
+        let provider = resolve_providers(config)?.1;
         let execution = |cache_path: String| ExecutionInfo {
             backend: "fastembed".into(),
             backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
@@ -170,10 +189,9 @@ impl FastembedBackend {
             }
             let pooling = parse_supported_pooling(&custom.pooling, &custom.dir)?;
             let (tokenizer_hash, model_hash) = custom_artifact_hashes(custom)?;
-            let model = load_custom_model(custom, execution_providers)?;
-            let untruncated_len = untruncated_len_fn(&model);
-            return Ok(Self {
-                contract: ModelContract {
+            let loader = custom_loader(custom.clone(), config.clone());
+            return Self::assemble(
+                ModelContract {
                     model: config.model.clone(),
                     // Path-independent: tokenizer_hash/model_hash pin the exact
                     // artifact bytes, so the mount point must not enter identity.
@@ -187,10 +205,9 @@ impl FastembedBackend {
                     prompts: PromptContract::Symmetric,
                     quantization: None,
                 },
-                execution: execution(custom.dir.to_string_lossy().into_owned()),
-                model,
-                untruncated_len,
-            });
+                execution(custom.dir.to_string_lossy().into_owned()),
+                loader,
+            );
         }
         if let Some(managed) = managed_model(&config.model) {
             if config.quantized {
@@ -215,10 +232,9 @@ impl FastembedBackend {
             };
             let pooling = parse_supported_pooling(&custom.pooling, &dir)?;
             let (tokenizer_hash, model_hash) = custom_artifact_hashes(&custom)?;
-            let model = load_custom_model(&custom, execution_providers)?;
-            let untruncated_len = untruncated_len_fn(&model);
-            return Ok(Self {
-                contract: ModelContract {
+            let loader = custom_loader(custom.clone(), config.clone());
+            return Self::assemble(
+                ModelContract {
                     model: config.model.clone(),
                     revision: Some(format!("managed:{}@{}", managed.repo, managed.revision)),
                     model_hash: Some(model_hash),
@@ -230,10 +246,9 @@ impl FastembedBackend {
                     prompts: prefix_prompts(managed.query_prefix, managed.document_prefix),
                     quantization: None,
                 },
-                execution: execution(dir.to_string_lossy().into_owned()),
-                model,
-                untruncated_len,
-            });
+                execution(dir.to_string_lossy().into_owned()),
+                loader,
+            );
         }
         let model_name = resolve_model(&config.model, config.quantized)?;
         let info = TextEmbedding::get_model_info(&model_name)
@@ -242,16 +257,21 @@ impl FastembedBackend {
         let model_code = info.model_code.clone();
 
         let cache_dir = resolve_cache_dir(config);
-        let options = TextInitOptions::new(model_name)
-            .with_show_download_progress(true)
-            .with_cache_dir(cache_dir.clone())
-            .with_execution_providers(execution_providers);
-        let model = TextEmbedding::try_new(options)
-            .with_context(|| format!("loading fastembed model {}", config.model))?;
-        let untruncated_len = untruncated_len_fn(&model);
+        let loader: Loader = {
+            let config = config.clone();
+            let cache_dir = cache_dir.clone();
+            Box::new(move || {
+                let options = TextInitOptions::new(model_name.clone())
+                    .with_show_download_progress(true)
+                    .with_cache_dir(cache_dir.clone())
+                    .with_execution_providers(resolve_providers(&config)?.0);
+                TextEmbedding::try_new(options)
+                    .with_context(|| format!("loading fastembed model {}", config.model))
+            })
+        };
 
-        Ok(Self {
-            contract: ModelContract {
+        Self::assemble(
+            ModelContract {
                 model: config.model.clone(),
                 revision: Some(model_code),
                 model_hash: None,
@@ -265,9 +285,20 @@ impl FastembedBackend {
                 prompts: PromptContract::Symmetric,
                 quantization: config.quantized.then(|| "quantized".to_string()),
             },
-            execution: execution(cache_dir.to_string_lossy().into_owned()),
-            model,
-            untruncated_len,
+            execution(cache_dir.to_string_lossy().into_owned()),
+            loader,
+        )
+    }
+
+    fn assemble(contract: ModelContract, execution: ExecutionInfo, loader: Loader) -> Result<Self> {
+        let model = loader()?;
+        Ok(Self {
+            contract,
+            execution,
+            truncated_len: truncated_len_fn(&model),
+            untruncated_len: untruncated_len_fn(&model),
+            model: Some(model),
+            loader,
         })
     }
 }
@@ -293,7 +324,7 @@ impl FastembedBackend {
             contract.model,
             contract.pooling.as_str()
         );
-        let (execution_providers, provider) = resolve_providers(config)?;
+        let provider = resolve_providers(config)?.1;
         let custom = CustomModelConfig {
             dir: dir.to_path_buf(),
             onnx_file: PathBuf::from(onnx_file),
@@ -301,20 +332,18 @@ impl FastembedBackend {
             pooling: contract.pooling.as_str().to_string(),
             max_length: contract.max_sequence_length,
         };
-        let model = load_custom_model(&custom, execution_providers)?;
-        let untruncated_len = untruncated_len_fn(&model);
-        Ok(Self {
-            execution: ExecutionInfo {
+        let loader = custom_loader(custom, config.clone());
+        Self::assemble(
+            contract,
+            ExecutionInfo {
                 backend: "fastembed".into(),
                 backend_version: env!("CODEINDEX_FASTEMBED_VERSION").into(),
                 runtime_version: Some(format!("ort {}", env!("CODEINDEX_ORT_VERSION"))),
                 execution_provider: provider,
                 cache_path: Some(dir.to_string_lossy().into_owned()),
             },
-            contract,
-            model,
-            untruncated_len,
-        })
+            loader,
+        )
     }
 }
 
@@ -577,11 +606,7 @@ impl EmbeddingBackend for FastembedBackend {
     fn count_tokens(&self, text: &str) -> Option<usize> {
         // fastembed configures truncation on this tokenizer, so the count
         // is already clamped to the model's max length.
-        self.model
-            .tokenizer
-            .encode(text, true)
-            .ok()
-            .map(|encoding| encoding.len())
+        (self.truncated_len)(text)
     }
 
     fn count_tokens_untruncated(&self, text: &str) -> Option<usize> {
@@ -592,9 +617,23 @@ impl EmbeddingBackend for FastembedBackend {
         let rendered = render_inputs(&self.contract, request)?;
         // The caller packs batches to a padded-memory budget; pass each
         // through as a single fastembed batch so that budget is authoritative.
-        self.model
+        self.reload()?;
+        let model = self.model.as_mut().expect("reload leaves the model loaded");
+        model
             .embed(rendered, Some(request.inputs.len().max(1)))
             .context("fastembed inference failed")
+    }
+
+    fn release(&mut self) -> Result<bool> {
+        // Dropping the session frees its weights and ONNX Runtime arena.
+        Ok(self.model.take().is_some())
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        if self.model.is_none() {
+            self.model = Some((self.loader)()?);
+        }
+        Ok(())
     }
 }
 

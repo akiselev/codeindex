@@ -23,6 +23,7 @@ pub use codeindex_sqlite::index_runs::{IndexRunPhase, IndexRunState, IndexRunSta
 pub use embed::{
     EmbedProgress, EmbedStats, LanguageTokens, embed_pending, embed_pending_with_progress,
     embed_space_pending, embed_space_pending_with_progress, find_or_create_model_id, token_report,
+    token_report_channel,
 };
 pub use language::{all_language_ids, is_prose, language_for_extension};
 pub use run::{

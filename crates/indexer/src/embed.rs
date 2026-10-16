@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::Result;
 use codeindex_core::{EmbeddingSpaceId, EmbeddingSpaceIdentity, ModelContract, RepresentationKind};
 use codeindex_embedding::config::EmbeddingRunConfig;
+use codeindex_embedding::memory::MemoryGuard;
 use codeindex_embedding::{
     EmbedRequest, EmbeddingBackend, EmbeddingRole, TokenStats, apply_output_dimensions,
     estimated_tokens, normalize_in_place, pack_batches, render_input,
@@ -32,6 +33,10 @@ pub struct EmbedProgress {
     pub unresolved: usize,
     pub batches: usize,
     pub current_batch: usize,
+    /// `Some(available MiB)` on the event emitted when the memory guard
+    /// pauses the run (the model is released until memory recovers); `None`
+    /// on ordinary per-batch progress.
+    pub memory_paused_mib: Option<u64>,
 }
 
 /// Convenience projection: create one `default/<channel>` space for every
@@ -171,16 +176,24 @@ fn embed_space(
             .collect::<Result<_>>()?;
         sized.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
 
+        let guard = config.embedding.memory_guard;
         for batch in pack_batches(
             &sized,
             config.embedding.batch_size,
             config.embedding.max_batch_chars,
-            config.embedding.max_batch_token_area,
+            if embedder.padded_batches() {
+                config.embedding.max_batch_token_area
+            } else {
+                usize::MAX
+            },
         ) {
             stats.tokens.record_batch(
                 batch.iter().map(|(_, _, tokens)| *tokens),
                 max_sequence_length,
             );
+            if let Some(guard) = &guard {
+                wait_for_memory(guard, embedder, space, stats, progress)?;
+            }
             let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
             let request = EmbedRequest {
                 role: EmbeddingRole::Document,
@@ -223,10 +236,40 @@ fn embed_space(
                 unresolved: stats.unresolved,
                 batches: stats.batches,
                 current_batch: batch.len(),
+                memory_paused_mib: None,
             });
         }
     }
     Ok(())
+}
+
+/// Between batches: if available memory is under the guard's floor, release
+/// the model and block until it recovers, then reload. Pausing at a batch
+/// boundary loses no work — every finished batch is already persisted.
+fn wait_for_memory(
+    guard: &MemoryGuard,
+    embedder: &mut dyn EmbeddingBackend,
+    space: &EmbeddingSpaceIdentity,
+    stats: &EmbedStats,
+    progress: &mut impl FnMut(EmbedProgress),
+) -> Result<()> {
+    let Some(available) = guard.should_pause() else {
+        return Ok(());
+    };
+    embedder.release()?;
+    progress(EmbedProgress {
+        space_id: space.id.clone(),
+        pending_total: stats.pending_total,
+        embedded: stats.embedded,
+        unresolved: stats.unresolved,
+        batches: stats.batches,
+        current_batch: 0,
+        memory_paused_mib: Some(available),
+    });
+    while !guard.may_resume() {
+        std::thread::sleep(guard.poll_interval);
+    }
+    embedder.reload()
 }
 
 fn persisted_usize(db: &Db, key: &str) -> Result<Option<usize>> {

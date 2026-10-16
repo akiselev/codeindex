@@ -3,6 +3,7 @@ pub mod candle_backend;
 #[cfg(feature = "fastembed")]
 pub mod fastembed_backend;
 pub mod hash;
+pub mod remote;
 
 use std::borrow::Cow;
 
@@ -85,6 +86,28 @@ pub trait EmbeddingBackend: Send {
     /// Render the request through the prompt contract and encode. Returns one
     /// `native_dimensions`-width vector per input, in order.
     fn embed(&mut self, request: &EmbedRequest<'_>) -> Result<Vec<Vec<f32>>>;
+    /// Whether a batch is padded to its longest input and run as one tensor,
+    /// so `max_batch_token_area` bounds its memory. Remote backends return
+    /// `false` and are batched by item count and characters only.
+    fn padded_batches(&self) -> bool {
+        true
+    }
+    /// One-line account of metered usage (requests, tokens, cost) so far,
+    /// for backends that bill per call.
+    fn usage_summary(&self) -> Option<String> {
+        None
+    }
+    /// Free inference memory (weights, runtime session, allocator arenas)
+    /// while keeping the contract and token counting usable. Returns whether
+    /// anything was released; backends that cannot unload return `false`.
+    fn release(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+    /// Reload after [`release`](Self::release). A no-op when already loaded;
+    /// `embed` after `release` must also reload on its own.
+    fn reload(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Render one input for a role through the model's prompt contract.
@@ -222,6 +245,9 @@ pub fn apply_output_dimensions(
 /// can run the resolved contract (candle for last-token safetensors models,
 /// fastembed for mean/cls ONNX exports).
 pub fn embedder_from_config(config: &EmbeddingConfig) -> Result<Box<dyn EmbeddingBackend>> {
+    if remote::is_remote_backend(&config.backend) {
+        return remote::backend(config);
+    }
     anyhow::ensure!(
         config.backend == "fastembed",
         "unsupported embedding backend {:?}",
