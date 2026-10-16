@@ -58,6 +58,8 @@ pub fn interpret(status: u16, body: &str) -> Reply {
         let reason = format!("HTTP {status}: {}", excerpt(body));
         return if status == 413 {
             Reply::TooLarge(reason)
+        } else if status == 429 {
+            Reply::RateLimited(reason)
         } else if is_transient(status) {
             Reply::Retry(reason)
         } else {
@@ -74,6 +76,7 @@ pub fn interpret(status: u16, body: &str) -> Reply {
         let reason = format!("upstream error: {}", excerpt(&error.to_string()));
         return match code {
             413 => Reply::TooLarge(reason),
+            429 => Reply::RateLimited(reason),
             0 => Reply::Retry(reason),
             code if is_transient(code) => Reply::Retry(reason),
             _ => Reply::Fatal(reason),
@@ -121,7 +124,13 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(interpret(429, "slow down"), Reply::Retry(_)));
+        assert!(matches!(interpret(429, "slow down"), Reply::RateLimited(_)));
+        assert!(matches!(interpret(503, "overloaded"), Reply::Retry(_)));
+        let upstream_limit = r#"{"error":{"code":429,"message":"rate limited"}}"#;
+        assert!(matches!(
+            interpret(200, upstream_limit),
+            Reply::RateLimited(_)
+        ));
         assert!(matches!(interpret(413, "too big"), Reply::TooLarge(_)));
         assert!(matches!(interpret(402, "no credits"), Reply::Fatal(_)));
         let upstream = r#"{"error":{"code":502,"message":"provider down"}}"#;

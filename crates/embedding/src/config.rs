@@ -170,8 +170,21 @@ pub struct RemoteModelConfig {
     pub document_input_type: Option<String>,
     pub query_input_type: Option<String>,
     pub max_inputs_per_request: usize,
-    /// Requests in flight at once per embed batch.
+    /// Cap on the summed input characters of one request, so long bodies
+    /// split into more requests instead of one oversized one.
+    pub max_request_chars: usize,
+    /// Ceiling on requests in flight at once.
     pub concurrency: usize,
+    /// Halve the in-flight limit on each rate limit and grow it back by one
+    /// per `limit` successes. `false` holds `concurrency` fixed (429s still
+    /// pause every worker).
+    pub adaptive_concurrency: bool,
+    /// Jittered exponential backoff for transient failures, and for 429s
+    /// that carry no `Retry-After`.
+    pub backoff_initial_ms: u64,
+    pub backoff_max_ms: u64,
+    /// Give up once one request has been rate limited this long in total.
+    pub rate_limit_max_wait_secs: u64,
     pub query_prefix: String,
     pub document_prefix: String,
     pub timeout_secs: u64,
@@ -192,7 +205,12 @@ impl Default for RemoteModelConfig {
             document_input_type: None,
             query_input_type: None,
             max_inputs_per_request: 64,
-            concurrency: 4,
+            max_request_chars: 100_000,
+            concurrency: 8,
+            adaptive_concurrency: true,
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 60_000,
+            rate_limit_max_wait_secs: 900,
             query_prefix: String::new(),
             document_prefix: String::new(),
             timeout_secs: 120,

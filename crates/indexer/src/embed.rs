@@ -124,13 +124,23 @@ fn embed_space(
     progress: &mut impl FnMut(EmbedProgress),
 ) -> Result<()> {
     let document_prompt = space.document_side.prompt.clone();
+    let limits = embedder.batch_limits();
+    let (batch_items, batch_chars) = limits.map_or(
+        (
+            config.embedding.batch_size,
+            config.embedding.max_batch_chars,
+        ),
+        |limits| (limits.items, limits.chars),
+    );
+    // A page smaller than the batch would starve a remote backend's request
+    // slots. Local backends keep the configured page size.
+    let page_size = match limits {
+        Some(_) => config.embedding.pending_page_size.max(batch_items),
+        None => config.embedding.pending_page_size,
+    };
     let mut after_hash: Option<String> = None;
     loop {
-        let pending = db.unembedded_hashes_page(
-            &space.id,
-            after_hash.as_deref(),
-            config.embedding.pending_page_size,
-        )?;
+        let pending = db.unembedded_hashes_page(&space.id, after_hash.as_deref(), page_size)?;
         if pending.is_empty() {
             break;
         }
@@ -179,8 +189,8 @@ fn embed_space(
         let guard = config.embedding.memory_guard;
         for batch in pack_batches(
             &sized,
-            config.embedding.batch_size,
-            config.embedding.max_batch_chars,
+            batch_items,
+            batch_chars,
             if embedder.padded_batches() {
                 config.embedding.max_batch_token_area
             } else {

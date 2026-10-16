@@ -92,6 +92,13 @@ pub trait EmbeddingBackend: Send {
     fn padded_batches(&self) -> bool {
         true
     }
+    /// Packer batch size this backend wants in place of the configured
+    /// `batch_size`/`max_batch_chars`. Remote backends fan one batch out
+    /// over concurrent requests, so a batch must hold enough work to keep
+    /// every request slot busy.
+    fn batch_limits(&self) -> Option<BatchLimits> {
+        None
+    }
     /// One-line account of metered usage (requests, tokens, cost) so far,
     /// for backends that bill per call.
     fn usage_summary(&self) -> Option<String> {
@@ -108,6 +115,13 @@ pub trait EmbeddingBackend: Send {
     fn reload(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Items and characters per packer batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    pub items: usize,
+    pub chars: usize,
 }
 
 /// Render one input for a role through the model's prompt contract.
